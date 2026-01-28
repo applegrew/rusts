@@ -149,7 +149,7 @@ curl -X POST 'http://localhost:8086/query' \
   -H 'Content-Type: application/json' \
   -d '{
     "measurement": "cpu",
-    "time_range": {"start": 0, "end": 9999999999999999999},
+    "time_range": {"start": 0, "end": 9223372036854775807},
     "tag_filters": [
       {"key": "host", "value": "server01", "op": "Eq"}
     ]
@@ -160,7 +160,7 @@ curl -X POST 'http://localhost:8086/query' \
   -H 'Content-Type: application/json' \
   -d '{
     "measurement": "cpu",
-    "time_range": {"start": 0, "end": 9999999999999999999},
+    "time_range": {"start": 0, "end": 9223372036854775807},
     "aggregation": {
       "function": "Mean",
       "field": "usage",
