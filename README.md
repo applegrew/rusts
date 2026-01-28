@@ -317,10 +317,7 @@ Adjust via configuration for your workload.
 ## Roadmap
 
 - [ ] SQL query interface (via DataFusion)
-- [ ] Prometheus remote write/read support
-- [ ] Grafana data source plugin
 - [ ] Kubernetes operator
-- [ ] etcd integration for dynamic clustering
 - [ ] Continuous queries
 - [ ] Materialized views
 
