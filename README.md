@@ -15,12 +15,12 @@ A high-performance time series database written in Rust, designed for monitoring
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                      REST API Layer                          │
-│         (InfluxDB Line Protocol, JSON Query API)             │
-├─────────────────────────────────────────────────────────────┤
-│                     Query Engine                             │
-│            (Planner, Optimizer, Executor)                    │
+┌────────────────────────────────────────────────────────────┐
+│                      REST API Layer                        │
+│         (InfluxDB Line Protocol, JSON Query API)           │
+├────────────────────────────────────────────────────────────┤
+│                     Query Engine                           │
+│            (Planner, Optimizer, Executor)                  │
 ├──────────┬──────────┬───────────┬──────────┬───────────────┤
 │  Index   │ Storage  │ Compress  │ Cluster  │  Retention    │
 │  Engine  │  Engine  │  Engine   │  Router  │   Manager     │
