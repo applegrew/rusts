@@ -1,0 +1,35 @@
+[package]
+name = "rusts-api"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "REST API for RusTs time series database"
+
+[dependencies]
+rusts-core = { workspace = true }
+rusts-storage = { workspace = true }
+rusts-query = { workspace = true }
+rusts-index = { workspace = true }
+
+tokio = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+hyper = { workspace = true }
+jsonwebtoken = { workspace = true }
+argon2 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+regex = "1.10"
+
+[dev-dependencies]
+rand = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

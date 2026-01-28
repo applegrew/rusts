@@ -1,0 +1,24 @@
+[package]
+name = "rusts-compression"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Compression algorithms for RusTs time series database"
+
+[dependencies]
+rusts-core = { workspace = true }
+
+lz4 = { workspace = true }
+zstd = { workspace = true }
+thiserror = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "compression"
+harness = false

@@ -1,0 +1,635 @@
+//! Query executor
+
+use crate::aggregation::{AggregateFunction, Aggregator, TimeBucketAggregator};
+use crate::error::{QueryError, Result};
+use crate::model::{FieldSelection, Query, QueryResult, ResultRow, TagFilter};
+use crate::planner::{QueryOptimizer, QueryPlan, QueryPlanner};
+use rusts_core::{FieldValue, SeriesId, Tag, TimeRange};
+use rusts_index::{SeriesIndex, TagIndex};
+use rusts_storage::{MemTablePoint, StorageEngine};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Instant;
+
+/// Query executor for running queries against the storage engine
+pub struct QueryExecutor {
+    /// Storage engine
+    storage: Arc<StorageEngine>,
+    /// Series index
+    series_index: Arc<SeriesIndex>,
+    /// Tag index
+    tag_index: Arc<TagIndex>,
+    /// Query planner
+    planner: QueryPlanner,
+}
+
+impl QueryExecutor {
+    /// Create a new query executor
+    pub fn new(
+        storage: Arc<StorageEngine>,
+        series_index: Arc<SeriesIndex>,
+        tag_index: Arc<TagIndex>,
+    ) -> Self {
+        Self {
+            storage,
+            series_index,
+            tag_index,
+            planner: QueryPlanner::new(),
+        }
+    }
+
+    /// Execute a query
+    pub fn execute(&self, query: Query) -> Result<QueryResult> {
+        let start = Instant::now();
+
+        // Validate query
+        query.validate()?;
+
+        // Plan the query
+        let plan = self.planner.plan(query.clone())?;
+        let plan = QueryOptimizer::optimize(plan);
+
+        // Resolve series IDs from filters
+        let series_ids = self.resolve_series_ids(&query)?;
+
+        // Execute based on field selection
+        let result = match &query.field_selection {
+            FieldSelection::All | FieldSelection::Fields(_) => {
+                self.execute_select(&query, &series_ids)?
+            }
+            FieldSelection::Aggregate { field, function, alias } => {
+                self.execute_aggregate(&query, &series_ids, field, *function, alias.clone())?
+            }
+        };
+
+        // Apply limit and offset
+        let result = self.apply_limit_offset(result, query.limit, query.offset);
+
+        // Set execution time
+        let mut result = result;
+        result.execution_time_ns = start.elapsed().as_nanos() as u64;
+
+        Ok(result)
+    }
+
+    /// Resolve series IDs matching the query filters
+    fn resolve_series_ids(&self, query: &Query) -> Result<Vec<SeriesId>> {
+        // Get series IDs for the measurement
+        let measurement_series = self.series_index.get_by_measurement(&query.measurement);
+
+        if measurement_series.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        if query.tag_filters.is_empty() {
+            return Ok(measurement_series);
+        }
+
+        // Filter by tags
+        let mut result = measurement_series;
+
+        for filter in &query.tag_filters {
+            match filter {
+                TagFilter::Equals { key, value } => {
+                    let matching = self.tag_index.find_by_tag(key, value);
+                    let matching_set: std::collections::HashSet<_> = matching.into_iter().collect();
+                    result.retain(|id| matching_set.contains(id));
+                }
+                TagFilter::NotEquals { key, value } => {
+                    let matching = self.tag_index.find_by_tag(key, value);
+                    let matching_set: std::collections::HashSet<_> = matching.into_iter().collect();
+                    result.retain(|id| !matching_set.contains(id));
+                }
+                TagFilter::In { key, values } => {
+                    let tags: Vec<Tag> = values.iter()
+                        .map(|v| Tag::new(key, v))
+                        .collect();
+                    let matching = self.tag_index.find_by_tags_any(&tags);
+                    let matching_set: std::collections::HashSet<_> = matching.into_iter().collect();
+                    result.retain(|id| matching_set.contains(id));
+                }
+                TagFilter::Exists { key } => {
+                    // Check which series have this tag
+                    result.retain(|id| {
+                        if let Some(meta) = self.series_index.get(*id) {
+                            meta.tags.iter().any(|t| &t.key == key)
+                        } else {
+                            false
+                        }
+                    });
+                }
+                TagFilter::Regex { key, pattern } => {
+                    if let Ok(re) = regex::Regex::new(pattern) {
+                        result.retain(|id| {
+                            if let Some(meta) = self.series_index.get(*id) {
+                                meta.tags.iter().any(|t| &t.key == key && re.is_match(&t.value))
+                            } else {
+                                false
+                            }
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Execute a SELECT query (raw data)
+    fn execute_select(&self, query: &Query, series_ids: &[SeriesId]) -> Result<QueryResult> {
+        let mut rows = Vec::new();
+
+        for &series_id in series_ids {
+            let points = self.storage.query(series_id, &query.time_range)?;
+
+            let series_meta = self.series_index.get(series_id);
+            let tags = series_meta.map(|m| m.tags).unwrap_or_default();
+
+            for point in points {
+                let fields = self.filter_fields(&point.fields, &query.field_selection);
+
+                rows.push(ResultRow {
+                    timestamp: Some(point.timestamp),
+                    series_id,
+                    tags: tags.clone(),
+                    fields,
+                });
+            }
+        }
+
+        // Sort by timestamp
+        rows.sort_by_key(|r| r.timestamp);
+
+        let total_rows = rows.len();
+
+        Ok(QueryResult {
+            measurement: query.measurement.clone(),
+            rows,
+            total_rows,
+            execution_time_ns: 0,
+        })
+    }
+
+    /// Execute an aggregate query
+    fn execute_aggregate(
+        &self,
+        query: &Query,
+        series_ids: &[SeriesId],
+        field: &str,
+        function: AggregateFunction,
+        alias: Option<String>,
+    ) -> Result<QueryResult> {
+        let field_name = alias.unwrap_or_else(|| format!("{}_{:?}", field, function).to_lowercase());
+
+        // Group by time if specified
+        if let Some(interval) = query.group_by_time {
+            return self.execute_aggregate_time_bucket(
+                query, series_ids, field, function, &field_name, interval,
+            );
+        }
+
+        // Group by tags if specified
+        if !query.group_by.is_empty() {
+            return self.execute_aggregate_grouped(
+                query, series_ids, field, function, &field_name,
+            );
+        }
+
+        // Simple aggregation over all data
+        let mut aggregator = Aggregator::new(function);
+
+        for &series_id in series_ids {
+            let points = self.storage.query(series_id, &query.time_range)?;
+
+            for point in points {
+                if let Some((_, value)) = point.fields.iter().find(|(k, _)| k == field) {
+                    aggregator.add(value);
+                }
+            }
+        }
+
+        let mut fields = HashMap::new();
+        if let Some(value) = aggregator.result() {
+            fields.insert(field_name, value);
+        }
+
+        let rows = vec![ResultRow {
+            timestamp: None,
+            series_id: 0,
+            tags: Vec::new(),
+            fields,
+        }];
+
+        Ok(QueryResult {
+            measurement: query.measurement.clone(),
+            rows,
+            total_rows: 1,
+            execution_time_ns: 0,
+        })
+    }
+
+    /// Execute aggregate with time bucketing
+    fn execute_aggregate_time_bucket(
+        &self,
+        query: &Query,
+        series_ids: &[SeriesId],
+        field: &str,
+        function: AggregateFunction,
+        field_name: &str,
+        interval: i64,
+    ) -> Result<QueryResult> {
+        // Group by series if group_by tags specified, otherwise aggregate all series
+        let group_by_series = !query.group_by.is_empty();
+
+        if group_by_series {
+            // Each series gets its own time buckets
+            let mut rows = Vec::new();
+
+            for &series_id in series_ids {
+                let points = self.storage.query(series_id, &query.time_range)?;
+                let mut time_agg = TimeBucketAggregator::new(
+                    function,
+                    query.time_range.start,
+                    query.time_range.end,
+                    interval,
+                );
+
+                for point in points {
+                    if let Some((_, value)) = point.fields.iter().find(|(k, _)| k == field) {
+                        time_agg.add(point.timestamp, value);
+                    }
+                }
+
+                let series_meta = self.series_index.get(series_id);
+                let tags = series_meta.map(|m| m.tags).unwrap_or_default();
+
+                for (bucket_ts, value) in time_agg.results() {
+                    if let Some(v) = value {
+                        let mut fields = HashMap::new();
+                        fields.insert(field_name.to_string(), v);
+
+                        rows.push(ResultRow {
+                            timestamp: Some(bucket_ts),
+                            series_id,
+                            tags: tags.clone(),
+                            fields,
+                        });
+                    }
+                }
+            }
+
+            rows.sort_by_key(|r| r.timestamp);
+            let total_rows = rows.len();
+
+            Ok(QueryResult {
+                measurement: query.measurement.clone(),
+                rows,
+                total_rows,
+                execution_time_ns: 0,
+            })
+        } else {
+            // Aggregate all series into single time buckets
+            let mut time_agg = TimeBucketAggregator::new(
+                function,
+                query.time_range.start,
+                query.time_range.end,
+                interval,
+            );
+
+            for &series_id in series_ids {
+                let points = self.storage.query(series_id, &query.time_range)?;
+
+                for point in points {
+                    if let Some((_, value)) = point.fields.iter().find(|(k, _)| k == field) {
+                        time_agg.add(point.timestamp, value);
+                    }
+                }
+            }
+
+            let mut rows = Vec::new();
+            for (bucket_ts, value) in time_agg.results() {
+                if let Some(v) = value {
+                    let mut fields = HashMap::new();
+                    fields.insert(field_name.to_string(), v);
+
+                    rows.push(ResultRow {
+                        timestamp: Some(bucket_ts),
+                        series_id: 0,
+                        tags: Vec::new(),
+                        fields,
+                    });
+                }
+            }
+
+            let total_rows = rows.len();
+
+            Ok(QueryResult {
+                measurement: query.measurement.clone(),
+                rows,
+                total_rows,
+                execution_time_ns: 0,
+            })
+        }
+    }
+
+    /// Execute aggregate grouped by tags
+    fn execute_aggregate_grouped(
+        &self,
+        query: &Query,
+        series_ids: &[SeriesId],
+        field: &str,
+        function: AggregateFunction,
+        field_name: &str,
+    ) -> Result<QueryResult> {
+        // Group series by the group_by tags
+        let mut groups: HashMap<Vec<(String, String)>, Vec<SeriesId>> = HashMap::new();
+
+        for &series_id in series_ids {
+            if let Some(meta) = self.series_index.get(series_id) {
+                let group_key: Vec<(String, String)> = query
+                    .group_by
+                    .iter()
+                    .filter_map(|key| {
+                        meta.tags
+                            .iter()
+                            .find(|t| &t.key == key)
+                            .map(|t| (key.clone(), t.value.clone()))
+                    })
+                    .collect();
+
+                groups.entry(group_key).or_default().push(series_id);
+            }
+        }
+
+        let mut rows = Vec::new();
+
+        for (group_key, group_series) in groups {
+            let mut aggregator = Aggregator::new(function);
+
+            for &series_id in &group_series {
+                let points = self.storage.query(series_id, &query.time_range)?;
+
+                for point in points {
+                    if let Some((_, value)) = point.fields.iter().find(|(k, _)| k == field) {
+                        aggregator.add(value);
+                    }
+                }
+            }
+
+            let mut fields = HashMap::new();
+            if let Some(value) = aggregator.result() {
+                fields.insert(field_name.to_string(), value);
+            }
+
+            let tags: Vec<Tag> = group_key
+                .into_iter()
+                .map(|(k, v)| Tag::new(k, v))
+                .collect();
+
+            rows.push(ResultRow {
+                timestamp: None,
+                series_id: 0,
+                tags,
+                fields,
+            });
+        }
+
+        let total_rows = rows.len();
+
+        Ok(QueryResult {
+            measurement: query.measurement.clone(),
+            rows,
+            total_rows,
+            execution_time_ns: 0,
+        })
+    }
+
+    /// Filter fields based on selection
+    fn filter_fields(
+        &self,
+        fields: &[(String, FieldValue)],
+        selection: &FieldSelection,
+    ) -> HashMap<String, FieldValue> {
+        match selection {
+            FieldSelection::All => fields.iter().cloned().collect(),
+            FieldSelection::Fields(names) => {
+                fields
+                    .iter()
+                    .filter(|(k, _)| names.contains(k))
+                    .cloned()
+                    .collect()
+            }
+            FieldSelection::Aggregate { .. } => HashMap::new(),
+        }
+    }
+
+    /// Apply limit and offset to results
+    fn apply_limit_offset(
+        &self,
+        mut result: QueryResult,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> QueryResult {
+        let offset = offset.unwrap_or(0);
+
+        if offset > 0 {
+            if offset >= result.rows.len() {
+                result.rows = Vec::new();
+            } else {
+                result.rows = result.rows.split_off(offset);
+            }
+        }
+
+        if let Some(limit) = limit {
+            result.rows.truncate(limit);
+        }
+
+        result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusts_core::Point;
+    use rusts_storage::{StorageEngineConfig, WalDurability};
+    use tempfile::TempDir;
+
+    fn setup_test_env() -> (Arc<StorageEngine>, Arc<SeriesIndex>, Arc<TagIndex>, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let config = StorageEngineConfig {
+            data_dir: dir.path().to_path_buf(),
+            wal_durability: WalDurability::None,
+            ..Default::default()
+        };
+
+        let storage = Arc::new(StorageEngine::new(config).unwrap());
+        let series_index = Arc::new(SeriesIndex::new());
+        let tag_index = Arc::new(TagIndex::new());
+
+        (storage, series_index, tag_index, dir)
+    }
+
+    fn create_test_point(host: &str, ts: i64, value: f64) -> Point {
+        Point::builder("cpu")
+            .timestamp(ts)
+            .tag("host", host)
+            .field("value", value)
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_executor_basic_query() {
+        let (storage, series_index, tag_index, _dir) = setup_test_env();
+
+        // Write some data
+        for i in 0..10 {
+            let point = create_test_point("server01", i * 1000, i as f64);
+            storage.write(&point).unwrap();
+
+            let series_id = point.series_id();
+            series_index.upsert(series_id, "cpu", &point.tags, point.timestamp);
+            tag_index.index_series(series_id, &point.tags);
+        }
+
+        let executor = QueryExecutor::new(
+            Arc::clone(&storage),
+            Arc::clone(&series_index),
+            Arc::clone(&tag_index),
+        );
+
+        let query = Query::builder("cpu")
+            .time_range(0, 100000)
+            .build()
+            .unwrap();
+
+        let result = executor.execute(query).unwrap();
+        assert_eq!(result.rows.len(), 10);
+
+        storage.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_executor_with_tag_filter() {
+        let (storage, series_index, tag_index, _dir) = setup_test_env();
+
+        // Write data for two hosts
+        for i in 0..10 {
+            let p1 = create_test_point("server01", i * 1000, i as f64);
+            let p2 = create_test_point("server02", i * 1000, i as f64 * 2.0);
+
+            storage.write(&p1).unwrap();
+            storage.write(&p2).unwrap();
+
+            series_index.upsert(p1.series_id(), "cpu", &p1.tags, p1.timestamp);
+            series_index.upsert(p2.series_id(), "cpu", &p2.tags, p2.timestamp);
+
+            tag_index.index_series(p1.series_id(), &p1.tags);
+            tag_index.index_series(p2.series_id(), &p2.tags);
+        }
+
+        let executor = QueryExecutor::new(
+            Arc::clone(&storage),
+            Arc::clone(&series_index),
+            Arc::clone(&tag_index),
+        );
+
+        // Query only server01
+        let query = Query::builder("cpu")
+            .time_range(0, 100000)
+            .where_tag("host", "server01")
+            .build()
+            .unwrap();
+
+        let result = executor.execute(query).unwrap();
+        assert_eq!(result.rows.len(), 10);
+
+        // All rows should be from server01
+        for row in &result.rows {
+            assert!(row.tags.iter().any(|t| t.key == "host" && t.value == "server01"));
+        }
+
+        storage.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_executor_aggregate() {
+        let (storage, series_index, tag_index, _dir) = setup_test_env();
+
+        for i in 0..10 {
+            let point = create_test_point("server01", i * 1000, i as f64);
+            storage.write(&point).unwrap();
+
+            let series_id = point.series_id();
+            series_index.upsert(series_id, "cpu", &point.tags, point.timestamp);
+            tag_index.index_series(series_id, &point.tags);
+        }
+
+        let executor = QueryExecutor::new(
+            Arc::clone(&storage),
+            Arc::clone(&series_index),
+            Arc::clone(&tag_index),
+        );
+
+        let query = Query::builder("cpu")
+            .time_range(0, 100000)
+            .select_aggregate("value", AggregateFunction::Mean, Some("avg_value".to_string()))
+            .build()
+            .unwrap();
+
+        let result = executor.execute(query).unwrap();
+        assert_eq!(result.rows.len(), 1);
+
+        // Mean of 0..9 = 4.5
+        if let Some(FieldValue::Float(v)) = result.rows[0].fields.get("avg_value") {
+            assert!((v - 4.5).abs() < 0.01);
+        } else {
+            panic!("Expected avg_value field");
+        }
+
+        storage.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_executor_limit_offset() {
+        let (storage, series_index, tag_index, _dir) = setup_test_env();
+
+        for i in 0..100 {
+            let point = create_test_point("server01", i * 1000, i as f64);
+            storage.write(&point).unwrap();
+
+            let series_id = point.series_id();
+            series_index.upsert(series_id, "cpu", &point.tags, point.timestamp);
+        }
+
+        let executor = QueryExecutor::new(
+            Arc::clone(&storage),
+            Arc::clone(&series_index),
+            Arc::clone(&tag_index),
+        );
+
+        // Query with limit
+        let query = Query::builder("cpu")
+            .time_range(0, 1000000)
+            .limit(10)
+            .build()
+            .unwrap();
+
+        let result = executor.execute(query).unwrap();
+        assert_eq!(result.rows.len(), 10);
+        assert_eq!(result.total_rows, 100);
+
+        // Query with offset
+        let query = Query::builder("cpu")
+            .time_range(0, 1000000)
+            .offset(90)
+            .build()
+            .unwrap();
+
+        let result = executor.execute(query).unwrap();
+        assert_eq!(result.rows.len(), 10);
+
+        storage.shutdown().unwrap();
+    }
+}

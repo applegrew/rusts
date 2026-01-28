@@ -1,0 +1,45 @@
+[package]
+name = "rusts-server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Main server binary for RusTs time series database"
+
+[[bin]]
+name = "rusts"
+path = "src/main.rs"
+
+[dependencies]
+rusts-core = { workspace = true }
+rusts-storage = { workspace = true }
+rusts-compression = { workspace = true }
+rusts-index = { workspace = true }
+rusts-query = { workspace = true }
+rusts-cluster = { workspace = true }
+rusts-aggregation = { workspace = true }
+rusts-retention = { workspace = true }
+rusts-api = { workspace = true }
+
+tokio = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }
+tempfile = { workspace = true }
+criterion = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[[bench]]
+name = "ingestion"
+harness = false
+
+[[bench]]
+name = "query"
+harness = false

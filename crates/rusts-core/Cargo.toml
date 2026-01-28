@@ -1,0 +1,19 @@
+[package]
+name = "rusts-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Core types for RusTs time series database"
+
+[dependencies]
+serde = { workspace = true }
+bincode = { workspace = true }
+thiserror = { workspace = true }
+fxhash = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }
+serde_json = { workspace = true }

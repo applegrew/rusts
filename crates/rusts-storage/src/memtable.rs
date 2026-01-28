@@ -1,0 +1,472 @@
+//! MemTable - In-memory write buffer
+//!
+//! Points are first written to the MemTable before being flushed to segments.
+//! The MemTable is organized by series ID for efficient querying.
+
+use crate::error::{Result, StorageError};
+use dashmap::DashMap;
+use parking_lot::RwLock;
+use rusts_core::{Point, SeriesId, TimeRange, Timestamp};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// A single point stored in the MemTable (without redundant measurement/tags)
+#[derive(Debug, Clone)]
+pub struct MemTablePoint {
+    pub timestamp: Timestamp,
+    pub fields: Vec<(String, rusts_core::FieldValue)>,
+}
+
+impl MemTablePoint {
+    pub fn from_point(point: &Point) -> Self {
+        Self {
+            timestamp: point.timestamp,
+            fields: point
+                .fields
+                .iter()
+                .map(|f| (f.key.clone(), f.value.clone()))
+                .collect(),
+        }
+    }
+}
+
+/// Series data in the MemTable
+#[derive(Debug)]
+struct SeriesData {
+    /// Measurement name
+    measurement: String,
+    /// Tags for this series
+    tags: Vec<rusts_core::Tag>,
+    /// Points sorted by timestamp
+    points: RwLock<Vec<MemTablePoint>>,
+}
+
+/// Flush trigger configuration
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FlushTrigger {
+    /// Maximum memory size in bytes
+    pub max_size: usize,
+    /// Maximum number of points
+    pub max_points: usize,
+    /// Maximum age of oldest point (nanoseconds)
+    pub max_age_nanos: i64,
+}
+
+impl Default for FlushTrigger {
+    fn default() -> Self {
+        Self {
+            max_size: 64 * 1024 * 1024,          // 64MB
+            max_points: 1_000_000,               // 1M points
+            max_age_nanos: 60 * 1_000_000_000,   // 60 seconds
+        }
+    }
+}
+
+/// MemTable - In-memory write buffer
+pub struct MemTable {
+    /// Series ID -> Series data
+    series: DashMap<SeriesId, SeriesData>,
+    /// Approximate memory usage
+    size: AtomicUsize,
+    /// Total point count
+    point_count: AtomicUsize,
+    /// Flush trigger configuration
+    flush_trigger: FlushTrigger,
+    /// Oldest timestamp in the MemTable
+    oldest_timestamp: RwLock<Option<Timestamp>>,
+    /// Is the MemTable sealed (no more writes allowed)
+    sealed: RwLock<bool>,
+}
+
+impl MemTable {
+    /// Create a new MemTable with default flush trigger
+    pub fn new() -> Self {
+        Self::with_flush_trigger(FlushTrigger::default())
+    }
+
+    /// Create a new MemTable with custom flush trigger
+    pub fn with_flush_trigger(flush_trigger: FlushTrigger) -> Self {
+        Self {
+            series: DashMap::new(),
+            size: AtomicUsize::new(0),
+            point_count: AtomicUsize::new(0),
+            flush_trigger,
+            oldest_timestamp: RwLock::new(None),
+            sealed: RwLock::new(false),
+        }
+    }
+
+    /// Insert a point into the MemTable
+    pub fn insert(&self, point: &Point) -> Result<()> {
+        if *self.sealed.read() {
+            return Err(StorageError::MemTableFull);
+        }
+
+        let series_id = point.series_id();
+        let mem_point = MemTablePoint::from_point(point);
+
+        // Estimate memory size (rough approximation)
+        let point_size = std::mem::size_of::<MemTablePoint>()
+            + mem_point.fields.iter().map(|(k, v)| {
+                k.len() + match v {
+                    rusts_core::FieldValue::String(s) => s.len(),
+                    _ => 8,
+                }
+            }).sum::<usize>();
+
+        // Insert into series
+        self.series
+            .entry(series_id)
+            .or_insert_with(|| {
+                // New series - add overhead
+                let series_size = std::mem::size_of::<SeriesData>()
+                    + point.measurement.len()
+                    + point.tags.iter().map(|t| t.key.len() + t.value.len()).sum::<usize>();
+                self.size.fetch_add(series_size, Ordering::Relaxed);
+
+                SeriesData {
+                    measurement: point.measurement.clone(),
+                    tags: point.tags.clone(),
+                    points: RwLock::new(Vec::new()),
+                }
+            })
+            .points
+            .write()
+            .push(mem_point);
+
+        self.size.fetch_add(point_size, Ordering::Relaxed);
+        self.point_count.fetch_add(1, Ordering::Relaxed);
+
+        // Update oldest timestamp
+        {
+            let mut oldest = self.oldest_timestamp.write();
+            match *oldest {
+                None => *oldest = Some(point.timestamp),
+                Some(ts) if point.timestamp < ts => *oldest = Some(point.timestamp),
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Insert multiple points
+    pub fn insert_batch(&self, points: &[Point]) -> Result<()> {
+        for point in points {
+            self.insert(point)?;
+        }
+        Ok(())
+    }
+
+    /// Query points for a series within a time range
+    pub fn query(
+        &self,
+        series_id: SeriesId,
+        time_range: &TimeRange,
+    ) -> Vec<MemTablePoint> {
+        self.series
+            .get(&series_id)
+            .map(|series| {
+                series
+                    .points
+                    .read()
+                    .iter()
+                    .filter(|p| time_range.contains(p.timestamp))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Query points for all series matching a measurement
+    pub fn query_measurement(
+        &self,
+        measurement: &str,
+        time_range: &TimeRange,
+    ) -> Vec<(SeriesId, Vec<MemTablePoint>)> {
+        self.series
+            .iter()
+            .filter(|entry| entry.value().measurement == measurement)
+            .map(|entry| {
+                let series_id = *entry.key();
+                let points: Vec<MemTablePoint> = entry
+                    .value()
+                    .points
+                    .read()
+                    .iter()
+                    .filter(|p| time_range.contains(p.timestamp))
+                    .cloned()
+                    .collect();
+                (series_id, points)
+            })
+            .filter(|(_, points)| !points.is_empty())
+            .collect()
+    }
+
+    /// Check if flush should be triggered
+    pub fn should_flush(&self) -> bool {
+        if self.size.load(Ordering::Relaxed) >= self.flush_trigger.max_size {
+            return true;
+        }
+
+        if self.point_count.load(Ordering::Relaxed) >= self.flush_trigger.max_points {
+            return true;
+        }
+
+        if let Some(oldest) = *self.oldest_timestamp.read() {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as i64;
+            if now - oldest >= self.flush_trigger.max_age_nanos {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Seal the MemTable (no more writes allowed)
+    pub fn seal(&self) {
+        *self.sealed.write() = true;
+    }
+
+    /// Check if sealed
+    pub fn is_sealed(&self) -> bool {
+        *self.sealed.read()
+    }
+
+    /// Get approximate memory size
+    pub fn size(&self) -> usize {
+        self.size.load(Ordering::Relaxed)
+    }
+
+    /// Get total point count
+    pub fn point_count(&self) -> usize {
+        self.point_count.load(Ordering::Relaxed)
+    }
+
+    /// Get number of series
+    pub fn series_count(&self) -> usize {
+        self.series.len()
+    }
+
+    /// Get all series IDs
+    pub fn series_ids(&self) -> Vec<SeriesId> {
+        self.series.iter().map(|e| *e.key()).collect()
+    }
+
+    /// Get series metadata
+    pub fn get_series_meta(&self, series_id: SeriesId) -> Option<(String, Vec<rusts_core::Tag>)> {
+        self.series.get(&series_id).map(|s| {
+            (s.value().measurement.clone(), s.value().tags.clone())
+        })
+    }
+
+    /// Iterate over all series and their points
+    pub fn iter_series(&self) -> impl Iterator<Item = (SeriesId, String, Vec<rusts_core::Tag>, Vec<MemTablePoint>)> + '_ {
+        self.series.iter().map(|entry| {
+            let series_id = *entry.key();
+            let series = entry.value();
+            let points = series.points.read().clone();
+            (series_id, series.measurement.clone(), series.tags.clone(), points)
+        })
+    }
+
+    /// Clear all data (used after flush)
+    pub fn clear(&self) {
+        self.series.clear();
+        self.size.store(0, Ordering::Relaxed);
+        self.point_count.store(0, Ordering::Relaxed);
+        *self.oldest_timestamp.write() = None;
+    }
+}
+
+impl Default for MemTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_test_point(measurement: &str, host: &str, ts: i64, value: f64) -> Point {
+        Point::builder(measurement)
+            .timestamp(ts)
+            .tag("host", host)
+            .field("value", value)
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_memtable_insert_query() {
+        let memtable = MemTable::new();
+
+        let point = create_test_point("cpu", "server01", 1000, 64.5);
+        let series_id = point.series_id();
+
+        memtable.insert(&point).unwrap();
+
+        assert_eq!(memtable.point_count(), 1);
+        assert_eq!(memtable.series_count(), 1);
+
+        let range = TimeRange::new(0, 2000);
+        let results = memtable.query(series_id, &range);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].timestamp, 1000);
+    }
+
+    #[test]
+    fn test_memtable_multiple_series() {
+        let memtable = MemTable::new();
+
+        let p1 = create_test_point("cpu", "server01", 1000, 64.5);
+        let p2 = create_test_point("cpu", "server02", 1000, 70.0);
+        let p3 = create_test_point("mem", "server01", 1000, 8000.0);
+
+        memtable.insert(&p1).unwrap();
+        memtable.insert(&p2).unwrap();
+        memtable.insert(&p3).unwrap();
+
+        assert_eq!(memtable.point_count(), 3);
+        assert_eq!(memtable.series_count(), 3);
+    }
+
+    #[test]
+    fn test_memtable_query_measurement() {
+        let memtable = MemTable::new();
+
+        for i in 0..10 {
+            let p = create_test_point("cpu", &format!("server{:02}", i), i * 1000, i as f64);
+            memtable.insert(&p).unwrap();
+        }
+
+        let p = create_test_point("mem", "server01", 5000, 8000.0);
+        memtable.insert(&p).unwrap();
+
+        let range = TimeRange::new(0, 100000);
+        let results = memtable.query_measurement("cpu", &range);
+
+        assert_eq!(results.len(), 10);
+    }
+
+    #[test]
+    fn test_memtable_time_range_filter() {
+        let memtable = MemTable::new();
+
+        let point = create_test_point("cpu", "server01", 1000, 64.5);
+        let series_id = point.series_id();
+
+        for i in 0..100 {
+            let p = create_test_point("cpu", "server01", i * 1000, i as f64);
+            memtable.insert(&p).unwrap();
+        }
+
+        // Query only middle range
+        let range = TimeRange::new(25000, 75000);
+        let results = memtable.query(series_id, &range);
+
+        assert_eq!(results.len(), 50);
+        assert!(results.iter().all(|p| p.timestamp >= 25000 && p.timestamp < 75000));
+    }
+
+    #[test]
+    fn test_memtable_flush_trigger_size() {
+        let trigger = FlushTrigger {
+            max_size: 1000,
+            max_points: 1_000_000,
+            max_age_nanos: i64::MAX,
+        };
+        let memtable = MemTable::with_flush_trigger(trigger);
+
+        // Insert until we exceed size
+        for i in 0..100 {
+            let p = create_test_point("cpu", "server01", i * 1000, i as f64);
+            memtable.insert(&p).unwrap();
+        }
+
+        assert!(memtable.should_flush());
+    }
+
+    #[test]
+    fn test_memtable_flush_trigger_points() {
+        let trigger = FlushTrigger {
+            max_size: usize::MAX,
+            max_points: 50,
+            max_age_nanos: i64::MAX,
+        };
+        let memtable = MemTable::with_flush_trigger(trigger);
+
+        for i in 0..50 {
+            let p = create_test_point("cpu", "server01", i * 1000, i as f64);
+            memtable.insert(&p).unwrap();
+        }
+
+        assert!(memtable.should_flush());
+    }
+
+    #[test]
+    fn test_memtable_seal() {
+        let memtable = MemTable::new();
+
+        let p1 = create_test_point("cpu", "server01", 1000, 64.5);
+        memtable.insert(&p1).unwrap();
+
+        memtable.seal();
+        assert!(memtable.is_sealed());
+
+        let p2 = create_test_point("cpu", "server01", 2000, 70.0);
+        assert!(memtable.insert(&p2).is_err());
+    }
+
+    #[test]
+    fn test_memtable_clear() {
+        let memtable = MemTable::new();
+
+        for i in 0..100 {
+            let p = create_test_point("cpu", "server01", i * 1000, i as f64);
+            memtable.insert(&p).unwrap();
+        }
+
+        assert_eq!(memtable.point_count(), 100);
+
+        memtable.clear();
+
+        assert_eq!(memtable.point_count(), 0);
+        assert_eq!(memtable.series_count(), 0);
+        assert_eq!(memtable.size(), 0);
+    }
+
+    #[test]
+    fn test_memtable_concurrent_access() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let memtable = Arc::new(MemTable::new());
+        let mut handles = vec![];
+
+        for t in 0..4 {
+            let mt = Arc::clone(&memtable);
+            handles.push(thread::spawn(move || {
+                for i in 0..1000 {
+                    let p = create_test_point(
+                        "cpu",
+                        &format!("server{}", t),
+                        (t * 1000000 + i) as i64,
+                        i as f64,
+                    );
+                    mt.insert(&p).unwrap();
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert_eq!(memtable.point_count(), 4000);
+        assert_eq!(memtable.series_count(), 4);
+    }
+}

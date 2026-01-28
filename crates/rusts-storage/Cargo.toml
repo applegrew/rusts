@@ -1,0 +1,29 @@
+[package]
+name = "rusts-storage"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Storage engine for RusTs time series database"
+
+[dependencies]
+rusts-core = { workspace = true }
+rusts-compression = { workspace = true }
+
+tokio = { workspace = true }
+async-trait = { workspace = true }
+memmap2 = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+crc32fast = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+crossbeam-channel = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+rand = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
