@@ -1,7 +1,6 @@
 //! Retention policy management
 
 use crate::error::{Result, RetentionError};
-use chrono::{DateTime, Duration, Utc};
 use parking_lot::RwLock;
 use rusts_core::Timestamp;
 use serde::{Deserialize, Serialize};

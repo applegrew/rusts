@@ -2,10 +2,9 @@
 
 use crate::error::{AggregationError, Result};
 use parking_lot::RwLock;
-use rusts_core::{TimeRange, Timestamp};
+use rusts_core::Timestamp;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
 
 /// Aggregate function type
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

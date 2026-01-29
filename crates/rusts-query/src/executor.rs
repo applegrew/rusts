@@ -1,12 +1,12 @@
 //! Query executor
 
 use crate::aggregation::{AggregateFunction, Aggregator, TimeBucketAggregator};
-use crate::error::{QueryError, Result};
+use crate::error::Result;
 use crate::model::{FieldSelection, Query, QueryResult, ResultRow, TagFilter};
-use crate::planner::{QueryOptimizer, QueryPlan, QueryPlanner};
-use rusts_core::{FieldValue, SeriesId, Tag, TimeRange};
+use crate::planner::{QueryOptimizer, QueryPlanner};
+use rusts_core::{FieldValue, SeriesId, Tag};
 use rusts_index::{SeriesIndex, TagIndex};
-use rusts_storage::{MemTablePoint, StorageEngine};
+use rusts_storage::StorageEngine;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -47,7 +47,7 @@ impl QueryExecutor {
 
         // Plan the query
         let plan = self.planner.plan(query.clone())?;
-        let plan = QueryOptimizer::optimize(plan);
+        let _plan = QueryOptimizer::optimize(plan);
 
         // Resolve series IDs from filters
         let series_ids = self.resolve_series_ids(&query)?;

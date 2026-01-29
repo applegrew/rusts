@@ -5,7 +5,7 @@
 //! - Read path: MemTable + Segments
 //! - Background flushing and compaction
 
-use crate::error::{Result, StorageError};
+use crate::error::Result;
 use crate::memtable::{FlushTrigger, MemTable, MemTablePoint};
 use crate::partition::PartitionManager;
 use crate::wal::{WalDurability, WalReader, WalWriter};

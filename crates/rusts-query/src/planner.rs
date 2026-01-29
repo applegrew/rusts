@@ -3,7 +3,6 @@
 use crate::error::Result;
 use crate::model::{Query, TagFilter};
 use rusts_core::{SeriesId, TimeRange};
-use std::collections::HashSet;
 
 /// Query plan describing how to execute a query
 #[derive(Debug, Clone)]

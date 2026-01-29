@@ -105,7 +105,7 @@ impl GorillaEncoder {
     }
 
     /// Finish encoding and return the compressed bytes
-    pub fn finish(mut self) -> Vec<u8> {
+    pub fn finish(self) -> Vec<u8> {
         // Pad the last byte if needed
         if self.bit_pos > 0 {
             // Byte is already in buffer, just ensure we're aligned

@@ -2,7 +2,7 @@
 //!
 //! Provides fast lookup of series metadata by series ID.
 
-use crate::error::{IndexError, Result};
+use crate::error::Result;
 use dashmap::DashMap;
 use rusts_core::{SeriesId, Tag};
 use serde::{Deserialize, Serialize};

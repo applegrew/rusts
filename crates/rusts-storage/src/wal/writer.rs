@@ -1,6 +1,6 @@
 //! WAL writer implementation
 
-use crate::error::{Result, StorageError};
+use crate::error::Result;
 use crc32fast::Hasher;
 use parking_lot::Mutex;
 use rusts_core::Point;

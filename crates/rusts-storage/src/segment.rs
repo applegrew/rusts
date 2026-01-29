@@ -10,7 +10,7 @@ use rusts_compression::{
     GorillaEncoder, GorillaDecoder, TimestampEncoder, TimestampDecoder,
     IntegerEncoder, IntegerDecoder,
 };
-use rusts_core::{FieldValue, SeriesId, Tag, TimeRange, Timestamp};
+use rusts_core::{FieldValue, SeriesId, Tag, TimeRange};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;

@@ -1,15 +1,14 @@
 //! HTTP request handlers
 
-use crate::error::{ApiError, Result};
+use crate::error::ApiError;
 use crate::line_protocol::LineProtocolParser;
 use axum::{
-    extract::{Query as AxumQuery, State},
-    http::StatusCode,
+    extract::State,
     response::Json,
 };
 use rusts_core::TimeRange;
 use rusts_index::{SeriesIndex, TagIndex};
-use rusts_query::{AggregateFunction, Query, QueryExecutor, QueryResult};
+use rusts_query::{AggregateFunction, Query, QueryExecutor};
 use rusts_storage::StorageEngine;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -69,7 +68,7 @@ pub struct ReadyResponse {
 }
 
 /// Ready check handler
-pub async fn ready(State(state): State<Arc<AppState>>) -> Json<ReadyResponse> {
+pub async fn ready(State(_state): State<Arc<AppState>>) -> Json<ReadyResponse> {
     // Check storage health
     let storage_status = "ok".to_string();
 

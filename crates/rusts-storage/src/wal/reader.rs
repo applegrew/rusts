@@ -1,7 +1,6 @@
 //! WAL reader implementation
 
 use crate::error::{Result, StorageError};
-use crate::wal::writer::WalDurability;
 use crc32fast::Hasher;
 use rusts_core::Point;
 use serde::{Deserialize, Serialize};
