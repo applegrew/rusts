@@ -58,16 +58,6 @@ impl WalEntryHeader {
         // bytes[28..32] is padding
         bytes
     }
-
-    fn from_bytes(bytes: &[u8; Self::SIZE]) -> Self {
-        Self {
-            sequence: u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
-            timestamp: i64::from_le_bytes(bytes[8..16].try_into().unwrap()),
-            point_count: u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
-            data_len: u32::from_le_bytes(bytes[20..24].try_into().unwrap()),
-            checksum: u32::from_le_bytes(bytes[24..28].try_into().unwrap()),
-        }
-    }
 }
 
 /// WAL writer
