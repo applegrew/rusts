@@ -20,6 +20,9 @@ use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 use rusts_core::{FieldValue, Point};
 use rusts_importer::{inspect_parquet_schema, ParquetReader, ParquetReaderConfig, RustsWriter};
+use rusts_storage::{StorageEngine, StorageEngineConfig};
+use rusts_storage::memtable::FlushTrigger;
+use rusts_storage::wal::WalDurability;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -72,6 +75,14 @@ enum Commands {
         /// Column name to use for deduplication (removes duplicate values)
         #[arg(long)]
         dedup_column: Option<String>,
+
+        /// Write directly to storage engine (bypasses REST API, much faster)
+        #[arg(long)]
+        direct: bool,
+
+        /// Data directory for direct mode (default: ./data)
+        #[arg(long, default_value = "./data")]
+        data_dir: PathBuf,
     },
 }
 
@@ -97,6 +108,8 @@ async fn main() -> Result<()> {
             schema_only,
             dry_run,
             dedup_column,
+            direct,
+            data_dir,
         } => {
             import_parquet(
                 file,
@@ -108,6 +121,8 @@ async fn main() -> Result<()> {
                 schema_only,
                 dry_run,
                 dedup_column,
+                direct,
+                data_dir,
             )
             .await
         }
@@ -124,6 +139,8 @@ async fn import_parquet(
     schema_only: bool,
     dry_run: bool,
     dedup_column: Option<String>,
+    direct: bool,
+    data_dir: PathBuf,
 ) -> Result<()> {
     // Check file exists
     if !file.exists() {
@@ -216,67 +233,123 @@ async fn import_parquet(
     }
 
     if dry_run {
-        info!("Dry run - skipping server write");
+        info!("Dry run - skipping write");
         println!("\nDry run complete:");
         println!("  Points read: {}", points.len());
-        println!("  Would write to: {}", server);
+        if direct {
+            println!("  Would write to: {}", data_dir.display());
+        } else {
+            println!("  Would write to: {}", server);
+        }
         return Ok(());
     }
 
-    // Connect to server
-    info!("Connecting to server: {}", server);
-    let writer = RustsWriter::new(&server).context("Failed to create writer")?;
-
-    // Check server health
-    if !writer.health_check().await.unwrap_or(false) {
-        anyhow::bail!("Server is not healthy or unreachable: {}", server);
-    }
-    info!("Server is healthy");
-
-    // Write data with progress bar
-    info!("Writing {} points in batches of {}...", points.len(), batch_size);
+    // Write data - either direct or via REST
     let write_start = Instant::now();
+    let points_written;
 
-    let progress = ProgressBar::new(points.len() as u64);
-    progress.set_style(
-        ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) {msg}")
-            .expect("Invalid progress style template")
-            .progress_chars("#>-"),
-    );
+    if direct {
+        // Direct mode - write to storage engine
+        info!("Opening storage engine at: {}", data_dir.display());
 
-    let result = writer
-        .write_batched_with_progress(&points, batch_size, |written, _total| {
+        let config = StorageEngineConfig {
+            data_dir: data_dir.clone(),
+            wal_dir: None,
+            wal_durability: WalDurability::None, // Skip WAL - source file is our recovery
+            flush_trigger: FlushTrigger {
+                max_size: 256 * 1024 * 1024,    // 256MB memtable
+                max_points: 10_000_000,          // 10M points
+                max_age_nanos: i64::MAX,         // Don't flush on age during import
+            },
+            partition_duration: 24 * 60 * 60 * 1_000_000_000, // 1 day
+            compression: rusts_compression::CompressionLevel::Default,
+        };
+
+        let engine = StorageEngine::new(config).context("Failed to open storage engine")?;
+
+        info!("Writing {} points in batches of {}...", points.len(), batch_size);
+
+        let progress = ProgressBar::new(points.len() as u64);
+        progress.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) {msg}")
+                .expect("Invalid progress style template")
+                .progress_chars("#>-"),
+        );
+
+        let mut written = 0;
+        for batch in points.chunks(batch_size) {
+            engine.write_batch(batch).context("Failed to write batch")?;
+            written += batch.len();
             progress.set_position(written as u64);
             let elapsed = write_start.elapsed().as_secs_f64();
             if elapsed > 0.0 {
                 let rate = written as f64 / elapsed;
                 progress.set_message(format!("{:.0} pts/sec", rate));
             }
-        })
-        .await
-        .context("Failed to write to server")?;
+        }
 
-    progress.finish_with_message("done");
+        // Flush and shutdown cleanly
+        engine.flush().context("Failed to flush")?;
+        engine.shutdown().context("Failed to shutdown engine")?;
+
+        progress.finish_with_message("done");
+        points_written = written;
+    } else {
+        // REST mode - write via HTTP
+        info!("Connecting to server: {}", server);
+        let writer = RustsWriter::new(&server).context("Failed to create writer")?;
+
+        // Check server health
+        if !writer.health_check().await.unwrap_or(false) {
+            anyhow::bail!("Server is not healthy or unreachable: {}", server);
+        }
+        info!("Server is healthy");
+
+        info!("Writing {} points in batches of {}...", points.len(), batch_size);
+
+        let progress = ProgressBar::new(points.len() as u64);
+        progress.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) {msg}")
+                .expect("Invalid progress style template")
+                .progress_chars("#>-"),
+        );
+
+        let result = writer
+            .write_batched_with_progress(&points, batch_size, |written, _total| {
+                progress.set_position(written as u64);
+                let elapsed = write_start.elapsed().as_secs_f64();
+                if elapsed > 0.0 {
+                    let rate = written as f64 / elapsed;
+                    progress.set_message(format!("{:.0} pts/sec", rate));
+                }
+            })
+            .await
+            .context("Failed to write to server")?;
+
+        progress.finish_with_message("done");
+        points_written = result.points_written;
+    }
+
     let write_duration = write_start.elapsed();
     let total_duration = start.elapsed();
 
     info!(
         "Wrote {} points in {:.2}s ({:.0} points/sec)",
-        result.points_written,
+        points_written,
         write_duration.as_secs_f64(),
-        result.points_written as f64 / write_duration.as_secs_f64()
+        points_written as f64 / write_duration.as_secs_f64()
     );
 
     println!("\nImport complete:");
-    println!("  Points imported: {}", result.points_written);
-    println!("  Bytes sent: {} KB", result.bytes_sent / 1024);
+    println!("  Points imported: {}", points_written);
     println!("  Read time: {:.2}s", read_duration.as_secs_f64());
     println!("  Write time: {:.2}s", write_duration.as_secs_f64());
     println!("  Total time: {:.2}s", total_duration.as_secs_f64());
     println!(
         "  Throughput: {:.0} points/sec",
-        result.points_written as f64 / total_duration.as_secs_f64()
+        points_written as f64 / total_duration.as_secs_f64()
     );
 
     Ok(())

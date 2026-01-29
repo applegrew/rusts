@@ -12,6 +12,8 @@ path = "src/main.rs"
 
 [dependencies]
 rusts-core = { workspace = true }
+rusts-storage = { path = "../rusts-storage" }
+rusts-compression = { path = "../rusts-compression" }
 
 # Data format
 arrow = { workspace = true }
