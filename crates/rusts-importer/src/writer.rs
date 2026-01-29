@@ -2,6 +2,8 @@
 
 use crate::error::{ImportError, Result};
 use rusts_core::Point;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::time::Duration;
 
 /// HTTP client for writing to RusTs server
@@ -10,11 +12,45 @@ pub struct RustsWriter {
     base_url: String,
 }
 
+/// Query request matching the API's QueryRequest
+#[derive(Debug, Serialize)]
+pub struct QueryRequest {
+    pub measurement: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_range: Option<TimeRangeRequest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fields: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TimeRangeRequest {
+    pub start: i64,
+    pub end: i64,
+}
+
+/// Query response matching the API's QueryResponse
+#[derive(Debug, Deserialize)]
+pub struct QueryResponse {
+    pub measurement: String,
+    pub results: Vec<ResultRow>,
+    pub total_rows: usize,
+    pub execution_time_ms: f64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ResultRow {
+    pub time: Option<i64>,
+    pub tags: HashMap<String, String>,
+    pub fields: HashMap<String, serde_json::Value>,
+}
+
 impl RustsWriter {
     /// Create a new writer connecting to the given server URL
     pub fn new(server_url: impl Into<String>) -> Result<Self> {
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(60)) // Longer timeout for queries
             .build()?;
 
         let mut base_url = server_url.into();
@@ -31,6 +67,38 @@ impl RustsWriter {
         let url = format!("{}/health", self.base_url);
         let response = self.client.get(&url).send().await?;
         Ok(response.status().is_success())
+    }
+
+    /// Query the database for existing records
+    pub async fn query(
+        &self,
+        measurement: &str,
+        time_range: Option<(i64, i64)>,
+        fields: Option<Vec<String>>,
+        limit: Option<usize>,
+    ) -> Result<QueryResponse> {
+        let url = format!("{}/query", self.base_url);
+
+        let request = QueryRequest {
+            measurement: measurement.to_string(),
+            time_range: time_range.map(|(start, end)| TimeRangeRequest { start, end }),
+            fields,
+            limit,
+        };
+
+        let response = self.client.post(&url).json(&request).send().await?;
+
+        if response.status().is_success() {
+            let query_response: QueryResponse = response.json().await?;
+            Ok(query_response)
+        } else {
+            let status = response.status().as_u16();
+            let message = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            Err(ImportError::Server { status, message })
+        }
     }
 
     /// Write points to the server using line protocol

@@ -122,7 +122,9 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
 
-        /// Column name to use for deduplication (removes duplicate values, not available with --direct)
+        /// Column name to use for deduplication against existing DB records.
+        /// Only imports records whose dedup column value doesn't already exist in the database.
+        /// For direct mode, only field columns are supported (not tags).
         #[arg(long)]
         dedup_column: Option<String>,
 
@@ -233,13 +235,16 @@ async fn import_parquet(
         .with_batch_size(batch_size);
 
     // Determine mode
-    let use_streaming = dedup_column.is_none();
     let mode_str = if direct {
-        "direct (streaming)"
-    } else if use_streaming {
-        "REST API (streaming)"
+        if dedup_column.is_some() {
+            "direct (streaming with DB dedup)"
+        } else {
+            "direct (streaming)"
+        }
+    } else if dedup_column.is_some() {
+        "REST API (streaming with DB dedup)"
     } else {
-        "REST API (buffered - dedup enabled)"
+        "REST API (streaming)"
     };
 
     info!("Configuration:");
@@ -249,7 +254,7 @@ async fn import_parquet(
     info!("  Batch size: {}", batch_size);
     info!("  Mode: {}", mode_str);
     if let Some(ref col) = dedup_column {
-        info!("  Dedup column: {}", col);
+        info!("  Dedup column: {} (checks against existing DB records)", col);
     }
 
     let reader = ParquetReader::new(config);
@@ -257,13 +262,10 @@ async fn import_parquet(
 
     if direct {
         // STREAMING DIRECT MODE - read and write batches without loading all into memory
-        import_direct_streaming(&reader, &file, &data_dir, batch_size, dry_run, start).await
-    } else if use_streaming {
-        // STREAMING REST MODE - read and send batches without loading all into memory
-        import_via_rest_streaming(&reader, &file, &server, batch_size, dry_run, start).await
+        import_direct_streaming(&reader, &file, &data_dir, batch_size, dry_run, dedup_column.clone(), &measurement, start).await
     } else {
-        // BUFFERED REST MODE - load all into memory (required for deduplication)
-        import_via_rest_buffered(&reader, &file, &server, batch_size, dry_run, dedup_column, start).await
+        // STREAMING REST MODE - read and send batches without loading all into memory
+        import_via_rest_streaming(&reader, &file, &server, batch_size, dry_run, dedup_column.clone(), &measurement, start).await
     }
 }
 
@@ -274,6 +276,8 @@ async fn import_direct_streaming(
     data_dir: &PathBuf,
     batch_size: usize,
     dry_run: bool,
+    dedup_column: Option<String>,
+    measurement: &str,
     start: Instant,
 ) -> Result<()> {
     if dry_run {
@@ -309,6 +313,21 @@ async fn import_direct_streaming(
 
     let engine = StorageEngine::new(storage_config).context("Failed to open storage engine")?;
 
+    // If dedup is enabled, query existing keys from the database
+    let existing_keys: HashSet<String> = if let Some(ref dedup_col) = dedup_column {
+        info!("Querying existing records for deduplication (column: {})...", dedup_col);
+        let query_start = Instant::now();
+        let keys = query_existing_keys_direct(&engine, measurement, dedup_col)?;
+        info!(
+            "Found {} existing records in {:.2}s",
+            keys.len(),
+            query_start.elapsed().as_secs_f64()
+        );
+        keys
+    } else {
+        HashSet::new()
+    };
+
     info!("Streaming import started (batch size: {})...", batch_size);
 
     // Create a spinner since we don't know total count upfront
@@ -322,15 +341,24 @@ async fn import_direct_streaming(
     let batches = reader.read_file_batched(file).context("Failed to read Parquet file")?;
 
     let mut total_written = 0;
+    let mut total_skipped = 0;
     let mut batch_count = 0;
 
     for batch_result in batches {
         let batch = batch_result.context("Failed to read batch")?;
-        let batch_len = batch.len();
 
-        if !batch.is_empty() {
-            engine.write_batch(&batch).context("Failed to write batch")?;
-            total_written += batch_len;
+        // Filter out duplicates if dedup is enabled
+        let batch_to_write = if let Some(ref dedup_col) = dedup_column {
+            let (new_points, skipped) = filter_existing_points(batch, dedup_col, &existing_keys);
+            total_skipped += skipped;
+            new_points
+        } else {
+            batch
+        };
+
+        if !batch_to_write.is_empty() {
+            engine.write_batch(&batch_to_write).context("Failed to write batch")?;
+            total_written += batch_to_write.len();
             batch_count += 1;
 
             let elapsed = start.elapsed().as_secs_f64();
@@ -339,9 +367,14 @@ async fn import_direct_streaming(
             } else {
                 0.0
             };
+            let skip_msg = if total_skipped > 0 {
+                format!(", {} skipped", total_skipped)
+            } else {
+                String::new()
+            };
             progress.set_message(format!(
-                "{} points written ({} batches) - {:.0} pts/sec",
-                total_written, batch_count, rate
+                "{} points written ({} batches{}) - {:.0} pts/sec",
+                total_written, batch_count, skip_msg, rate
             ));
         }
     }
@@ -357,6 +390,9 @@ async fn import_direct_streaming(
 
     println!("\nImport complete:");
     println!("  Points imported: {}", total_written);
+    if total_skipped > 0 {
+        println!("  Points skipped (duplicates): {}", total_skipped);
+    }
     println!("  Batches processed: {}", batch_count);
     println!("  Total time: {:.2}s", total_duration.as_secs_f64());
     println!(
@@ -374,6 +410,8 @@ async fn import_via_rest_streaming(
     server: &str,
     batch_size: usize,
     dry_run: bool,
+    dedup_column: Option<String>,
+    measurement: &str,
     start: Instant,
 ) -> Result<()> {
     if dry_run {
@@ -399,6 +437,21 @@ async fn import_via_rest_streaming(
     }
     info!("Server is healthy");
 
+    // If dedup is enabled, query existing keys from the database
+    let existing_keys: HashSet<String> = if let Some(ref dedup_col) = dedup_column {
+        info!("Querying existing records for deduplication (column: {})...", dedup_col);
+        let query_start = Instant::now();
+        let keys = query_existing_keys_rest(&writer, measurement, dedup_col).await?;
+        info!(
+            "Found {} existing records in {:.2}s",
+            keys.len(),
+            query_start.elapsed().as_secs_f64()
+        );
+        keys
+    } else {
+        HashSet::new()
+    };
+
     info!("Streaming import started (batch size: {})...", batch_size);
 
     let progress = ProgressBar::new_spinner();
@@ -411,13 +464,23 @@ async fn import_via_rest_streaming(
     let batches = reader.read_file_batched(file).context("Failed to read Parquet file")?;
 
     let mut total_written = 0;
+    let mut total_skipped = 0;
     let mut batch_count = 0;
 
     for batch_result in batches {
         let batch = batch_result.context("Failed to read batch")?;
 
-        if !batch.is_empty() {
-            let result = writer.write(&batch).await.context("Failed to write batch")?;
+        // Filter out duplicates if dedup is enabled
+        let batch_to_write = if let Some(ref dedup_col) = dedup_column {
+            let (new_points, skipped) = filter_existing_points(batch, dedup_col, &existing_keys);
+            total_skipped += skipped;
+            new_points
+        } else {
+            batch
+        };
+
+        if !batch_to_write.is_empty() {
+            let result = writer.write(&batch_to_write).await.context("Failed to write batch")?;
             total_written += result.points_written;
             batch_count += 1;
 
@@ -427,9 +490,14 @@ async fn import_via_rest_streaming(
             } else {
                 0.0
             };
+            let skip_msg = if total_skipped > 0 {
+                format!(", {} skipped", total_skipped)
+            } else {
+                String::new()
+            };
             progress.set_message(format!(
-                "{} points written ({} batches) - {:.0} pts/sec",
-                total_written, batch_count, rate
+                "{} points written ({} batches{}) - {:.0} pts/sec",
+                total_written, batch_count, skip_msg, rate
             ));
         }
     }
@@ -440,6 +508,9 @@ async fn import_via_rest_streaming(
 
     println!("\nImport complete:");
     println!("  Points imported: {}", total_written);
+    if total_skipped > 0 {
+        println!("  Points skipped (duplicates): {}", total_skipped);
+    }
     println!("  Batches processed: {}", batch_count);
     println!("  Total time: {:.2}s", total_duration.as_secs_f64());
     println!(
@@ -450,145 +521,101 @@ async fn import_via_rest_streaming(
     Ok(())
 }
 
-/// Buffered REST API import - loads all data into memory (required for deduplication)
-async fn import_via_rest_buffered(
-    reader: &ParquetReader,
-    file: &PathBuf,
-    server: &str,
-    batch_size: usize,
-    dry_run: bool,
-    dedup_column: Option<String>,
-    start: Instant,
-) -> Result<()> {
-    info!("Reading all data into memory (required for deduplication)...");
-    let points = reader
-        .read_file(file)
-        .context("Failed to read Parquet file")?;
+/// Query existing keys from the database using REST API
+async fn query_existing_keys_rest(
+    writer: &RustsWriter,
+    measurement: &str,
+    dedup_column: &str,
+) -> Result<HashSet<String>> {
+    let mut existing_keys = HashSet::new();
 
-    let read_duration = start.elapsed();
-    let original_count = points.len();
-    info!(
-        "Read {} points in {:.2}s ({:.0} points/sec)",
-        original_count,
-        read_duration.as_secs_f64(),
-        original_count as f64 / read_duration.as_secs_f64()
-    );
+    // Query all records from the measurement, selecting only the dedup column
+    // Use a large time range to get all records
+    let response = writer
+        .query(
+            measurement,
+            Some((0, i64::MAX)),
+            Some(vec![dedup_column.to_string()]),
+            None, // No limit - get all records
+        )
+        .await;
 
-    // Deduplicate if requested
-    let points = if let Some(ref dedup_col) = dedup_column {
-        info!("Deduplicating by column: {}", dedup_col);
-        let deduped = deduplicate_points(points, dedup_col);
-        let removed = original_count - deduped.len();
-        info!(
-            "Deduplication complete: {} duplicates removed, {} unique points",
-            removed,
-            deduped.len()
-        );
-        deduped
-    } else {
-        points
-    };
-
-    if points.is_empty() {
-        warn!("No points to import");
-        return Ok(());
-    }
-
-    // Show sample point
-    if let Some(sample) = points.first() {
-        info!("Sample point:");
-        info!("  Measurement: {}", sample.measurement);
-        info!("  Tags: {:?}", sample.tags);
-        info!(
-            "  Fields: {:?}",
-            sample
-                .fields
-                .iter()
-                .map(|f| &f.key)
-                .collect::<Vec<_>>()
-        );
-        info!("  Timestamp: {}", sample.timestamp);
-    }
-
-    if dry_run {
-        println!("\nDry run complete:");
-        println!("  Points read: {}", points.len());
-        println!("  Would write to: {}", server);
-        return Ok(());
-    }
-
-    // Connect to server
-    info!("Connecting to server: {}", server);
-    let writer = RustsWriter::new(server).context("Failed to create writer")?;
-
-    // Check server health
-    if !writer.health_check().await.unwrap_or(false) {
-        anyhow::bail!("Server is not healthy or unreachable: {}", server);
-    }
-    info!("Server is healthy");
-
-    info!(
-        "Writing {} points in batches of {}...",
-        points.len(),
-        batch_size
-    );
-    let write_start = Instant::now();
-
-    let progress = ProgressBar::new(points.len() as u64);
-    progress.set_style(
-        ProgressStyle::default_bar()
-            .template(
-                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) {msg}",
-            )
-            .expect("Invalid progress style template")
-            .progress_chars("#>-"),
-    );
-
-    let result = writer
-        .write_batched_with_progress(&points, batch_size, |written, _total| {
-            progress.set_position(written as u64);
-            let elapsed = write_start.elapsed().as_secs_f64();
-            if elapsed > 0.0 {
-                let rate = written as f64 / elapsed;
-                progress.set_message(format!("{:.0} pts/sec", rate));
+    match response {
+        Ok(query_response) => {
+            for row in query_response.results {
+                // Check in fields
+                if let Some(value) = row.fields.get(dedup_column) {
+                    if let Some(key_str) = json_value_to_string(value) {
+                        existing_keys.insert(key_str);
+                    }
+                }
+                // Also check in tags
+                if let Some(value) = row.tags.get(dedup_column) {
+                    existing_keys.insert(value.clone());
+                }
             }
-        })
-        .await
-        .context("Failed to write to server")?;
+        }
+        Err(e) => {
+            // If measurement doesn't exist yet, that's OK - no duplicates
+            warn!("Query for existing records failed (may be empty measurement): {}", e);
+        }
+    }
 
-    progress.finish_with_message("done");
-
-    let write_duration = write_start.elapsed();
-    let total_duration = start.elapsed();
-
-    info!(
-        "Wrote {} points in {:.2}s ({:.0} points/sec)",
-        result.points_written,
-        write_duration.as_secs_f64(),
-        result.points_written as f64 / write_duration.as_secs_f64()
-    );
-
-    println!("\nImport complete:");
-    println!("  Points imported: {}", result.points_written);
-    println!("  Read time: {:.2}s", read_duration.as_secs_f64());
-    println!("  Write time: {:.2}s", write_duration.as_secs_f64());
-    println!("  Total time: {:.2}s", total_duration.as_secs_f64());
-    println!(
-        "  Throughput: {:.0} points/sec",
-        result.points_written as f64 / total_duration.as_secs_f64()
-    );
-
-    Ok(())
+    Ok(existing_keys)
 }
 
-/// Deduplicate points based on a column value.
-/// The column can be a tag or a field. First occurrence is kept.
-fn deduplicate_points(points: Vec<Point>, dedup_column: &str) -> Vec<Point> {
-    let mut seen: HashSet<String> = HashSet::new();
+/// Query existing keys from the database using direct storage access
+fn query_existing_keys_direct(
+    engine: &StorageEngine,
+    measurement: &str,
+    dedup_column: &str,
+) -> Result<HashSet<String>> {
+    use rusts_core::TimeRange;
+
+    let mut existing_keys = HashSet::new();
+
+    // Query all records from the measurement
+    let time_range = TimeRange::new(0, i64::MAX);
+    let results = engine
+        .query_measurement(measurement, &time_range)
+        .context("Failed to query existing records")?;
+
+    // Note: Direct mode can only deduplicate by fields, not tags.
+    // Tags are encoded in the series_id and not directly accessible from MemTablePoint.
+    let mut found_column = false;
+
+    for (_series_id, points) in results {
+        for point in points {
+            // Check in fields (MemTablePoint only has fields, not tags)
+            if let Some((_, field_value)) = point.fields.iter().find(|(k, _)| k == dedup_column) {
+                existing_keys.insert(field_value_to_string(field_value));
+                found_column = true;
+            }
+        }
+    }
+
+    if !found_column && existing_keys.is_empty() {
+        // No records found with this column - might be a tag or measurement doesn't exist yet
+        warn!(
+            "Column '{}' not found in existing records (may be a tag - direct mode can only dedup by fields)",
+            dedup_column
+        );
+    }
+
+    Ok(existing_keys)
+}
+
+/// Filter out points that already exist in the database based on the dedup column
+fn filter_existing_points(
+    points: Vec<Point>,
+    dedup_column: &str,
+    existing_keys: &HashSet<String>,
+) -> (Vec<Point>, usize) {
     let mut result = Vec::with_capacity(points.len());
+    let mut skipped = 0;
 
     for point in points {
-        // Try to find the value in tags first
+        // Try to find the key in tags first
         let key = point
             .tags
             .iter()
@@ -604,7 +631,9 @@ fn deduplicate_points(points: Vec<Point>, dedup_column: &str) -> Vec<Point> {
             });
 
         if let Some(key) = key {
-            if seen.insert(key) {
+            if existing_keys.contains(&key) {
+                skipped += 1;
+            } else {
                 result.push(point);
             }
         } else {
@@ -613,7 +642,7 @@ fn deduplicate_points(points: Vec<Point>, dedup_column: &str) -> Vec<Point> {
         }
     }
 
-    result
+    (result, skipped)
 }
 
 /// Convert a field value to a string for deduplication comparison
@@ -624,5 +653,15 @@ fn field_value_to_string(value: &FieldValue) -> String {
         FieldValue::UnsignedInteger(v) => v.to_string(),
         FieldValue::String(v) => v.clone(),
         FieldValue::Boolean(v) => v.to_string(),
+    }
+}
+
+/// Convert a JSON value to a string for deduplication comparison
+fn json_value_to_string(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        _ => None,
     }
 }
