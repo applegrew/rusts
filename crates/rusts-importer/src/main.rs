@@ -226,27 +226,30 @@ async fn import_parquet(
         return Ok(());
     }
 
-    // Check for incompatible options
-    if direct && dedup_column.is_some() {
-        warn!("Deduplication is not supported with --direct mode (streaming). Ignoring --dedup-column.");
-    }
-
     // Configure the reader
     let config = ParquetReaderConfig::new(&measurement)
         .with_timestamp_column(&timestamp_column)
         .with_tag_columns(tags.clone())
         .with_batch_size(batch_size);
 
+    // Determine mode
+    let use_streaming = dedup_column.is_none();
+    let mode_str = if direct {
+        "direct (streaming)"
+    } else if use_streaming {
+        "REST API (streaming)"
+    } else {
+        "REST API (buffered - dedup enabled)"
+    };
+
     info!("Configuration:");
     info!("  Measurement: {}", measurement);
     info!("  Timestamp column: {}", timestamp_column);
     info!("  Tag columns: {:?}", tags);
     info!("  Batch size: {}", batch_size);
-    info!("  Mode: {}", if direct { "direct (streaming)" } else { "REST API" });
+    info!("  Mode: {}", mode_str);
     if let Some(ref col) = dedup_column {
-        if !direct {
-            info!("  Dedup column: {}", col);
-        }
+        info!("  Dedup column: {}", col);
     }
 
     let reader = ParquetReader::new(config);
@@ -255,9 +258,12 @@ async fn import_parquet(
     if direct {
         // STREAMING DIRECT MODE - read and write batches without loading all into memory
         import_direct_streaming(&reader, &file, &data_dir, batch_size, dry_run, start).await
+    } else if use_streaming {
+        // STREAMING REST MODE - read and send batches without loading all into memory
+        import_via_rest_streaming(&reader, &file, &server, batch_size, dry_run, start).await
     } else {
-        // REST MODE - load all into memory (supports deduplication)
-        import_via_rest(&reader, &file, &server, batch_size, dry_run, dedup_column, start).await
+        // BUFFERED REST MODE - load all into memory (required for deduplication)
+        import_via_rest_buffered(&reader, &file, &server, batch_size, dry_run, dedup_column, start).await
     }
 }
 
@@ -361,8 +367,91 @@ async fn import_direct_streaming(
     Ok(())
 }
 
-/// REST API import - loads all data into memory (supports deduplication)
-async fn import_via_rest(
+/// Streaming REST API import - reads and sends batches without loading all into memory
+async fn import_via_rest_streaming(
+    reader: &ParquetReader,
+    file: &PathBuf,
+    server: &str,
+    batch_size: usize,
+    dry_run: bool,
+    start: Instant,
+) -> Result<()> {
+    if dry_run {
+        info!("Dry run - counting records...");
+        let batches = reader.read_file_batched(file).context("Failed to read Parquet file")?;
+        let mut total_points = 0;
+        for batch_result in batches {
+            let batch = batch_result?;
+            total_points += batch.len();
+        }
+        println!("\nDry run complete:");
+        println!("  Points counted: {}", total_points);
+        println!("  Would write to: {}", server);
+        return Ok(());
+    }
+
+    // Connect to server first
+    info!("Connecting to server: {}", server);
+    let writer = RustsWriter::new(server).context("Failed to create writer")?;
+
+    if !writer.health_check().await.unwrap_or(false) {
+        anyhow::bail!("Server is not healthy or unreachable: {}", server);
+    }
+    info!("Server is healthy");
+
+    info!("Streaming import started (batch size: {})...", batch_size);
+
+    let progress = ProgressBar::new_spinner();
+    progress.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.green} [{elapsed_precise}] {msg}")
+            .expect("Invalid progress style template"),
+    );
+
+    let batches = reader.read_file_batched(file).context("Failed to read Parquet file")?;
+
+    let mut total_written = 0;
+    let mut batch_count = 0;
+
+    for batch_result in batches {
+        let batch = batch_result.context("Failed to read batch")?;
+
+        if !batch.is_empty() {
+            let result = writer.write(&batch).await.context("Failed to write batch")?;
+            total_written += result.points_written;
+            batch_count += 1;
+
+            let elapsed = start.elapsed().as_secs_f64();
+            let rate = if elapsed > 0.0 {
+                total_written as f64 / elapsed
+            } else {
+                0.0
+            };
+            progress.set_message(format!(
+                "{} points written ({} batches) - {:.0} pts/sec",
+                total_written, batch_count, rate
+            ));
+        }
+    }
+
+    progress.finish_with_message(format!("{} points written - done", total_written));
+
+    let total_duration = start.elapsed();
+
+    println!("\nImport complete:");
+    println!("  Points imported: {}", total_written);
+    println!("  Batches processed: {}", batch_count);
+    println!("  Total time: {:.2}s", total_duration.as_secs_f64());
+    println!(
+        "  Throughput: {:.0} points/sec",
+        total_written as f64 / total_duration.as_secs_f64()
+    );
+
+    Ok(())
+}
+
+/// Buffered REST API import - loads all data into memory (required for deduplication)
+async fn import_via_rest_buffered(
     reader: &ParquetReader,
     file: &PathBuf,
     server: &str,
@@ -371,7 +460,7 @@ async fn import_via_rest(
     dedup_column: Option<String>,
     start: Instant,
 ) -> Result<()> {
-    info!("Reading all data into memory...");
+    info!("Reading all data into memory (required for deduplication)...");
     let points = reader
         .read_file(file)
         .context("Failed to read Parquet file")?;
