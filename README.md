@@ -89,23 +89,86 @@ cargo test --workspace
 ### Run the Server
 
 ```bash
-# Start with default settings (standalone mode)
+# Start with default settings (reads rusts.yml if present)
 cargo run --release -p rusts-server
 
-# Or with custom configuration
+# Generate a default configuration file
+cargo run --release -p rusts-server -- --generate-config
+
+# Use a custom configuration file
+cargo run --release -p rusts-server -- --config /etc/rusts/rusts.yml
+
+# Override config with command line arguments
 cargo run --release -p rusts-server -- \
   --data-dir /var/lib/rusts \
-  --bind 0.0.0.0:8086 \
-  --wal-mode periodic
+  --host 0.0.0.0 \
+  --port 8086
 ```
 
-### Configuration Options
+### Configuration File (rusts.yml)
+
+RusTs reads configuration from `rusts.yml` in the current directory by default. Generate a default config with `--generate-config`.
+
+```yaml
+server:
+  host: 0.0.0.0
+  port: 8086
+  max_body_size: 10485760    # 10MB max request body
+  request_timeout_secs: 30
+
+storage:
+  data_dir: ./data
+  wal_dir: null              # Defaults to data_dir/wal
+  wal_durability: periodic   # every_write, periodic, os_default, none
+  wal_sync_interval_ms: 100  # For periodic mode
+  wal_retention_secs: 604800 # 7 days (null = forever for CDC)
+  memtable:
+    max_size_mb: 64
+    max_points: 1000000
+    max_age_secs: 60
+  partition_duration_hours: 24
+  compression: default       # none, fast, default, best
+
+auth:
+  enabled: false
+  jwt_secret: change-me-in-production
+  token_expiration_secs: 3600
+
+logging:
+  level: info                # trace, debug, info, warn, error
+  show_target: true
+  show_thread_ids: false
+  show_location: false
+
+retention_policies: []
+```
+
+### Command Line Options
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--data-dir` | `./data` | Data storage directory |
-| `--bind` | `127.0.0.1:8086` | HTTP bind address |
-| `--wal-mode` | `periodic` | WAL durability: `every-write`, `periodic`, `os-default`, `none` |
+| `-c, --config` | `rusts.yml` | Configuration file path |
+| `-d, --data-dir` | (from config) | Data storage directory (overrides config) |
+| `-H, --host` | (from config) | Bind address (overrides config) |
+| `-p, --port` | (from config) | HTTP port (overrides config) |
+| `--generate-config` | | Generate default rusts.yml and exit |
+
+### WAL Durability Modes
+
+| Mode | Description | Use Case |
+|------|-------------|----------|
+| `every_write` | Sync after each write | Maximum durability, slower |
+| `periodic` | Sync at intervals (default 100ms) | Balanced durability/performance |
+| `os_default` | Let OS decide when to sync | Higher throughput, some risk |
+| `none` | No syncing (in-memory only) | Bulk imports, testing |
+
+### WAL Retention
+
+WAL files can be retained for:
+- **Change Data Capture (CDC)**: Stream changes to downstream systems
+- **Backup/Recovery**: Point-in-time recovery beyond memtable flushes
+
+Set `wal_retention_secs: null` to retain WAL files indefinitely for CDC use cases.
 
 ## API Usage
 
@@ -238,7 +301,7 @@ replica_shards = [8, 9, 10, 11, 12, 13, 14, 15]
 
 ## Data Import
 
-RusTs includes a standalone CLI tool for importing data from files.
+RusTs includes a standalone CLI tool for importing data from files with streaming support for large datasets.
 
 ### Parquet Import
 
@@ -249,31 +312,87 @@ cargo build --release -p rusts-importer
 # View Parquet file schema
 ./target/release/rusts-import parquet data.parquet --schema-only
 
-# Import with default settings
+# Import via REST API (streaming)
 ./target/release/rusts-import parquet data.parquet \
   --measurement metrics \
   --server http://localhost:8086
+
+# Direct mode - write directly to storage (faster, bypasses REST)
+./target/release/rusts-import parquet data.parquet \
+  --measurement metrics \
+  --direct
 
 # Specify tag columns and timestamp column
 ./target/release/rusts-import parquet data.parquet \
   --measurement cpu \
   --timestamp-column time \
   --tags host,region,datacenter \
-  --batch-size 50000
+  --batch-size 50000 \
+  --direct
+
+# Use custom config file (reads data_dir from config)
+./target/release/rusts-import --config /etc/rusts.yml parquet data.parquet --direct
+
+# Override data directory
+./target/release/rusts-import parquet data.parquet --direct --data-dir /var/lib/rusts
+
+# Deduplicate against existing database records
+./target/release/rusts-import parquet data.parquet \
+  --measurement metrics \
+  --dedup-column record_id \
+  --direct
 
 # Dry run (read file, don't write to server)
 ./target/release/rusts-import parquet data.parquet --dry-run
 ```
 
+### Import Modes
+
+| Mode | Flag | Description | Performance |
+|------|------|-------------|-------------|
+| REST Streaming | (default) | Stream batches via HTTP API | ~45k pts/sec |
+| Direct | `--direct` | Write directly to storage engine | ~260k pts/sec |
+
+**Direct mode** bypasses the REST API and writes directly to the storage engine. It:
+- Disables WAL (source file serves as recovery mechanism)
+- Uses larger memtable buffers for bulk loading
+- Requires exclusive access to the data directory (server should not be running)
+
+### Deduplication
+
+The `--dedup-column` option checks against **existing records in the database** before importing:
+
+```bash
+# Skip records where 'trip_id' already exists in the database
+./target/release/rusts-import parquet trips.parquet \
+  --measurement trips \
+  --dedup-column trip_id \
+  --direct
+```
+
+**Deduplication behavior:**
+- Queries all existing values of the dedup column before import starts
+- Filters each batch to exclude records that already exist
+- Reports skipped duplicate count in progress and summary
+
+**Limitations:**
+- **Direct mode**: Can only deduplicate by field columns (not tags)
+- **REST mode**: Can deduplicate by both tags and fields
+- Loads all existing dedup keys into memory
+
 ### Importer Options
 
 | Option | Default | Description |
 |--------|---------|-------------|
+| `-c, --config` | `rusts.yml` | Path to rusts.yml config file |
 | `-m, --measurement` | `imported` | Measurement name for all points |
-| `-s, --server` | `http://localhost:8086` | RusTs server URL |
+| `-s, --server` | `http://localhost:8086` | RusTs server URL (REST mode) |
 | `-t, --timestamp-column` | `timestamp` | Column containing timestamps |
 | `--tags` | (none) | Comma-separated tag column names |
 | `-b, --batch-size` | `10000` | Points per write batch |
+| `--direct` | false | Write directly to storage engine |
+| `--data-dir` | (from config) | Data directory for direct mode |
+| `--dedup-column` | (none) | Column for deduplication against existing DB records |
 | `--schema-only` | false | Only display schema, don't import |
 | `--dry-run` | false | Read file but don't write to server |
 
