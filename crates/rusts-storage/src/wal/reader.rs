@@ -202,6 +202,7 @@ impl WalReader {
 mod tests {
     use super::*;
     use crate::wal::WalWriter;
+    use crate::WalDurability;
     use tempfile::TempDir;
 
     fn create_test_point(ts: i64, value: f64) -> Point {
