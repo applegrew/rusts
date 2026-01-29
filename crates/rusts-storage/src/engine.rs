@@ -13,6 +13,8 @@ use parking_lot::RwLock;
 use rusts_compression::CompressionLevel;
 use rusts_core::{Point, SeriesId, TimeRange};
 use serde::{Deserialize, Serialize};
+use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -20,6 +22,9 @@ use std::thread;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
+
+/// Checkpoint file name for tracking flushed WAL sequences
+const CHECKPOINT_FILE: &str = "wal_checkpoint";
 
 /// Storage engine configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,7 +64,11 @@ impl Default for StorageEngineConfig {
 
 /// Flush command for background flusher
 enum FlushCommand {
-    Flush(Arc<MemTable>),
+    /// Flush a memtable with its associated WAL sequence number
+    Flush {
+        memtable: Arc<MemTable>,
+        wal_sequence: u64,
+    },
     Shutdown,
 }
 
@@ -109,6 +118,12 @@ impl StorageEngine {
         // Create flush channel
         let (flush_tx, flush_rx) = mpsc::unbounded_channel();
 
+        // Load checkpoint from disk
+        let checkpoint_sequence = Self::load_checkpoint(&config.data_dir);
+        if checkpoint_sequence > 0 {
+            info!("Loaded WAL checkpoint: sequence {}", checkpoint_sequence);
+        }
+
         let engine = Self {
             config,
             wal,
@@ -118,7 +133,7 @@ impl StorageEngine {
             partitions,
             flush_tx,
             running: RwLock::new(true),
-            last_flushed_sequence: AtomicU64::new(0),
+            last_flushed_sequence: AtomicU64::new(checkpoint_sequence),
         };
 
         // Start background flusher
@@ -303,6 +318,24 @@ impl StorageEngine {
         self.last_flushed_sequence.store(sequence, Ordering::SeqCst);
     }
 
+    /// Load checkpoint from disk (returns 0 if no checkpoint exists)
+    fn load_checkpoint(data_dir: &Path) -> u64 {
+        let checkpoint_path = data_dir.join(CHECKPOINT_FILE);
+        match fs::read_to_string(&checkpoint_path) {
+            Ok(content) => content.trim().parse().unwrap_or(0),
+            Err(_) => 0,
+        }
+    }
+
+    /// Save checkpoint to disk
+    fn save_checkpoint(data_dir: &Path, sequence: u64) -> Result<()> {
+        let checkpoint_path = data_dir.join(CHECKPOINT_FILE);
+        let mut file = fs::File::create(&checkpoint_path)?;
+        writeln!(file, "{}", sequence)?;
+        file.sync_all()?;
+        Ok(())
+    }
+
     /// Clean up old WAL files based on retention policy.
     /// Only removes files that:
     /// 1. Are older than the configured retention period
@@ -372,6 +405,10 @@ impl StorageEngine {
 
     /// Rotate the active memtable (make it immutable and create new active)
     fn rotate_memtable(&self) -> Result<()> {
+        // Get the current WAL sequence before rotation
+        // All data in this memtable was written at or before this sequence
+        let wal_sequence = self.wal.sequence();
+
         let old_memtable = {
             let mut active = self.active_memtable.write();
             let old = active.clone();
@@ -386,10 +423,13 @@ impl StorageEngine {
         // Add to immutable list
         self.immutable_memtables.write().push(old_memtable.clone());
 
-        // Trigger background flush
-        let _ = self.flush_tx.send(FlushCommand::Flush(old_memtable));
+        // Trigger background flush with the WAL sequence
+        let _ = self.flush_tx.send(FlushCommand::Flush {
+            memtable: old_memtable,
+            wal_sequence,
+        });
 
-        debug!("Rotated memtable");
+        debug!("Rotated memtable (WAL sequence: {})", wal_sequence);
         Ok(())
     }
 
@@ -397,6 +437,7 @@ impl StorageEngine {
     fn start_flusher(&self, mut rx: mpsc::UnboundedReceiver<FlushCommand>) {
         // We need to pass data to the flusher thread
         // Since we can't move self, we'll create the thread in a way that can access partitions
+        let data_dir = self.config.data_dir.clone();
         let partitions_dir = self.config.data_dir.join("partitions");
         let partition_duration = self.config.partition_duration;
         let compression = self.config.compression;
@@ -419,11 +460,19 @@ impl StorageEngine {
 
                 while let Some(cmd) = rx.recv().await {
                     match cmd {
-                        FlushCommand::Flush(memtable) => {
+                        FlushCommand::Flush { memtable, wal_sequence } => {
                             if let Err(e) = flush_memtable_to_partitions(&memtable, &partitions) {
                                 error!("Failed to flush memtable: {}", e);
                             } else {
-                                debug!("Flushed memtable with {} points", memtable.point_count());
+                                debug!("Flushed memtable with {} points (WAL sequence: {})",
+                                       memtable.point_count(), wal_sequence);
+
+                                // Save checkpoint after successful flush
+                                if let Err(e) = Self::save_checkpoint(&data_dir, wal_sequence) {
+                                    error!("Failed to save checkpoint: {}", e);
+                                } else {
+                                    debug!("Saved WAL checkpoint: sequence {}", wal_sequence);
+                                }
                             }
                         }
                         FlushCommand::Shutdown => {
@@ -444,6 +493,9 @@ impl StorageEngine {
             .clone()
             .unwrap_or_else(|| self.config.data_dir.join("wal"));
 
+        // Get the checkpoint sequence - entries at or before this have been flushed
+        let checkpoint = self.last_flushed_sequence.load(Ordering::SeqCst);
+
         let reader = WalReader::new(&wal_dir);
         let entries = reader.read_all()?;
 
@@ -452,10 +504,26 @@ impl StorageEngine {
             return Ok(());
         }
 
-        info!("Recovering {} WAL entries", entries.len());
+        // Filter out already-flushed entries
+        let entries_to_recover: Vec<_> = entries
+            .into_iter()
+            .filter(|e| e.sequence > checkpoint)
+            .collect();
+
+        if entries_to_recover.is_empty() {
+            info!("All WAL entries already flushed (checkpoint: {})", checkpoint);
+            return Ok(());
+        }
+
+        info!(
+            "Recovering {} WAL entries (skipped {} already flushed, checkpoint: {})",
+            entries_to_recover.len(),
+            checkpoint,
+            checkpoint
+        );
 
         let memtable = self.active_memtable.read();
-        for entry in entries {
+        for entry in entries_to_recover {
             for point in entry.points {
                 if let Err(e) = memtable.insert(&point) {
                     error!("Failed to recover point: {}", e);
