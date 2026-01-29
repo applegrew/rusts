@@ -189,8 +189,6 @@ pub struct TimeBucketAggregator {
     start: i64,
     /// Aggregators per bucket
     buckets: Vec<Aggregator>,
-    /// Function being used
-    function: AggregateFunction,
 }
 
 /// Maximum number of buckets to prevent memory exhaustion
@@ -220,7 +218,6 @@ impl TimeBucketAggregator {
             interval,
             start,
             buckets,
-            function,
         }
     }
 
