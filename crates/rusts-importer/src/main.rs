@@ -5,11 +5,17 @@
 //! ## Usage
 //!
 //! ```bash
-//! # Import a Parquet file
-//! rusts-import parquet data.parquet --measurement cpu --server http://localhost:8086
+//! # Import a Parquet file (uses data_dir from rusts.yml)
+//! rusts-import parquet data.parquet --measurement cpu --direct
 //!
 //! # Specify tag columns
-//! rusts-import parquet data.parquet -m metrics --tags host,region
+//! rusts-import parquet data.parquet -m metrics --tags host,region --direct
+//!
+//! # Use custom config file
+//! rusts-import --config /etc/rusts.yml parquet data.parquet --direct
+//!
+//! # Override data directory
+//! rusts-import parquet data.parquet --direct --data-dir /custom/path
 //!
 //! # Inspect Parquet schema
 //! rusts-import parquet data.parquet --schema-only
@@ -23,16 +29,60 @@ use rusts_importer::{inspect_parquet_schema, ParquetReader, ParquetReaderConfig,
 use rusts_storage::memtable::FlushTrigger;
 use rusts_storage::wal::WalDurability;
 use rusts_storage::{StorageEngine, StorageEngineConfig};
+use serde::Deserialize;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Instant;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
+/// Minimal config structure to read data_dir from rusts.yml
+#[derive(Debug, Deserialize)]
+struct RustsConfig {
+    #[serde(default)]
+    storage: StorageConfig,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct StorageConfig {
+    #[serde(default = "default_data_dir")]
+    data_dir: PathBuf,
+}
+
+fn default_data_dir() -> PathBuf {
+    PathBuf::from("./data")
+}
+
+impl RustsConfig {
+    fn load(path: &PathBuf) -> Option<Self> {
+        if path.exists() {
+            match std::fs::read_to_string(path) {
+                Ok(content) => match serde_yaml::from_str(&content) {
+                    Ok(config) => Some(config),
+                    Err(e) => {
+                        eprintln!("Warning: Failed to parse {}: {}", path.display(), e);
+                        None
+                    }
+                },
+                Err(e) => {
+                    eprintln!("Warning: Failed to read {}: {}", path.display(), e);
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "rusts-import")]
 #[command(author, version, about = "Import data into RusTs time series database")]
 struct Cli {
+    /// Path to rusts.yml config file (default: ./rusts.yml)
+    #[arg(short, long, global = true, default_value = "rusts.yml")]
+    config: PathBuf,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -80,9 +130,9 @@ enum Commands {
         #[arg(long)]
         direct: bool,
 
-        /// Data directory for direct mode (default: ./data)
-        #[arg(long, default_value = "./data")]
-        data_dir: PathBuf,
+        /// Data directory for direct mode (overrides config file)
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
     },
 }
 
@@ -96,6 +146,9 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+
+    // Load config file for data_dir
+    let rusts_config = RustsConfig::load(&cli.config);
 
     match cli.command {
         Commands::Parquet {
@@ -111,6 +164,16 @@ async fn main() -> Result<()> {
             direct,
             data_dir,
         } => {
+            // Use data_dir from CLI if provided, otherwise from config, otherwise default
+            let effective_data_dir = if let Some(dir) = data_dir {
+                dir
+            } else if let Some(ref config) = rusts_config {
+                info!("Using data_dir from {}: {:?}", cli.config.display(), config.storage.data_dir);
+                config.storage.data_dir.clone()
+            } else {
+                default_data_dir()
+            };
+
             import_parquet(
                 file,
                 measurement,
@@ -122,7 +185,7 @@ async fn main() -> Result<()> {
                 dry_run,
                 dedup_column,
                 direct,
-                data_dir,
+                effective_data_dir,
             )
             .await
         }
