@@ -236,6 +236,56 @@ replica_shards = [8, 9, 10, 11, 12, 13, 14, 15]
 | `Quorum` | Eventual | Medium | General purpose |
 | `Async` | Weak | Low | High-throughput metrics |
 
+## Data Import
+
+RusTs includes a standalone CLI tool for importing data from files.
+
+### Parquet Import
+
+```bash
+# Build the importer
+cargo build --release -p rusts-importer
+
+# View Parquet file schema
+./target/release/rusts-import parquet data.parquet --schema-only
+
+# Import with default settings
+./target/release/rusts-import parquet data.parquet \
+  --measurement metrics \
+  --server http://localhost:8086
+
+# Specify tag columns and timestamp column
+./target/release/rusts-import parquet data.parquet \
+  --measurement cpu \
+  --timestamp-column time \
+  --tags host,region,datacenter \
+  --batch-size 50000
+
+# Dry run (read file, don't write to server)
+./target/release/rusts-import parquet data.parquet --dry-run
+```
+
+### Importer Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-m, --measurement` | `imported` | Measurement name for all points |
+| `-s, --server` | `http://localhost:8086` | RusTs server URL |
+| `-t, --timestamp-column` | `timestamp` | Column containing timestamps |
+| `--tags` | (none) | Comma-separated tag column names |
+| `-b, --batch-size` | `10000` | Points per write batch |
+| `--schema-only` | false | Only display schema, don't import |
+| `--dry-run` | false | Read file but don't write to server |
+
+### Supported Timestamp Formats
+
+- `Timestamp(Nanosecond)` - Direct nanoseconds
+- `Timestamp(Microsecond)` - Converted to nanoseconds
+- `Timestamp(Millisecond)` - Converted to nanoseconds
+- `Timestamp(Second)` - Converted to nanoseconds
+- `Int64` - Interpreted as nanoseconds
+- `Date64` - Milliseconds since epoch
+
 ## Project Structure
 
 ```
@@ -251,6 +301,7 @@ rusts/
 │   ├── rusts-cluster/        # Sharding, routing, replication
 │   ├── rusts-aggregation/    # Continuous aggregates, downsampling
 │   ├── rusts-retention/      # Retention policies, tiering
+│   ├── rusts-importer/       # Data import CLI (Parquet, etc.)
 │   └── rusts-server/         # Main server binary
 └── README.md
 ```

@@ -14,3 +14,4 @@ Thumbs.db
 
 # Local settings (keep .claude/settings.local.json private)
 .claude/settings.local.json
+/data/

@@ -11,6 +11,7 @@ members = [
     "crates/rusts-retention",
     "crates/rusts-api",
     "crates/rusts-server",
+    "crates/rusts-importer",
 ]
 
 [workspace.package]
@@ -51,9 +52,12 @@ crc32fast = "1.4"
 roaring = "0.10"  # 0.11 has breaking API changes
 fxhash = "0.2"
 
-# Data format (optional Parquet support - add to individual crates as needed)
-# arrow = { version = "53" }
-# parquet = { version = "53" }
+# Data format
+arrow = { version = "54" }
+parquet = { version = "54" }
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
 
 # API
 axum = { version = "0.7", features = ["macros"] }  # 0.8 has breaking changes

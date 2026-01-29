@@ -1,0 +1,41 @@
+[package]
+name = "rusts-importer"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Data importer CLI for RusTs time series database"
+
+[[bin]]
+name = "rusts-import"
+path = "src/main.rs"
+
+[dependencies]
+rusts-core = { workspace = true }
+
+# Data format
+arrow = { workspace = true }
+parquet = { workspace = true }
+
+# CLI
+clap = { workspace = true }
+
+# Async & HTTP
+tokio = { workspace = true }
+reqwest = { version = "0.12", features = ["json"] }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Utilities
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
