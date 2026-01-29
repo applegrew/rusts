@@ -466,6 +466,18 @@ async fn main() -> anyhow::Result<()> {
     let series_index = Arc::new(SeriesIndex::new());
     let tag_index = Arc::new(TagIndex::new());
 
+    // Rebuild indexes from recovered WAL data
+    let recovered_series = storage.get_memtable_series();
+    if !recovered_series.is_empty() {
+        info!("Rebuilding indexes from {} recovered series", recovered_series.len());
+        for (series_id, measurement, tags) in recovered_series {
+            // Get the latest timestamp from the series (use 0 as placeholder)
+            series_index.upsert(series_id, &measurement, &tags, 0);
+            tag_index.index_series(series_id, &tags);
+        }
+        info!("Index rebuild complete");
+    }
+
     // Query protection settings
     let query_timeout = std::time::Duration::from_secs(config.server.query_timeout_secs);
     let max_concurrent_queries = config.server.max_concurrent_queries;

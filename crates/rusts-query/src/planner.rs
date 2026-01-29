@@ -47,7 +47,9 @@ impl QueryPlanner {
         // - Time range width
         // - Whether we have series filters
         let base_cost = partition_ranges.len() as f64 * 100.0;
-        let time_cost = (query.time_range.end - query.time_range.start) as f64 / 1_000_000_000.0;
+        // Use saturating_sub to prevent overflow with extreme time ranges (i64::MIN to i64::MAX)
+        let time_range_nanos = query.time_range.end.saturating_sub(query.time_range.start);
+        let time_cost = time_range_nanos as f64 / 1_000_000_000.0;
         let filter_discount = if query.tag_filters.is_empty() { 1.0 } else { 0.5 };
 
         let estimated_cost = (base_cost + time_cost) * filter_discount;
@@ -240,5 +242,33 @@ mod tests {
 
         // Filtered query should have lower cost
         assert!(plan2.estimated_cost < plan1.estimated_cost);
+    }
+
+    #[test]
+    fn test_plan_extreme_time_range_no_panic() {
+        // Test that planning with extreme time range (i64::MIN to i64::MAX) does not panic
+        // This was previously causing "attempt to subtract with overflow"
+        let planner = QueryPlanner::new();
+
+        // Create a query with the default time range (i64::MIN to i64::MAX)
+        // We have to manually construct this since Query::builder validates
+        let query = Query {
+            measurement: "cpu".to_string(),
+            time_range: TimeRange::new(i64::MIN, i64::MAX),
+            tag_filters: Vec::new(),
+            field_selection: crate::model::FieldSelection::All,
+            group_by: Vec::new(),
+            group_by_time: None,
+            order_by: None,
+            limit: None,
+            offset: None,
+        };
+
+        // This should not panic
+        let plan = planner.plan(query).unwrap();
+
+        // Cost should be finite and positive
+        assert!(plan.estimated_cost.is_finite());
+        assert!(plan.estimated_cost >= 0.0);
     }
 }

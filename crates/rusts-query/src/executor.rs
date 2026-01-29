@@ -735,4 +735,190 @@ mod tests {
 
         storage.shutdown().unwrap();
     }
+
+    #[test]
+    fn test_wal_recovery_with_index_rebuild_and_query() {
+        // Integration test: WAL recovery -> index rebuild -> query execution
+        // This simulates server restart scenario
+        use rusts_storage::memtable::FlushTrigger;
+
+        let dir = TempDir::new().unwrap();
+        let data_dir = dir.path().to_path_buf();
+
+        // Phase 1: Write data and shutdown
+        {
+            let config = StorageEngineConfig {
+                data_dir: data_dir.clone(),
+                wal_durability: WalDurability::EveryWrite,
+                flush_trigger: FlushTrigger {
+                    max_size: 1024 * 1024 * 1024,
+                    max_points: 1_000_000_000,
+                    max_age_nanos: i64::MAX,
+                },
+                ..Default::default()
+            };
+
+            let storage = Arc::new(StorageEngine::new(config).unwrap());
+            let series_index = Arc::new(SeriesIndex::new());
+            let tag_index = Arc::new(TagIndex::new());
+
+            // Write data for multiple hosts
+            for host_idx in 0..3 {
+                for i in 0..10 {
+                    let point = Point::builder("cpu")
+                        .timestamp(i * 1000)
+                        .tag("host", &format!("server{:02}", host_idx))
+                        .field("value", (host_idx * 100 + i) as f64)
+                        .build()
+                        .unwrap();
+
+                    storage.write(&point).unwrap();
+
+                    let series_id = point.series_id();
+                    series_index.upsert(series_id, "cpu", &point.tags, point.timestamp);
+                    tag_index.index_series(series_id, &point.tags);
+                }
+            }
+
+            // Verify query works before shutdown
+            let executor = QueryExecutor::new(
+                Arc::clone(&storage),
+                Arc::clone(&series_index),
+                Arc::clone(&tag_index),
+            );
+
+            let query = Query::builder("cpu")
+                .time_range(0, 100000)
+                .build()
+                .unwrap();
+
+            let result = executor.execute(query).unwrap();
+            assert_eq!(result.rows.len(), 30, "Expected 30 rows before shutdown");
+
+            storage.shutdown().unwrap();
+        }
+
+        // Phase 2: Simulate server restart - create new engine, rebuild indexes, query
+        {
+            let config = StorageEngineConfig {
+                data_dir: data_dir.clone(),
+                wal_durability: WalDurability::EveryWrite,
+                flush_trigger: FlushTrigger {
+                    max_size: 1024 * 1024 * 1024,
+                    max_points: 1_000_000_000,
+                    max_age_nanos: i64::MAX,
+                },
+                ..Default::default()
+            };
+
+            let storage = Arc::new(StorageEngine::new(config).unwrap());
+
+            // Create fresh indexes (simulating server restart)
+            let series_index = Arc::new(SeriesIndex::new());
+            let tag_index = Arc::new(TagIndex::new());
+
+            // Rebuild indexes from recovered WAL data (same as main.rs does)
+            let recovered_series = storage.get_memtable_series();
+            assert_eq!(recovered_series.len(), 3, "Expected 3 series recovered from WAL");
+
+            for (series_id, measurement, tags) in recovered_series {
+                series_index.upsert(series_id, &measurement, &tags, 0);
+                tag_index.index_series(series_id, &tags);
+            }
+
+            // Verify index was rebuilt correctly
+            let cpu_series = series_index.get_by_measurement("cpu");
+            assert_eq!(cpu_series.len(), 3, "Expected 3 cpu series in index");
+
+            // Create executor and verify queries work
+            let executor = QueryExecutor::new(
+                Arc::clone(&storage),
+                Arc::clone(&series_index),
+                Arc::clone(&tag_index),
+            );
+
+            // Query all data
+            let query = Query::builder("cpu")
+                .time_range(0, 100000)
+                .build()
+                .unwrap();
+
+            let result = executor.execute(query).unwrap();
+            assert_eq!(result.rows.len(), 30, "Expected 30 rows after recovery");
+
+            // Query with tag filter
+            let query = Query::builder("cpu")
+                .time_range(0, 100000)
+                .where_tag("host", "server01")
+                .build()
+                .unwrap();
+
+            let result = executor.execute(query).unwrap();
+            assert_eq!(result.rows.len(), 10, "Expected 10 rows for server01 after recovery");
+
+            // Verify all rows have correct host tag
+            for row in &result.rows {
+                assert!(row.tags.iter().any(|t| t.key == "host" && t.value == "server01"));
+            }
+
+            // Query with aggregation
+            let query = Query::builder("cpu")
+                .time_range(0, 100000)
+                .select_aggregate("value", AggregateFunction::Count, Some("count".to_string()))
+                .build()
+                .unwrap();
+
+            let result = executor.execute(query).unwrap();
+            assert_eq!(result.rows.len(), 1);
+            if let Some(FieldValue::Integer(count)) = result.rows[0].fields.get("count") {
+                assert_eq!(*count, 30, "Expected count of 30 after recovery");
+            } else {
+                panic!("Expected count field");
+            }
+
+            storage.shutdown().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_query_with_default_time_range_no_panic() {
+        // Test that queries with default (extreme) time range don't panic
+        // This was a bug: i64::MAX - i64::MIN overflowed
+        let (storage, series_index, tag_index, _dir) = setup_test_env();
+
+        // Write some data
+        for i in 0..10 {
+            let point = create_test_point("server01", i * 1000, i as f64);
+            storage.write(&point).unwrap();
+
+            let series_id = point.series_id();
+            series_index.upsert(series_id, "cpu", &point.tags, point.timestamp);
+            tag_index.index_series(series_id, &point.tags);
+        }
+
+        let executor = QueryExecutor::new(
+            Arc::clone(&storage),
+            Arc::clone(&series_index),
+            Arc::clone(&tag_index),
+        );
+
+        // Create query with extreme time range (simulating no time range specified in API)
+        let query = Query {
+            measurement: "cpu".to_string(),
+            time_range: rusts_core::TimeRange::new(i64::MIN, i64::MAX),
+            tag_filters: Vec::new(),
+            field_selection: crate::model::FieldSelection::All,
+            group_by: Vec::new(),
+            group_by_time: None,
+            order_by: None,
+            limit: None,
+            offset: None,
+        };
+
+        // This should NOT panic (was previously causing "attempt to subtract with overflow")
+        let result = executor.execute(query).unwrap();
+        assert_eq!(result.rows.len(), 10, "Should return all 10 rows");
+
+        storage.shutdown().unwrap();
+    }
 }

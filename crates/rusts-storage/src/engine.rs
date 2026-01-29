@@ -120,8 +120,8 @@ impl StorageEngine {
 
         // Load checkpoint from disk
         let checkpoint_sequence = Self::load_checkpoint(&config.data_dir);
-        if checkpoint_sequence > 0 {
-            info!("Loaded WAL checkpoint: sequence {}", checkpoint_sequence);
+        if let Some(seq) = checkpoint_sequence {
+            info!("Loaded WAL checkpoint: sequence {}", seq);
         }
 
         let engine = Self {
@@ -133,14 +133,14 @@ impl StorageEngine {
             partitions,
             flush_tx,
             running: RwLock::new(true),
-            last_flushed_sequence: AtomicU64::new(checkpoint_sequence),
+            last_flushed_sequence: AtomicU64::new(checkpoint_sequence.unwrap_or(0)),
         };
 
         // Start background flusher
         engine.start_flusher(flush_rx);
 
-        // Recover from WAL
-        engine.recover()?;
+        // Recover from WAL (pass checkpoint so we know whether to filter entries)
+        engine.recover(checkpoint_sequence)?;
 
         Ok(engine)
     }
@@ -298,6 +298,16 @@ impl StorageEngine {
         }
     }
 
+    /// Get all series data from the active memtable
+    /// Used for rebuilding indexes after WAL recovery
+    pub fn get_memtable_series(&self) -> Vec<(SeriesId, String, Vec<rusts_core::Tag>)> {
+        let memtable = self.active_memtable.read();
+        memtable
+            .iter_series()
+            .map(|(series_id, measurement, tags, _points)| (series_id, measurement, tags))
+            .collect()
+    }
+
     /// Get partition stats
     pub fn partition_stats(&self) -> PartitionStats {
         let partitions = self.partitions.partitions();
@@ -318,12 +328,12 @@ impl StorageEngine {
         self.last_flushed_sequence.store(sequence, Ordering::SeqCst);
     }
 
-    /// Load checkpoint from disk (returns 0 if no checkpoint exists)
-    fn load_checkpoint(data_dir: &Path) -> u64 {
+    /// Load checkpoint from disk (returns None if no checkpoint exists)
+    fn load_checkpoint(data_dir: &Path) -> Option<u64> {
         let checkpoint_path = data_dir.join(CHECKPOINT_FILE);
         match fs::read_to_string(&checkpoint_path) {
-            Ok(content) => content.trim().parse().unwrap_or(0),
-            Err(_) => 0,
+            Ok(content) => content.trim().parse().ok(),
+            Err(_) => None,
         }
     }
 
@@ -486,15 +496,15 @@ impl StorageEngine {
     }
 
     /// Recover data from WAL
-    fn recover(&self) -> Result<()> {
+    ///
+    /// If checkpoint is None, all WAL entries are recovered (fresh start).
+    /// If checkpoint is Some(seq), only entries with sequence > seq are recovered.
+    fn recover(&self, checkpoint: Option<u64>) -> Result<()> {
         let wal_dir = self
             .config
             .wal_dir
             .clone()
             .unwrap_or_else(|| self.config.data_dir.join("wal"));
-
-        // Get the checkpoint sequence - entries at or before this have been flushed
-        let checkpoint = self.last_flushed_sequence.load(Ordering::SeqCst);
 
         let reader = WalReader::new(&wal_dir);
         let entries = reader.read_all()?;
@@ -504,23 +514,37 @@ impl StorageEngine {
             return Ok(());
         }
 
-        // Filter out already-flushed entries
-        let entries_to_recover: Vec<_> = entries
-            .into_iter()
-            .filter(|e| e.sequence > checkpoint)
-            .collect();
+        // Filter out already-flushed entries only if we have a checkpoint
+        let entries_to_recover = if let Some(cp) = checkpoint {
+            entries
+                .into_iter()
+                .filter(|e| e.sequence > cp)
+                .collect()
+        } else {
+            // No checkpoint - recover all entries
+            entries
+        };
 
         if entries_to_recover.is_empty() {
-            info!("All WAL entries already flushed (checkpoint: {})", checkpoint);
+            if let Some(cp) = checkpoint {
+                info!("All WAL entries already flushed (checkpoint: {})", cp);
+            } else {
+                info!("No WAL entries to recover");
+            }
             return Ok(());
         }
 
-        info!(
-            "Recovering {} WAL entries (skipped {} already flushed, checkpoint: {})",
-            entries_to_recover.len(),
-            checkpoint,
-            checkpoint
-        );
+        match checkpoint {
+            Some(cp) => info!(
+                "Recovering {} WAL entries (checkpoint: {}, skipped entries at or before checkpoint)",
+                entries_to_recover.len(),
+                cp
+            ),
+            None => info!(
+                "Recovering {} WAL entries (no checkpoint, fresh recovery)",
+                entries_to_recover.len()
+            ),
+        }
 
         let memtable = self.active_memtable.read();
         for entry in entries_to_recover {
@@ -712,5 +736,269 @@ mod tests {
         assert_eq!(stats.active_series, 1);
 
         engine.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_wal_recovery_basic() {
+        // Test that data written to WAL is recovered after engine restart
+        let dir = TempDir::new().unwrap();
+        let data_dir = dir.path().to_path_buf();
+
+        // Phase 1: Write data and shutdown
+        let config = StorageEngineConfig {
+            data_dir: data_dir.clone(),
+            wal_durability: WalDurability::EveryWrite, // Ensure WAL is synced
+            flush_trigger: FlushTrigger {
+                max_size: 1024 * 1024 * 1024,  // Very high to prevent flush
+                max_points: 1_000_000_000,
+                max_age_nanos: i64::MAX,
+            },
+            ..Default::default()
+        };
+
+        // Get series_id (all points have same series_id since same measurement + tags)
+        let series_id = create_test_point("cpu", "server01", 0, 0.0).series_id();
+
+        {
+            let engine = StorageEngine::new(config.clone()).unwrap();
+
+            // Write points
+            for i in 0..50 {
+                let point = create_test_point("cpu", "server01", i * 1000, i as f64);
+                engine.write(&point).unwrap();
+            }
+
+            // Verify data is in memtable before shutdown
+            let stats = engine.memtable_stats();
+            assert_eq!(stats.active_points, 50, "Expected 50 points before shutdown");
+
+            engine.shutdown().unwrap();
+        }
+
+        // Phase 2: Create new engine and verify recovery
+        {
+            let engine = StorageEngine::new(config).unwrap();
+
+            // Verify data was recovered
+            let stats = engine.memtable_stats();
+            assert_eq!(stats.active_points, 50, "Expected 50 points after WAL recovery");
+            assert_eq!(stats.active_series, 1, "Expected 1 series after WAL recovery");
+
+            // Verify data can be queried
+            let results = engine.query(series_id, &TimeRange::new(0, 100000)).unwrap();
+            assert_eq!(results.len(), 50, "Expected 50 points from query after recovery");
+
+            // Verify the values are correct
+            for (i, point) in results.iter().enumerate() {
+                assert_eq!(point.timestamp, i as i64 * 1000);
+                if let Some((_, rusts_core::FieldValue::Float(v))) = point.fields.first() {
+                    assert!((v - i as f64).abs() < f64::EPSILON);
+                }
+            }
+
+            engine.shutdown().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_wal_recovery_multiple_series() {
+        // Test WAL recovery with multiple series
+        let dir = TempDir::new().unwrap();
+        let data_dir = dir.path().to_path_buf();
+
+        let config = StorageEngineConfig {
+            data_dir: data_dir.clone(),
+            wal_durability: WalDurability::EveryWrite,
+            flush_trigger: FlushTrigger {
+                max_size: 1024 * 1024 * 1024,
+                max_points: 1_000_000_000,
+                max_age_nanos: i64::MAX,
+            },
+            ..Default::default()
+        };
+
+        // Phase 1: Write data to multiple series
+        {
+            let engine = StorageEngine::new(config.clone()).unwrap();
+
+            // Write to cpu measurement with different hosts
+            for host_idx in 0..5 {
+                for i in 0..10 {
+                    let point = create_test_point(
+                        "cpu",
+                        &format!("server{:02}", host_idx),
+                        i * 1000,
+                        (host_idx * 100 + i) as f64,
+                    );
+                    engine.write(&point).unwrap();
+                }
+            }
+
+            // Write to memory measurement
+            for i in 0..20 {
+                let point = create_test_point("memory", "server01", i * 1000, i as f64 * 1024.0);
+                engine.write(&point).unwrap();
+            }
+
+            let stats = engine.memtable_stats();
+            assert_eq!(stats.active_points, 70, "Expected 70 total points");
+            assert_eq!(stats.active_series, 6, "Expected 6 series (5 cpu + 1 memory)");
+
+            engine.shutdown().unwrap();
+        }
+
+        // Phase 2: Recover and verify
+        {
+            let engine = StorageEngine::new(config).unwrap();
+
+            let stats = engine.memtable_stats();
+            assert_eq!(stats.active_points, 70, "Expected 70 points after recovery");
+            assert_eq!(stats.active_series, 6, "Expected 6 series after recovery");
+
+            // Verify cpu queries work
+            let cpu_results = engine
+                .query_measurement("cpu", &TimeRange::new(0, 100000))
+                .unwrap();
+            assert_eq!(cpu_results.len(), 5, "Expected 5 cpu series");
+            for (_, points) in &cpu_results {
+                assert_eq!(points.len(), 10, "Expected 10 points per cpu series");
+            }
+
+            // Verify memory queries work
+            let mem_results = engine
+                .query_measurement("memory", &TimeRange::new(0, 100000))
+                .unwrap();
+            assert_eq!(mem_results.len(), 1, "Expected 1 memory series");
+            assert_eq!(mem_results[0].1.len(), 20, "Expected 20 memory points");
+
+            engine.shutdown().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_wal_recovery_with_get_memtable_series() {
+        // Test that get_memtable_series returns correct data for index rebuilding
+        let dir = TempDir::new().unwrap();
+        let data_dir = dir.path().to_path_buf();
+
+        let config = StorageEngineConfig {
+            data_dir: data_dir.clone(),
+            wal_durability: WalDurability::EveryWrite,
+            flush_trigger: FlushTrigger {
+                max_size: 1024 * 1024 * 1024,
+                max_points: 1_000_000_000,
+                max_age_nanos: i64::MAX,
+            },
+            ..Default::default()
+        };
+
+        // Phase 1: Write data
+        {
+            let engine = StorageEngine::new(config.clone()).unwrap();
+
+            // cpu,host=server01
+            let p1 = create_test_point("cpu", "server01", 1000, 10.0);
+            engine.write(&p1).unwrap();
+
+            // cpu,host=server02
+            let p2 = create_test_point("cpu", "server02", 2000, 20.0);
+            engine.write(&p2).unwrap();
+
+            // memory,host=server01
+            let p3 = create_test_point("memory", "server01", 3000, 1024.0);
+            engine.write(&p3).unwrap();
+
+            engine.shutdown().unwrap();
+        }
+
+        // Phase 2: Recover and verify get_memtable_series
+        {
+            let engine = StorageEngine::new(config).unwrap();
+
+            let series = engine.get_memtable_series();
+            assert_eq!(series.len(), 3, "Expected 3 series for index rebuilding");
+
+            // Verify each series has correct measurement and tags
+            let mut found_cpu_server01 = false;
+            let mut found_cpu_server02 = false;
+            let mut found_memory_server01 = false;
+
+            for (series_id, measurement, tags) in &series {
+                assert!(*series_id != 0, "Series ID should be non-zero");
+
+                if measurement == "cpu" {
+                    for tag in tags {
+                        if tag.key == "host" && tag.value == "server01" {
+                            found_cpu_server01 = true;
+                        } else if tag.key == "host" && tag.value == "server02" {
+                            found_cpu_server02 = true;
+                        }
+                    }
+                } else if measurement == "memory" {
+                    for tag in tags {
+                        if tag.key == "host" && tag.value == "server01" {
+                            found_memory_server01 = true;
+                        }
+                    }
+                }
+            }
+
+            assert!(found_cpu_server01, "Should find cpu,host=server01");
+            assert!(found_cpu_server02, "Should find cpu,host=server02");
+            assert!(found_memory_server01, "Should find memory,host=server01");
+
+            engine.shutdown().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_wal_recovery_no_checkpoint_recovers_all() {
+        // Test that when no checkpoint exists, all WAL entries are recovered
+        // This tests the fix for the bug where entries with sequence 0 were skipped
+        let dir = TempDir::new().unwrap();
+        let data_dir = dir.path().to_path_buf();
+
+        let config = StorageEngineConfig {
+            data_dir: data_dir.clone(),
+            wal_durability: WalDurability::EveryWrite,
+            flush_trigger: FlushTrigger {
+                max_size: 1024 * 1024 * 1024,
+                max_points: 1_000_000_000,
+                max_age_nanos: i64::MAX,
+            },
+            ..Default::default()
+        };
+
+        // Phase 1: Write minimal data (this creates WAL entry with sequence 0)
+        {
+            let engine = StorageEngine::new(config.clone()).unwrap();
+
+            let point = create_test_point("test", "host1", 1000, 42.0);
+            engine.write(&point).unwrap();
+
+            engine.shutdown().unwrap();
+        }
+
+        // Verify no checkpoint file exists (we never flushed)
+        let checkpoint_path = data_dir.join("wal_checkpoint");
+        assert!(!checkpoint_path.exists(), "Checkpoint should not exist");
+
+        // Phase 2: Recover and verify the single point is recovered
+        {
+            let engine = StorageEngine::new(config).unwrap();
+
+            let stats = engine.memtable_stats();
+            assert_eq!(stats.active_points, 1, "Should recover 1 point even with no checkpoint");
+            assert_eq!(stats.active_series, 1, "Should recover 1 series");
+
+            // Query to verify data is accessible
+            let point = create_test_point("test", "host1", 0, 0.0);
+            let series_id = point.series_id();
+            let results = engine.query(series_id, &TimeRange::new(0, 10000)).unwrap();
+            assert_eq!(results.len(), 1, "Should be able to query recovered point");
+            assert_eq!(results[0].timestamp, 1000);
+
+            engine.shutdown().unwrap();
+        }
     }
 }

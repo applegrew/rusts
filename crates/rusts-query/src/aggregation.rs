@@ -193,10 +193,27 @@ pub struct TimeBucketAggregator {
     function: AggregateFunction,
 }
 
+/// Maximum number of buckets to prevent memory exhaustion
+const MAX_BUCKETS: usize = 1_000_000;
+
 impl TimeBucketAggregator {
     /// Create a new time bucket aggregator
+    ///
+    /// Uses saturating arithmetic to handle extreme time ranges (like i64::MIN to i64::MAX)
+    /// and caps the number of buckets to prevent memory exhaustion.
     pub fn new(function: AggregateFunction, start: i64, end: i64, interval: i64) -> Self {
-        let num_buckets = ((end - start + interval - 1) / interval) as usize;
+        // Use checked arithmetic to prevent overflow
+        // If end - start overflows, use MAX_BUCKETS as the fallback
+        let num_buckets = if let Some(range) = end.checked_sub(start) {
+            // Calculate (range + interval - 1) / interval with overflow protection
+            let adjusted = range.saturating_add(interval.saturating_sub(1));
+            let buckets = (adjusted / interval) as usize;
+            buckets.min(MAX_BUCKETS)
+        } else {
+            // Overflow occurred (e.g., i64::MAX - i64::MIN), use max buckets
+            MAX_BUCKETS
+        };
+
         let buckets = (0..num_buckets).map(|_| Aggregator::new(function)).collect();
 
         Self {
@@ -209,9 +226,14 @@ impl TimeBucketAggregator {
 
     /// Add a value with timestamp
     pub fn add(&mut self, timestamp: i64, value: &FieldValue) {
-        let bucket_idx = ((timestamp - self.start) / self.interval) as usize;
-        if bucket_idx < self.buckets.len() {
-            self.buckets[bucket_idx].add(value);
+        // Use checked subtraction to handle timestamps before start
+        if let Some(offset) = timestamp.checked_sub(self.start) {
+            if offset >= 0 {
+                let bucket_idx = (offset / self.interval) as usize;
+                if bucket_idx < self.buckets.len() {
+                    self.buckets[bucket_idx].add(value);
+                }
+            }
         }
     }
 
@@ -449,5 +471,94 @@ mod tests {
         assert_eq!(AggregateFunction::from_str("percentile_50").unwrap(), AggregateFunction::Percentile(50));
 
         assert!(AggregateFunction::from_str("invalid").is_err());
+    }
+
+    #[test]
+    fn test_time_bucket_extreme_range_no_panic() {
+        // This should not panic even with extreme time range (i64::MIN to i64::MAX)
+        // Previously this would cause "attempt to subtract with overflow"
+        let mut agg = TimeBucketAggregator::new(
+            AggregateFunction::Count,
+            i64::MIN,
+            i64::MAX,
+            1_000_000_000, // 1 second buckets
+        );
+
+        // Should be capped at MAX_BUCKETS
+        let results = agg.results();
+        assert!(results.len() <= super::MAX_BUCKETS);
+
+        // Adding values should not panic
+        agg.add(0, &FieldValue::Float(1.0));
+        agg.add(1_000_000_000, &FieldValue::Float(2.0));
+    }
+
+    #[test]
+    fn test_time_bucket_timestamp_before_start() {
+        let mut agg = TimeBucketAggregator::new(
+            AggregateFunction::Sum,
+            1000,  // start at 1000
+            5000,  // end at 5000
+            1000,  // 1000 ns buckets
+        );
+
+        // Add value before start - should be safely ignored
+        agg.add(500, &FieldValue::Float(100.0));
+
+        // Add value within range
+        agg.add(1500, &FieldValue::Float(10.0));
+
+        let results = agg.results();
+        // First bucket should only have the 10.0 value
+        if let Some(FieldValue::Float(v)) = &results[0].1 {
+            assert!((v - 10.0).abs() < f64::EPSILON);
+        } else {
+            panic!("Expected value in bucket 0");
+        }
+    }
+
+    #[test]
+    fn test_time_bucket_negative_timestamps() {
+        // Test with negative timestamps (which can occur in some time systems)
+        let mut agg = TimeBucketAggregator::new(
+            AggregateFunction::Mean,
+            -10000,  // start
+            10000,   // end
+            5000,    // 5000 ns buckets
+        );
+
+        agg.add(-8000, &FieldValue::Float(1.0));  // bucket 0
+        agg.add(-3000, &FieldValue::Float(2.0));  // bucket 1
+        agg.add(2000, &FieldValue::Float(3.0));   // bucket 2
+        agg.add(7000, &FieldValue::Float(4.0));   // bucket 3
+
+        let results = agg.results();
+        assert_eq!(results.len(), 4);
+
+        // Verify bucket timestamps
+        assert_eq!(results[0].0, -10000);
+        assert_eq!(results[1].0, -5000);
+        assert_eq!(results[2].0, 0);
+        assert_eq!(results[3].0, 5000);
+    }
+
+    #[test]
+    fn test_time_bucket_overflow_start_minus_timestamp() {
+        // Test case where timestamp - start could overflow
+        let mut agg = TimeBucketAggregator::new(
+            AggregateFunction::Sum,
+            i64::MIN + 1000,  // start very close to i64::MIN
+            i64::MIN + 10000, // small range
+            1000,
+        );
+
+        // This timestamp would cause (timestamp - start) to overflow if not handled
+        // because i64::MIN - (i64::MIN + 1000) would be very negative
+        agg.add(i64::MIN, &FieldValue::Float(100.0));
+
+        // Should be safely ignored, not panic
+        let results = agg.results();
+        // First bucket should be empty since the value was before start
+        assert!(results[0].1.is_none());
     }
 }
