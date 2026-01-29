@@ -228,6 +228,7 @@ async fn import_direct_streaming(
         data_dir: data_dir.clone(),
         wal_dir: None,
         wal_durability: WalDurability::None, // Skip WAL - source file is our recovery
+        wal_retention_secs: None,            // No retention needed for import
         flush_trigger: FlushTrigger {
             max_size: 256 * 1024 * 1024, // 256MB memtable
             max_points: 10_000_000,       // 10M points

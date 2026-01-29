@@ -134,7 +134,7 @@ impl WalReader {
     }
 
     /// List all WAL files in order
-    fn list_wal_files(&self) -> Result<Vec<PathBuf>> {
+    pub fn list_wal_files(&self) -> Result<Vec<PathBuf>> {
         if !self.dir.exists() {
             return Ok(Vec::new());
         }
@@ -156,6 +156,29 @@ impl WalReader {
 
         files.sort_by_key(|(num, _)| *num);
         Ok(files.into_iter().map(|(_, path)| path).collect())
+    }
+
+    /// List WAL files with metadata (path, modified time, max sequence in file)
+    /// Returns tuples of (file_path, modified_time, max_sequence)
+    pub fn list_wal_files_with_metadata(
+        &self,
+    ) -> Result<Vec<(PathBuf, std::time::SystemTime, u64)>> {
+        let files = self.list_wal_files()?;
+        let mut result = Vec::with_capacity(files.len());
+
+        for file_path in files {
+            // Get file modified time
+            let metadata = std::fs::metadata(&file_path)?;
+            let modified = metadata.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+
+            // Read entries to find max sequence
+            let entries = self.read_file(&file_path)?;
+            let max_sequence = entries.iter().map(|e| e.sequence).max().unwrap_or(0);
+
+            result.push((file_path, modified, max_sequence));
+        }
+
+        Ok(result)
     }
 
     /// Delete WAL files up to (and including) the given sequence

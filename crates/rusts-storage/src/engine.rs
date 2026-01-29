@@ -14,10 +14,12 @@ use rusts_compression::CompressionLevel;
 use rusts_core::{Point, SeriesId, TimeRange};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::{error, info, debug};
+use tracing::{debug, error, info, warn};
 
 /// Storage engine configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,6 +30,11 @@ pub struct StorageEngineConfig {
     pub wal_dir: Option<PathBuf>,
     /// WAL durability mode
     pub wal_durability: WalDurability,
+    /// WAL retention period in seconds - files older than this will be cleaned up
+    /// after their data is flushed to segments. None means retain forever.
+    /// Useful for CDC consumers and backup systems that read from WAL.
+    /// Default: 7 days (604800 seconds)
+    pub wal_retention_secs: Option<u64>,
     /// MemTable flush trigger
     pub flush_trigger: FlushTrigger,
     /// Partition duration in nanoseconds
@@ -42,6 +49,7 @@ impl Default for StorageEngineConfig {
             data_dir: PathBuf::from("./data"),
             wal_dir: None,
             wal_durability: WalDurability::default(),
+            wal_retention_secs: Some(7 * 24 * 60 * 60), // 7 days default
             flush_trigger: FlushTrigger::default(),
             partition_duration: 24 * 60 * 60 * 1_000_000_000, // 1 day
             compression: CompressionLevel::Default,
@@ -59,8 +67,10 @@ enum FlushCommand {
 pub struct StorageEngine {
     /// Configuration
     config: StorageEngineConfig,
-    /// Write-ahead log
+    /// Write-ahead log writer
     wal: WalWriter,
+    /// WAL directory path
+    wal_dir: PathBuf,
     /// Active memtable for writes
     active_memtable: RwLock<Arc<MemTable>>,
     /// Immutable memtables being flushed
@@ -71,6 +81,8 @@ pub struct StorageEngine {
     flush_tx: mpsc::UnboundedSender<FlushCommand>,
     /// Indicates if engine is running
     running: RwLock<bool>,
+    /// Last WAL sequence number that has been flushed to segments
+    last_flushed_sequence: AtomicU64,
 }
 
 impl StorageEngine {
@@ -100,11 +112,13 @@ impl StorageEngine {
         let engine = Self {
             config,
             wal,
+            wal_dir,
             active_memtable: RwLock::new(active_memtable),
             immutable_memtables: RwLock::new(Vec::new()),
             partitions,
             flush_tx,
             running: RwLock::new(true),
+            last_flushed_sequence: AtomicU64::new(0),
         };
 
         // Start background flusher
@@ -277,6 +291,83 @@ impl StorageEngine {
             total_segments: partitions.iter().map(|p| p.segment_count()).sum(),
             total_points: partitions.iter().map(|p| p.point_count()).sum(),
         }
+    }
+
+    /// Get the last flushed WAL sequence number
+    pub fn last_flushed_sequence(&self) -> u64 {
+        self.last_flushed_sequence.load(Ordering::SeqCst)
+    }
+
+    /// Update the last flushed sequence number (called after successful flush)
+    pub fn set_last_flushed_sequence(&self, sequence: u64) {
+        self.last_flushed_sequence.store(sequence, Ordering::SeqCst);
+    }
+
+    /// Clean up old WAL files based on retention policy.
+    /// Only removes files that:
+    /// 1. Are older than the configured retention period
+    /// 2. Have all entries already flushed to segments (sequence <= last_flushed_sequence)
+    ///
+    /// Returns the number of files cleaned up.
+    pub fn cleanup_wal(&self) -> Result<usize> {
+        let retention = match self.config.wal_retention_secs {
+            Some(secs) => Duration::from_secs(secs),
+            None => {
+                debug!("WAL retention is None, skipping cleanup");
+                return Ok(0);
+            }
+        };
+
+        let flushed_seq = self.last_flushed_sequence.load(Ordering::SeqCst);
+        if flushed_seq == 0 {
+            debug!("No data flushed yet, skipping WAL cleanup");
+            return Ok(0);
+        }
+
+        let reader = WalReader::new(&self.wal_dir);
+        let now = std::time::SystemTime::now();
+        let mut cleaned = 0;
+
+        // Get list of WAL files with their metadata
+        let wal_files = reader.list_wal_files_with_metadata()?;
+
+        for (file_path, modified_time, max_sequence) in wal_files {
+            // Check if file is old enough
+            let age = now.duration_since(modified_time).unwrap_or(Duration::ZERO);
+            if age < retention {
+                debug!(
+                    "WAL file {:?} is not old enough ({:?} < {:?})",
+                    file_path, age, retention
+                );
+                continue;
+            }
+
+            // Check if all entries in this file have been flushed
+            if max_sequence > flushed_seq {
+                debug!(
+                    "WAL file {:?} has unflushed entries (max_seq {} > flushed {})",
+                    file_path, max_sequence, flushed_seq
+                );
+                continue;
+            }
+
+            // Safe to delete this file
+            info!(
+                "Cleaning up WAL file {:?} (age: {:?}, max_seq: {})",
+                file_path, age, max_sequence
+            );
+            if let Err(e) = std::fs::remove_file(&file_path) {
+                warn!("Failed to remove WAL file {:?}: {}", file_path, e);
+            } else {
+                cleaned += 1;
+            }
+        }
+
+        if cleaned > 0 {
+            info!("Cleaned up {} WAL files", cleaned);
+        }
+
+        Ok(cleaned)
     }
 
     /// Rotate the active memtable (make it immutable and create new active)
