@@ -4,82 +4,320 @@
 //!   rusts [OPTIONS]
 //!
 //! Options:
-//!   --data-dir <PATH>   Data directory (default: ./data)
-//!   --port <PORT>       HTTP port (default: 8086)
-//!   --host <HOST>       Bind address (default: 0.0.0.0)
+//!   --config <PATH>     Configuration file (default: rusts.yml)
+//!   --data-dir <PATH>   Data directory (overrides config)
+//!   --port <PORT>       HTTP port (overrides config)
+//!   --host <HOST>       Bind address (overrides config)
 
+use rusts_api::auth::AuthConfig;
 use rusts_api::{create_router, handlers::AppState};
 use rusts_index::{SeriesIndex, TagIndex};
+use rusts_storage::memtable::FlushTrigger;
 use rusts_storage::{StorageEngine, StorageEngineConfig, WalDurability};
+use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
-/// Server configuration
-#[derive(Debug, Clone)]
-struct Config {
-    /// Data directory
-    data_dir: PathBuf,
-    /// Bind host
-    host: String,
-    /// Bind port
-    port: u16,
-    /// WAL durability mode
-    wal_durability: WalDurability,
+/// Complete server configuration - can be loaded from YAML
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ServerConfig {
+    /// Server configuration
+    pub server: ServerSettings,
+    /// Storage engine configuration
+    pub storage: StorageSettings,
+    /// Authentication configuration
+    pub auth: AuthSettings,
+    /// Logging configuration
+    pub logging: LoggingSettings,
+    /// Retention policies
+    #[serde(default)]
+    pub retention_policies: Vec<RetentionPolicyConfig>,
 }
 
-impl Default for Config {
+/// Server network settings
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ServerSettings {
+    /// Bind host
+    pub host: String,
+    /// Bind port
+    pub port: u16,
+    /// Maximum request body size in bytes
+    pub max_body_size: usize,
+    /// Request timeout in seconds
+    pub request_timeout_secs: u64,
+}
+
+impl Default for ServerSettings {
     fn default() -> Self {
         Self {
-            data_dir: PathBuf::from("./data"),
             host: "0.0.0.0".to_string(),
             port: 8086,
-            wal_durability: WalDurability::default(),
+            max_body_size: 10 * 1024 * 1024, // 10MB
+            request_timeout_secs: 30,
         }
     }
 }
 
-fn parse_args() -> Config {
-    let mut config = Config::default();
-    let args: Vec<String> = std::env::args().collect();
+/// Storage engine settings
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StorageSettings {
+    /// Data directory
+    pub data_dir: PathBuf,
+    /// WAL directory (defaults to data_dir/wal)
+    pub wal_dir: Option<PathBuf>,
+    /// WAL durability mode: "every_write", "periodic", "os_default", "none"
+    pub wal_durability: String,
+    /// WAL periodic sync interval in milliseconds (only for "periodic" mode)
+    pub wal_sync_interval_ms: u64,
+    /// WAL retention in seconds (None = retain forever, useful for CDC)
+    pub wal_retention_secs: Option<u64>,
+    /// MemTable settings
+    pub memtable: MemTableSettings,
+    /// Partition duration in hours
+    pub partition_duration_hours: u64,
+    /// Compression level: "none", "fast", "default", "best"
+    pub compression: String,
+}
 
+impl Default for StorageSettings {
+    fn default() -> Self {
+        Self {
+            data_dir: PathBuf::from("./data"),
+            wal_dir: None,
+            wal_durability: "periodic".to_string(),
+            wal_sync_interval_ms: 100,
+            wal_retention_secs: Some(7 * 24 * 60 * 60), // 7 days
+            memtable: MemTableSettings::default(),
+            partition_duration_hours: 24,
+            compression: "default".to_string(),
+        }
+    }
+}
+
+/// MemTable flush settings
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MemTableSettings {
+    /// Maximum memory size in MB
+    pub max_size_mb: usize,
+    /// Maximum number of points
+    pub max_points: usize,
+    /// Maximum age in seconds
+    pub max_age_secs: u64,
+}
+
+impl Default for MemTableSettings {
+    fn default() -> Self {
+        Self {
+            max_size_mb: 64,
+            max_points: 1_000_000,
+            max_age_secs: 60,
+        }
+    }
+}
+
+/// Authentication settings
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AuthSettings {
+    /// Enable authentication
+    pub enabled: bool,
+    /// JWT secret key (change this in production!)
+    pub jwt_secret: String,
+    /// Token expiration in seconds
+    pub token_expiration_secs: u64,
+}
+
+impl Default for AuthSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            jwt_secret: "change-me-in-production".to_string(),
+            token_expiration_secs: 3600,
+        }
+    }
+}
+
+/// Logging settings
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LoggingSettings {
+    /// Log level: "trace", "debug", "info", "warn", "error"
+    pub level: String,
+    /// Include target in logs
+    pub show_target: bool,
+    /// Include thread IDs in logs
+    pub show_thread_ids: bool,
+    /// Include file and line numbers
+    pub show_location: bool,
+}
+
+impl Default for LoggingSettings {
+    fn default() -> Self {
+        Self {
+            level: "info".to_string(),
+            show_target: true,
+            show_thread_ids: false,
+            show_location: false,
+        }
+    }
+}
+
+/// Retention policy configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetentionPolicyConfig {
+    /// Policy name
+    pub name: String,
+    /// Measurement pattern (supports wildcards)
+    pub pattern: String,
+    /// Retention duration (e.g., "30d", "1w", "6h")
+    pub duration: String,
+    /// Is this the default policy
+    #[serde(default)]
+    pub is_default: bool,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            server: ServerSettings::default(),
+            storage: StorageSettings::default(),
+            auth: AuthSettings::default(),
+            logging: LoggingSettings::default(),
+            retention_policies: Vec::new(),
+        }
+    }
+}
+
+impl ServerConfig {
+    /// Load configuration from a YAML file
+    pub fn from_file(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let content = std::fs::read_to_string(path.as_ref())?;
+        let config: ServerConfig = serde_yaml::from_str(&content)?;
+        Ok(config)
+    }
+
+    /// Convert to StorageEngineConfig
+    pub fn to_storage_config(&self) -> StorageEngineConfig {
+        let wal_durability = match self.storage.wal_durability.to_lowercase().as_str() {
+            "every_write" | "every-write" | "every" => WalDurability::EveryWrite,
+            "periodic" => WalDurability::Periodic {
+                interval_ms: self.storage.wal_sync_interval_ms,
+            },
+            "os_default" | "os-default" | "os" => WalDurability::OsDefault,
+            "none" => WalDurability::None,
+            _ => WalDurability::default(),
+        };
+
+        let compression = match self.storage.compression.to_lowercase().as_str() {
+            "none" => rusts_compression::CompressionLevel::None,
+            "fast" => rusts_compression::CompressionLevel::Fast,
+            "best" => rusts_compression::CompressionLevel::Best,
+            _ => rusts_compression::CompressionLevel::Default,
+        };
+
+        StorageEngineConfig {
+            data_dir: self.storage.data_dir.clone(),
+            wal_dir: self.storage.wal_dir.clone(),
+            wal_durability,
+            wal_retention_secs: self.storage.wal_retention_secs,
+            flush_trigger: FlushTrigger {
+                max_size: self.storage.memtable.max_size_mb * 1024 * 1024,
+                max_points: self.storage.memtable.max_points,
+                max_age_nanos: self.storage.memtable.max_age_secs as i64 * 1_000_000_000,
+            },
+            partition_duration: self.storage.partition_duration_hours as i64 * 60 * 60 * 1_000_000_000,
+            compression,
+        }
+    }
+
+    /// Convert to AuthConfig
+    pub fn to_auth_config(&self) -> AuthConfig {
+        AuthConfig {
+            enabled: self.auth.enabled,
+            jwt_secret: self.auth.jwt_secret.clone(),
+            token_expiration: std::time::Duration::from_secs(self.auth.token_expiration_secs),
+        }
+    }
+
+    /// Get log level
+    pub fn log_level(&self) -> Level {
+        match self.logging.level.to_lowercase().as_str() {
+            "trace" => Level::TRACE,
+            "debug" => Level::DEBUG,
+            "warn" => Level::WARN,
+            "error" => Level::ERROR,
+            _ => Level::INFO,
+        }
+    }
+
+    /// Write default config to a file (for generating example config)
+    pub fn write_default(path: impl AsRef<Path>) -> anyhow::Result<()> {
+        let config = Self::default();
+        let yaml = serde_yaml::to_string(&config)?;
+        std::fs::write(path, yaml)?;
+        Ok(())
+    }
+}
+
+/// Command line arguments
+struct CliArgs {
+    config_path: Option<PathBuf>,
+    data_dir: Option<PathBuf>,
+    host: Option<String>,
+    port: Option<u16>,
+    generate_config: bool,
+}
+
+fn parse_args() -> CliArgs {
+    let mut args = CliArgs {
+        config_path: None,
+        data_dir: None,
+        host: None,
+        port: None,
+        generate_config: false,
+    };
+
+    let argv: Vec<String> = std::env::args().collect();
     let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
+
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--config" | "-c" => {
+                if i + 1 < argv.len() {
+                    args.config_path = Some(PathBuf::from(&argv[i + 1]));
+                    i += 1;
+                }
+            }
             "--data-dir" | "-d" => {
-                if i + 1 < args.len() {
-                    config.data_dir = PathBuf::from(&args[i + 1]);
+                if i + 1 < argv.len() {
+                    args.data_dir = Some(PathBuf::from(&argv[i + 1]));
                     i += 1;
                 }
             }
             "--port" | "-p" => {
-                if i + 1 < args.len() {
-                    if let Ok(port) = args[i + 1].parse() {
-                        config.port = port;
+                if i + 1 < argv.len() {
+                    if let Ok(port) = argv[i + 1].parse() {
+                        args.port = Some(port);
                     }
                     i += 1;
                 }
             }
-            "--host" | "-h" => {
-                if i + 1 < args.len() {
-                    config.host = args[i + 1].clone();
+            "--host" | "-H" => {
+                if i + 1 < argv.len() {
+                    args.host = Some(argv[i + 1].clone());
                     i += 1;
                 }
             }
-            "--wal-sync" => {
-                if i + 1 < args.len() {
-                    config.wal_durability = match args[i + 1].as_str() {
-                        "every" | "every-write" => WalDurability::EveryWrite,
-                        "periodic" => WalDurability::Periodic { interval_ms: 100 },
-                        "os" | "os-default" => WalDurability::OsDefault,
-                        "none" => WalDurability::None,
-                        _ => config.wal_durability,
-                    };
-                    i += 1;
-                }
+            "--generate-config" => {
+                args.generate_config = true;
             }
             "--help" => {
                 print_help();
@@ -94,7 +332,7 @@ fn parse_args() -> Config {
         i += 1;
     }
 
-    config
+    args
 }
 
 fn print_help() {
@@ -105,23 +343,40 @@ USAGE:
     rusts [OPTIONS]
 
 OPTIONS:
-    -d, --data-dir <PATH>    Data directory (default: ./data)
-    -h, --host <HOST>        Bind address (default: 0.0.0.0)
-    -p, --port <PORT>        HTTP port (default: 8086)
-    --wal-sync <MODE>        WAL sync mode: every, periodic, os, none
-                             (default: periodic)
+    -c, --config <PATH>      Configuration file (default: rusts.yml)
+    -d, --data-dir <PATH>    Data directory (overrides config)
+    -H, --host <HOST>        Bind address (overrides config)
+    -p, --port <PORT>        HTTP port (overrides config)
+    --generate-config        Generate default config file (rusts.yml)
     --help                   Print help information
     --version                Print version information
 
-EXAMPLES:
-    # Start server with default settings
-    rusts
+CONFIGURATION:
+    RusTs reads configuration from rusts.yml in the current directory,
+    or from the path specified with --config. Command line arguments
+    override values in the config file.
 
-    # Start with custom data directory and port
-    rusts --data-dir /var/lib/rusts --port 9086
+    Generate a default config file with:
+        rusts --generate-config
 
-    # Start with maximum durability
-    rusts --wal-sync every
+EXAMPLE CONFIG (rusts.yml):
+    server:
+      host: "0.0.0.0"
+      port: 8086
+
+    storage:
+      data_dir: "./data"
+      wal_durability: "periodic"
+      wal_retention_secs: 604800  # 7 days
+      memtable:
+        max_size_mb: 64
+        max_points: 1000000
+
+    auth:
+      enabled: false
+
+    logging:
+      level: "info"
 
 API ENDPOINTS:
     POST /write              Write data using InfluxDB line protocol
@@ -129,47 +384,74 @@ API ENDPOINTS:
     GET  /health             Health check
     GET  /ready              Readiness check
     GET  /stats              Database statistics
-
-WRITE EXAMPLE:
-    curl -X POST http://localhost:8086/write \
-      -d 'cpu,host=server01,region=us-west usage=64.5 1609459200000000000'
-
-QUERY EXAMPLE:
-    curl -X POST http://localhost:8086/query \
-      -H "Content-Type: application/json" \
-      -d '{{"measurement": "cpu", "time_range": {{"start": 0, "end": 9999999999999999999}}}}'
 "#
     );
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize logging
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::INFO)
-        .with_target(true)
-        .with_thread_ids(true)
-        .with_file(true)
-        .with_line_number(true)
-        .finish();
+    // Parse command line arguments
+    let args = parse_args();
 
-    tracing::subscriber::set_global_default(subscriber)
-        .expect("Failed to set subscriber");
+    // Generate config and exit if requested
+    if args.generate_config {
+        let path = "rusts.yml";
+        ServerConfig::write_default(path)?;
+        println!("Generated default configuration: {}", path);
+        return Ok(());
+    }
 
-    // Parse configuration
-    let config = parse_args();
-
-    info!("Starting RusTs v{}", env!("CARGO_PKG_VERSION"));
-    info!("Data directory: {:?}", config.data_dir);
-    info!("WAL durability: {:?}", config.wal_durability);
-
-    // Initialize storage engine
-    let storage_config = StorageEngineConfig {
-        data_dir: config.data_dir.clone(),
-        wal_durability: config.wal_durability,
-        ..Default::default()
+    // Load configuration
+    let config_path = args.config_path.clone().unwrap_or_else(|| PathBuf::from("rusts.yml"));
+    let mut config = if config_path.exists() {
+        match ServerConfig::from_file(&config_path) {
+            Ok(c) => {
+                println!("Loaded configuration from: {}", config_path.display());
+                c
+            }
+            Err(e) => {
+                eprintln!("Warning: Failed to load {}: {}", config_path.display(), e);
+                eprintln!("Using default configuration");
+                ServerConfig::default()
+            }
+        }
+    } else {
+        ServerConfig::default()
     };
 
+    // Apply command line overrides
+    if let Some(data_dir) = args.data_dir {
+        config.storage.data_dir = data_dir;
+    }
+    if let Some(host) = args.host {
+        config.server.host = host;
+    }
+    if let Some(port) = args.port {
+        config.server.port = port;
+    }
+
+    // Initialize logging
+    let subscriber = FmtSubscriber::builder()
+        .with_max_level(config.log_level())
+        .with_target(config.logging.show_target)
+        .with_thread_ids(config.logging.show_thread_ids)
+        .with_file(config.logging.show_location)
+        .with_line_number(config.logging.show_location)
+        .finish();
+
+    tracing::subscriber::set_global_default(subscriber).expect("Failed to set subscriber");
+
+    info!("Starting RusTs v{}", env!("CARGO_PKG_VERSION"));
+    info!("Data directory: {:?}", config.storage.data_dir);
+    info!("WAL durability: {}", config.storage.wal_durability);
+    if let Some(retention) = config.storage.wal_retention_secs {
+        info!("WAL retention: {} seconds ({} days)", retention, retention / 86400);
+    } else {
+        info!("WAL retention: forever (CDC mode)");
+    }
+
+    // Initialize storage engine
+    let storage_config = config.to_storage_config();
     info!("Initializing storage engine...");
     let storage = Arc::new(StorageEngine::new(storage_config)?);
     info!("Storage engine initialized");
@@ -189,7 +471,7 @@ async fn main() -> anyhow::Result<()> {
     let app = create_router(app_state);
 
     // Start server
-    let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
+    let addr: SocketAddr = format!("{}:{}", config.server.host, config.server.port).parse()?;
     let listener = TcpListener::bind(addr).await?;
 
     info!("Server listening on http://{}", addr);

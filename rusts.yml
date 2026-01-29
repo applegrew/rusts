@@ -1,0 +1,27 @@
+server:
+  host: 0.0.0.0
+  port: 8086
+  max_body_size: 10485760
+  request_timeout_secs: 30
+storage:
+  data_dir: ./data
+  wal_dir: null
+  wal_durability: periodic
+  wal_sync_interval_ms: 100
+  wal_retention_secs: 604800
+  memtable:
+    max_size_mb: 64
+    max_points: 1000000
+    max_age_secs: 60
+  partition_duration_hours: 24
+  compression: default
+auth:
+  enabled: false
+  jwt_secret: change-me-in-production
+  token_expiration_secs: 3600
+logging:
+  level: info
+  show_target: true
+  show_thread_ids: false
+  show_location: false
+retention_policies: []
