@@ -51,6 +51,10 @@ pub struct ServerSettings {
     pub max_body_size: usize,
     /// Request timeout in seconds
     pub request_timeout_secs: u64,
+    /// Query execution timeout in seconds
+    pub query_timeout_secs: u64,
+    /// Maximum number of concurrent queries
+    pub max_concurrent_queries: usize,
 }
 
 impl Default for ServerSettings {
@@ -60,6 +64,8 @@ impl Default for ServerSettings {
             port: 8086,
             max_body_size: 10 * 1024 * 1024, // 10MB
             request_timeout_secs: 30,
+            query_timeout_secs: 30,
+            max_concurrent_queries: 100,
         }
     }
 }
@@ -460,15 +466,24 @@ async fn main() -> anyhow::Result<()> {
     let series_index = Arc::new(SeriesIndex::new());
     let tag_index = Arc::new(TagIndex::new());
 
+    // Query protection settings
+    let query_timeout = std::time::Duration::from_secs(config.server.query_timeout_secs);
+    let max_concurrent_queries = config.server.max_concurrent_queries;
+    info!("Query timeout: {} seconds", config.server.query_timeout_secs);
+    info!("Max concurrent queries: {}", max_concurrent_queries);
+
     // Create application state
     let app_state = Arc::new(AppState::new(
         Arc::clone(&storage),
         Arc::clone(&series_index),
         Arc::clone(&tag_index),
+        query_timeout,
+        max_concurrent_queries,
     ));
 
-    // Create router
-    let app = create_router(app_state);
+    // Create router with request timeout (slightly longer than query timeout for proper error responses)
+    let request_timeout = std::time::Duration::from_secs(config.server.request_timeout_secs);
+    let app = create_router(app_state, request_timeout);
 
     // Start server
     let addr: SocketAddr = format!("{}:{}", config.server.host, config.server.port).parse()?;

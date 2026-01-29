@@ -6,11 +6,14 @@ use axum::{
     Router,
 };
 use std::sync::Arc;
+use std::time::Duration;
 use tower_http::cors::{Any, CorsLayer};
+use axum::http::StatusCode;
+use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
 /// Create the API router
-pub fn create_router(state: Arc<AppState>) -> Router {
+pub fn create_router(state: Arc<AppState>, request_timeout: Duration) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
@@ -28,6 +31,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         // Stats endpoint
         .route("/stats", get(handlers::stats))
         // Add middleware
+        .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, request_timeout))
         .layer(TraceLayer::new_for_http())
         .layer(cors)
         // Add state
@@ -53,7 +57,13 @@ mod tests {
         let series_index = Arc::new(SeriesIndex::new());
         let tag_index = Arc::new(TagIndex::new());
 
-        let state = Arc::new(AppState::new(storage, series_index, tag_index));
+        let state = Arc::new(AppState::new(
+            storage,
+            series_index,
+            tag_index,
+            Duration::from_secs(30),
+            100,
+        ));
 
         (state, dir)
     }
@@ -61,6 +71,6 @@ mod tests {
     #[test]
     fn test_router_creation() {
         let (state, _dir) = create_test_state();
-        let _router = create_router(state);
+        let _router = create_router(state, Duration::from_secs(30));
     }
 }

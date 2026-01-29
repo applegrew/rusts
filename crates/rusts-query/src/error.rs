@@ -34,6 +34,12 @@ pub enum QueryError {
 
     #[error("Type mismatch: expected {expected}, got {actual}")]
     TypeMismatch { expected: String, actual: String },
+
+    #[error("Query timeout: exceeded {0} seconds")]
+    Timeout(u64),
+
+    #[error("Query cancelled")]
+    Cancelled,
 }
 
 /// Result type for query operations

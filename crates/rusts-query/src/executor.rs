@@ -1,7 +1,7 @@
 //! Query executor
 
 use crate::aggregation::{AggregateFunction, Aggregator, TimeBucketAggregator};
-use crate::error::Result;
+use crate::error::{QueryError, Result};
 use crate::model::{FieldSelection, Query, QueryResult, ResultRow, TagFilter};
 use crate::planner::{QueryOptimizer, QueryPlanner};
 use rusts_core::{FieldValue, SeriesId, Tag};
@@ -10,6 +10,7 @@ use rusts_storage::StorageEngine;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 /// Query executor for running queries against the storage engine
 pub struct QueryExecutor {
@@ -50,15 +51,63 @@ impl QueryExecutor {
         let _plan = QueryOptimizer::optimize(plan);
 
         // Resolve series IDs from filters
-        let series_ids = self.resolve_series_ids(&query)?;
+        let series_ids = self.resolve_series_ids(&query, None)?;
 
         // Execute based on field selection
         let result = match &query.field_selection {
             FieldSelection::All | FieldSelection::Fields(_) => {
-                self.execute_select(&query, &series_ids)?
+                self.execute_select(&query, &series_ids, None)?
             }
             FieldSelection::Aggregate { field, function, alias } => {
-                self.execute_aggregate(&query, &series_ids, field, *function, alias.clone())?
+                self.execute_aggregate(&query, &series_ids, field, *function, alias.clone(), None)?
+            }
+        };
+
+        // Apply limit and offset
+        let result = self.apply_limit_offset(result, query.limit, query.offset);
+
+        // Set execution time
+        let mut result = result;
+        result.execution_time_ns = start.elapsed().as_nanos() as u64;
+
+        Ok(result)
+    }
+
+    /// Execute a query with cancellation support
+    pub fn execute_with_cancellation(
+        &self,
+        query: Query,
+        cancel: CancellationToken,
+    ) -> Result<QueryResult> {
+        let start = Instant::now();
+
+        // Check cancellation before starting
+        if cancel.is_cancelled() {
+            return Err(QueryError::Cancelled);
+        }
+
+        // Validate query
+        query.validate()?;
+
+        // Plan the query
+        let plan = self.planner.plan(query.clone())?;
+        let _plan = QueryOptimizer::optimize(plan);
+
+        // Check cancellation after planning
+        if cancel.is_cancelled() {
+            return Err(QueryError::Cancelled);
+        }
+
+        // Resolve series IDs from filters
+        let series_ids = self.resolve_series_ids(&query, Some(&cancel))?;
+
+        // Execute based on field selection
+        let result = match &query.field_selection {
+            FieldSelection::All | FieldSelection::Fields(_) => {
+                self.execute_select(&query, &series_ids, Some(&cancel))?
+            }
+            FieldSelection::Aggregate { field, function, alias } => {
+                self.execute_aggregate(&query, &series_ids, field, *function, alias.clone(), Some(&cancel))?
             }
         };
 
@@ -73,7 +122,11 @@ impl QueryExecutor {
     }
 
     /// Resolve series IDs matching the query filters
-    fn resolve_series_ids(&self, query: &Query) -> Result<Vec<SeriesId>> {
+    fn resolve_series_ids(
+        &self,
+        query: &Query,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<Vec<SeriesId>> {
         // Get series IDs for the measurement
         let measurement_series = self.series_index.get_by_measurement(&query.measurement);
 
@@ -89,6 +142,13 @@ impl QueryExecutor {
         let mut result = measurement_series;
 
         for filter in &query.tag_filters {
+            // Check cancellation before each filter
+            if let Some(cancel) = cancel {
+                if cancel.is_cancelled() {
+                    return Err(QueryError::Cancelled);
+                }
+            }
+
             match filter {
                 TagFilter::Equals { key, value } => {
                     let matching = self.tag_index.find_by_tag(key, value);
@@ -136,10 +196,22 @@ impl QueryExecutor {
     }
 
     /// Execute a SELECT query (raw data)
-    fn execute_select(&self, query: &Query, series_ids: &[SeriesId]) -> Result<QueryResult> {
+    fn execute_select(
+        &self,
+        query: &Query,
+        series_ids: &[SeriesId],
+        cancel: Option<&CancellationToken>,
+    ) -> Result<QueryResult> {
         let mut rows = Vec::new();
 
         for &series_id in series_ids {
+            // Check cancellation before each series
+            if let Some(cancel) = cancel {
+                if cancel.is_cancelled() {
+                    return Err(QueryError::Cancelled);
+                }
+            }
+
             let points = self.storage.query(series_id, &query.time_range)?;
 
             let series_meta = self.series_index.get(series_id);
@@ -178,20 +250,21 @@ impl QueryExecutor {
         field: &str,
         function: AggregateFunction,
         alias: Option<String>,
+        cancel: Option<&CancellationToken>,
     ) -> Result<QueryResult> {
         let field_name = alias.unwrap_or_else(|| format!("{}_{:?}", field, function).to_lowercase());
 
         // Group by time if specified
         if let Some(interval) = query.group_by_time {
             return self.execute_aggregate_time_bucket(
-                query, series_ids, field, function, &field_name, interval,
+                query, series_ids, field, function, &field_name, interval, cancel,
             );
         }
 
         // Group by tags if specified
         if !query.group_by.is_empty() {
             return self.execute_aggregate_grouped(
-                query, series_ids, field, function, &field_name,
+                query, series_ids, field, function, &field_name, cancel,
             );
         }
 
@@ -199,6 +272,13 @@ impl QueryExecutor {
         let mut aggregator = Aggregator::new(function);
 
         for &series_id in series_ids {
+            // Check cancellation before each series
+            if let Some(cancel) = cancel {
+                if cancel.is_cancelled() {
+                    return Err(QueryError::Cancelled);
+                }
+            }
+
             let points = self.storage.query(series_id, &query.time_range)?;
 
             for point in points {
@@ -237,6 +317,7 @@ impl QueryExecutor {
         function: AggregateFunction,
         field_name: &str,
         interval: i64,
+        cancel: Option<&CancellationToken>,
     ) -> Result<QueryResult> {
         // Group by series if group_by tags specified, otherwise aggregate all series
         let group_by_series = !query.group_by.is_empty();
@@ -246,6 +327,13 @@ impl QueryExecutor {
             let mut rows = Vec::new();
 
             for &series_id in series_ids {
+                // Check cancellation before each series
+                if let Some(cancel) = cancel {
+                    if cancel.is_cancelled() {
+                        return Err(QueryError::Cancelled);
+                    }
+                }
+
                 let points = self.storage.query(series_id, &query.time_range)?;
                 let mut time_agg = TimeBucketAggregator::new(
                     function,
@@ -297,6 +385,13 @@ impl QueryExecutor {
             );
 
             for &series_id in series_ids {
+                // Check cancellation before each series
+                if let Some(cancel) = cancel {
+                    if cancel.is_cancelled() {
+                        return Err(QueryError::Cancelled);
+                    }
+                }
+
                 let points = self.storage.query(series_id, &query.time_range)?;
 
                 for point in points {
@@ -340,6 +435,7 @@ impl QueryExecutor {
         field: &str,
         function: AggregateFunction,
         field_name: &str,
+        cancel: Option<&CancellationToken>,
     ) -> Result<QueryResult> {
         // Group series by the group_by tags
         let mut groups: HashMap<Vec<(String, String)>, Vec<SeriesId>> = HashMap::new();
@@ -364,6 +460,13 @@ impl QueryExecutor {
         let mut rows = Vec::new();
 
         for (group_key, group_series) in groups {
+            // Check cancellation before each group
+            if let Some(cancel) = cancel {
+                if cancel.is_cancelled() {
+                    return Err(QueryError::Cancelled);
+                }
+            }
+
             let mut aggregator = Aggregator::new(function);
 
             for &series_id in &group_series {

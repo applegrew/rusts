@@ -12,6 +12,7 @@ rusts-storage = { workspace = true }
 rusts-index = { workspace = true }
 
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 async-trait = { workspace = true }
 parking_lot = { workspace = true }
 serde = { workspace = true }

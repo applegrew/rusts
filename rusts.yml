@@ -3,6 +3,8 @@ server:
   port: 8086
   max_body_size: 10485760
   request_timeout_secs: 30
+  query_timeout_secs: 30
+  max_concurrent_queries: 100
 storage:
   data_dir: ./data
   wal_dir: null

@@ -14,7 +14,9 @@ use rusts_storage::StorageEngine;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 
 /// Application state shared across handlers
 pub struct AppState {
@@ -22,6 +24,8 @@ pub struct AppState {
     pub series_index: Arc<SeriesIndex>,
     pub tag_index: Arc<TagIndex>,
     pub executor: Arc<QueryExecutor>,
+    pub query_semaphore: Arc<Semaphore>,
+    pub query_timeout: Duration,
 }
 
 impl AppState {
@@ -29,6 +33,8 @@ impl AppState {
         storage: Arc<StorageEngine>,
         series_index: Arc<SeriesIndex>,
         tag_index: Arc<TagIndex>,
+        query_timeout: Duration,
+        max_concurrent_queries: usize,
     ) -> Self {
         let executor = Arc::new(QueryExecutor::new(
             Arc::clone(&storage),
@@ -41,6 +47,8 @@ impl AppState {
             series_index,
             tag_index,
             executor,
+            query_semaphore: Arc::new(Semaphore::new(max_concurrent_queries)),
+            query_timeout,
         }
     }
 }
@@ -171,6 +179,10 @@ pub async fn query(
 ) -> std::result::Result<Json<QueryResponse>, ApiError> {
     let start = Instant::now();
 
+    // Acquire semaphore permit (Layer 3: concurrent query limit)
+    let _permit = state.query_semaphore.acquire().await
+        .map_err(|_| ApiError::Internal("Query semaphore closed".to_string()))?;
+
     // Build query
     let time_range = req.time_range.map(|tr| TimeRange::new(tr.start, tr.end))
         .unwrap_or_default();
@@ -215,8 +227,36 @@ pub async fn query(
 
     let query = builder.build().map_err(|e| ApiError::Query(e.to_string()))?;
 
-    // Execute query
-    let result = state.executor.execute(query)?;
+    // Clone what we need for spawn_blocking
+    let executor = Arc::clone(&state.executor);
+    let timeout = state.query_timeout;
+    let cancel = CancellationToken::new();
+    let cancel_clone = cancel.clone();
+
+    // Execute with timeout and spawn_blocking (Layer 2 + 4)
+    let query_result = tokio::time::timeout(timeout, async {
+        tokio::task::spawn_blocking(move || {
+            executor.execute_with_cancellation(query, cancel_clone)
+        }).await
+    }).await;
+
+    // Handle results
+    let result = match query_result {
+        Ok(Ok(Ok(result))) => result,
+        Ok(Ok(Err(query_err))) => {
+            // Query error (including cancellation)
+            return Err(ApiError::Query(query_err.to_string()));
+        }
+        Ok(Err(join_err)) => {
+            // spawn_blocking panicked
+            return Err(ApiError::Internal(format!("Query task failed: {}", join_err)));
+        }
+        Err(_timeout) => {
+            // Timeout - cancel the query
+            cancel.cancel();
+            return Err(ApiError::Query("Query timeout exceeded".to_string()));
+        }
+    };
 
     // Convert to response
     let results: Vec<ResultRowResponse> = result
@@ -364,14 +404,46 @@ pub async fn sql_query(
 ) -> std::result::Result<Json<QueryResponse>, ApiError> {
     let start = Instant::now();
 
+    // Acquire semaphore permit (Layer 3: concurrent query limit)
+    let _permit = state.query_semaphore.acquire().await
+        .map_err(|_| ApiError::Internal("Query semaphore closed".to_string()))?;
+
     // Parse SQL
     let stmt = SqlParser::parse_select(&req.query)?;
 
     // Translate to Query model
     let query = SqlTranslator::translate(&stmt)?;
 
-    // Execute query
-    let result = state.executor.execute(query)?;
+    // Clone what we need for spawn_blocking
+    let executor = Arc::clone(&state.executor);
+    let timeout = state.query_timeout;
+    let cancel = CancellationToken::new();
+    let cancel_clone = cancel.clone();
+
+    // Execute with timeout and spawn_blocking (Layer 2 + 4)
+    let query_result = tokio::time::timeout(timeout, async {
+        tokio::task::spawn_blocking(move || {
+            executor.execute_with_cancellation(query, cancel_clone)
+        }).await
+    }).await;
+
+    // Handle results
+    let result = match query_result {
+        Ok(Ok(Ok(result))) => result,
+        Ok(Ok(Err(query_err))) => {
+            // Query error (including cancellation)
+            return Err(ApiError::Query(query_err.to_string()));
+        }
+        Ok(Err(join_err)) => {
+            // spawn_blocking panicked
+            return Err(ApiError::Internal(format!("Query task failed: {}", join_err)));
+        }
+        Err(_timeout) => {
+            // Timeout - cancel the query
+            cancel.cancel();
+            return Err(ApiError::Query("Query timeout exceeded".to_string()));
+        }
+    };
 
     // Convert to response (same format as /query endpoint)
     let results: Vec<ResultRowResponse> = result
