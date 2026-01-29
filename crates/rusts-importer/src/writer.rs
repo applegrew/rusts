@@ -71,13 +71,30 @@ impl RustsWriter {
         points: &[Point],
         batch_size: usize,
     ) -> Result<WriteResult> {
+        self.write_batched_with_progress(points, batch_size, |_, _| {}).await
+    }
+
+    /// Write points in batches with progress callback
+    ///
+    /// The callback receives (points_written_so_far, total_points) after each batch.
+    pub async fn write_batched_with_progress<F>(
+        &self,
+        points: &[Point],
+        batch_size: usize,
+        mut on_progress: F,
+    ) -> Result<WriteResult>
+    where
+        F: FnMut(usize, usize),
+    {
         let mut total_written = 0;
         let mut total_bytes = 0;
+        let total_points = points.len();
 
         for batch in points.chunks(batch_size) {
             let result = self.write(batch).await?;
             total_written += result.points_written;
             total_bytes += result.bytes_sent;
+            on_progress(total_written, total_points);
         }
 
         Ok(WriteResult {
