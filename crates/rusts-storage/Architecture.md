@@ -365,6 +365,174 @@ pub enum StorageError {
 }
 ```
 
+## File Formats
+
+### WAL File Format
+
+WAL (Write-Ahead Log) files store durable write records before they are flushed to segments.
+
+**File Naming:** `wal_XXXXXXXX.log` (8-digit zero-padded sequence number)
+
+**Example:** `wal_00000000.log`, `wal_00000001.log`, etc.
+
+**File Layout:**
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Entry 0                                                     │
+├─────────────────────────────────────────────────────────────┤
+│ Entry 1                                                     │
+├─────────────────────────────────────────────────────────────┤
+│ ...                                                         │
+├─────────────────────────────────────────────────────────────┤
+│ Entry N                                                     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Entry Format (Header + Data):**
+```
+Header (32 bytes):
+┌──────────┬──────────────┬────────────────────────────────────┐
+│ Offset   │ Size (bytes) │ Field                              │
+├──────────┼──────────────┼────────────────────────────────────┤
+│ 0        │ 8            │ sequence (u64, little-endian)      │
+│ 8        │ 8            │ timestamp (i64, little-endian)     │
+│ 16       │ 4            │ point_count (u32, little-endian)   │
+│ 20       │ 4            │ data_len (u32, little-endian)      │
+│ 24       │ 4            │ checksum (u32, CRC32)              │
+│ 28       │ 4            │ padding (reserved)                 │
+└──────────┴──────────────┴────────────────────────────────────┘
+
+Data (variable length):
+┌──────────────────────────────────────────────────────────────┐
+│ bincode-serialized Vec<Point> (data_len bytes)               │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**CRC32 Coverage:**
+```
+┌──────────────────────────────────────────────────────────────┐
+│                    CRC32 PROTECTED REGION                    │
+├──────────────────────────────────────────────────────────────┤
+│ Header bytes 0-23 (sequence, timestamp, point_count, data_len│
+│ + all data bytes                                             │
+└──────────────────────────────────────────────────────────────┘
+```
+
+The CRC32 checksum protects both the header fields and the serialized data, ensuring complete entry integrity. If any byte in the header or data is corrupted, validation will fail.
+
+**Rotation:**
+- Files rotate when size exceeds `max_file_size` (default: 64MB)
+- New file gets incremented sequence number
+- Old files retained based on `wal_retention_secs` configuration
+
+### Segment File Format
+
+Segments store compressed, immutable data flushed from MemTables.
+
+**File Naming:** `segment_XXXXXXXXXXXXXXXX.rts` (16-digit hex segment ID)
+
+**File Layout:**
+```
+┌──────────────────────────────────────────────────────────────┐
+│ Magic: "RTSS" (4 bytes: 0x52 0x54 0x53 0x53)                 │
+├──────────────────────────────────────────────────────────────┤
+│ Version: u16 (2 bytes, little-endian, currently = 1)         │
+├──────────────────────────────────────────────────────────────┤
+│ Metadata Block                                               │
+├──────────────────────────────────────────────────────────────┤
+│ Timestamp Column                                             │
+├──────────────────────────────────────────────────────────────┤
+│ Field Column 0                                               │
+├──────────────────────────────────────────────────────────────┤
+│ Field Column 1                                               │
+├──────────────────────────────────────────────────────────────┤
+│ ...                                                          │
+├──────────────────────────────────────────────────────────────┤
+│ Field Column N                                               │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**Metadata Block:**
+```
+┌──────────┬──────────────┬────────────────────────────────────┐
+│ Offset   │ Size (bytes) │ Field                              │
+├──────────┼──────────────┼────────────────────────────────────┤
+│ 0        │ 4            │ metadata_len (u32, little-endian)  │
+│ 4        │ metadata_len │ bincode-serialized SegmentMeta     │
+└──────────┴──────────────┴────────────────────────────────────┘
+
+SegmentMeta contains:
+- id: u64 (segment identifier)
+- series_id: u64 (hash of measurement + tags)
+- measurement: String
+- tags: Vec<Tag>
+- time_range: TimeRange (start, end timestamps)
+- point_count: usize
+- fields: Vec<(String, FieldType)>
+- compressed_size: usize
+- uncompressed_size: usize
+```
+
+**Column Block Format:**
+```
+┌──────────┬──────────────┬────────────────────────────────────┐
+│ Offset   │ Size (bytes) │ Field                              │
+├──────────┼──────────────┼────────────────────────────────────┤
+│ 0        │ 4            │ column_len (u32, little-endian)    │
+│ 4        │ column_len   │ compressed column data             │
+└──────────┴──────────────┴────────────────────────────────────┘
+```
+
+**Compression by Field Type:**
+
+| Field Type | Compression Algorithm |
+|------------|----------------------|
+| Timestamps | Delta-of-delta + LZ4/Zstd |
+| Float | Gorilla XOR encoding |
+| Integer | Delta + varint encoding |
+| String | Dictionary encoding |
+| Boolean | Bit-packing (8 per byte) |
+
+### Partition Directory Structure
+
+Partitions organize data by time windows (default: 24 hours).
+
+**Directory Naming:** `partition_XXXXXXXXXXXXXXXX/` (16-digit hex partition ID)
+
+**Directory Layout:**
+```
+data/
+├── partition_0000000000000001/
+│   ├── partition.meta           # Partition metadata
+│   ├── segment_0000000000000001.rts
+│   ├── segment_0000000000000002.rts
+│   └── ...
+├── partition_0000000000000002/
+│   ├── partition.meta
+│   └── ...
+└── wal/
+    ├── wal_00000000.log
+    ├── wal_00000001.log
+    └── ...
+```
+
+**partition.meta Format:**
+```
+bincode-serialized PartitionMeta:
+- id: u64
+- time_range: TimeRange (start, end timestamps)
+- segment_count: usize
+- total_points: usize
+- created_at: i64 (nanosecond timestamp)
+```
+
+**Partition Time Calculation:**
+```
+partition_duration = 24 * 60 * 60 * 1_000_000_000  // 1 day in nanos
+partition_start = (timestamp / partition_duration) * partition_duration
+partition_end = partition_start + partition_duration
+```
+
 ## Dependencies
 
 | Dependency | Purpose |

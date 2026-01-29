@@ -108,8 +108,10 @@ impl WalReader {
                 Err(e) => return Err(e.into()),
             }
 
-            // Verify checksum
+            // Verify checksum over header fields (bytes 0-23) AND data
+            // This ensures both header and data integrity are protected
             let mut hasher = Hasher::new();
+            hasher.update(&header_bytes[0..24]);
             hasher.update(&data);
             let computed_checksum = hasher.finalize();
 

@@ -41,7 +41,7 @@ struct WalEntryHeader {
     point_count: u32,
     /// Length of the serialized data
     data_len: u32,
-    /// CRC32 checksum of the data
+    /// CRC32 checksum of header fields (bytes 0-23) and data
     checksum: u32,
 }
 
@@ -134,21 +134,31 @@ impl WalWriter {
         // Serialize points
         let data = bincode::serialize(points)?;
 
-        // Compute checksum
+        // Create header fields
+        let sequence = self.sequence.fetch_add(1, Ordering::SeqCst);
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+        let point_count = points.len() as u32;
+        let data_len = data.len() as u32;
+
+        // Compute checksum over header fields (bytes 0-23) AND data
+        // This ensures both header and data integrity are protected
         let mut hasher = Hasher::new();
+        hasher.update(&sequence.to_le_bytes());
+        hasher.update(&timestamp.to_le_bytes());
+        hasher.update(&point_count.to_le_bytes());
+        hasher.update(&data_len.to_le_bytes());
         hasher.update(&data);
         let checksum = hasher.finalize();
 
         // Create header
-        let sequence = self.sequence.fetch_add(1, Ordering::SeqCst);
         let header = WalEntryHeader {
             sequence,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos() as i64,
-            point_count: points.len() as u32,
-            data_len: data.len() as u32,
+            timestamp,
+            point_count,
+            data_len,
             checksum,
         };
 
