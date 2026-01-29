@@ -11,6 +11,7 @@ rusts-core = { workspace = true }
 rusts-storage = { workspace = true }
 rusts-query = { workspace = true }
 rusts-index = { workspace = true }
+rusts-sql = { workspace = true }
 
 tokio = { workspace = true }
 async-trait = { workspace = true }

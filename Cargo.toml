@@ -10,6 +10,7 @@ members = [
     "crates/rusts-aggregation",
     "crates/rusts-retention",
     "crates/rusts-api",
+    "crates/rusts-sql",
     "crates/rusts-server",
     "crates/rusts-importer",
 ]
@@ -33,6 +34,7 @@ rusts-cluster = { path = "crates/rusts-cluster" }
 rusts-aggregation = { path = "crates/rusts-aggregation" }
 rusts-retention = { path = "crates/rusts-retention" }
 rusts-api = { path = "crates/rusts-api" }
+rusts-sql = { path = "crates/rusts-sql" }
 
 # Async runtime
 tokio = { version = "1.44", features = ["full"] }
@@ -92,6 +94,7 @@ criterion = "0.5"  # 0.8 has breaking changes
 # Utilities
 bytes = "1.10"
 chrono = { version = "0.4", features = ["serde"] }
+sqlparser = "0.60"
 uuid = { version = "1.16", features = ["v4", "serde"] }
 once_cell = "1.21"
 crossbeam-channel = "0.5"

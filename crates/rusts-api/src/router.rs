@@ -22,8 +22,9 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/ready", get(handlers::ready))
         // Write endpoint
         .route("/write", post(handlers::write))
-        // Query endpoint
+        // Query endpoints
         .route("/query", post(handlers::query))
+        .route("/sql", post(handlers::sql_query))
         // Stats endpoint
         .route("/stats", get(handlers::stats))
         // Add middleware

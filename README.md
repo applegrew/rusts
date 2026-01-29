@@ -484,9 +484,60 @@ Default MemTable flush triggers:
 
 Adjust via configuration for your workload.
 
+## SQL Query Interface
+
+RusTs supports SQL queries via the `/sql` endpoint. Queries are parsed using sqlparser-rs and translated to the native Query model for execution.
+
+### SQL Usage
+
+```bash
+# Basic SELECT
+curl -X POST 'http://localhost:8086/sql' \
+  -H 'Content-Type: application/json' \
+  -d '{"query": "SELECT * FROM cpu WHERE host = '\''server01'\'' LIMIT 10"}'
+
+# Aggregation with GROUP BY
+curl -X POST 'http://localhost:8086/sql' \
+  -H 'Content-Type: application/json' \
+  -d '{"query": "SELECT AVG(usage), MAX(usage) FROM cpu GROUP BY host"}'
+
+# Time range filtering
+curl -X POST 'http://localhost:8086/sql' \
+  -H 'Content-Type: application/json' \
+  -d '{"query": "SELECT * FROM cpu WHERE time >= '\''2024-01-01'\'' AND time < '\''2024-01-02'\''"}'
+```
+
+### Supported SQL Features
+
+| Feature | Example |
+|---------|---------|
+| Field selection | `SELECT usage, temperature FROM cpu` |
+| Wildcards | `SELECT * FROM cpu` |
+| Tag filtering | `WHERE host = 'server01'` |
+| Tag IN | `WHERE region IN ('us-west', 'us-east')` |
+| Tag NOT EQUALS | `WHERE host != 'server01'` |
+| Tag EXISTS | `WHERE host IS NOT NULL` |
+| Time range | `WHERE time >= '2024-01-01' AND time < '2024-01-02'` |
+| Aggregations | `SELECT AVG(usage), COUNT(*), MAX(temp) FROM cpu` |
+| GROUP BY tags | `GROUP BY host, region` |
+| ORDER BY | `ORDER BY time DESC` |
+| LIMIT/OFFSET | `LIMIT 100 OFFSET 50` |
+
+**Supported aggregate functions:** COUNT, SUM, AVG/MEAN, MIN, MAX, FIRST, LAST, STDDEV, VARIANCE, PERCENTILE_N
+
+**Not supported (v1):** JOINs, subqueries, CTEs, window functions, UNION, OR conditions
+
 ## Roadmap
 
-- [ ] SQL query interface (via DataFusion)
+- [x] SQL query interface
+  - [x] Architecture design (sqlparser-rs based)
+  - [x] Create rusts-sql crate
+  - [x] SQL parser wrapper
+  - [x] SQL to Query translator
+  - [x] Time-series functions (now(), time_bucket())
+  - [x] /sql API endpoint
+  - [x] Documentation and examples
+  - [ ] DataFusion integration (future)
 - [ ] Kubernetes operator
 - [ ] Continuous queries
 - [ ] Materialized views

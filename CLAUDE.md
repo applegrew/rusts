@@ -55,6 +55,7 @@ crates/
 ├── rusts-index/          # Series index, Tag index (Roaring bitmaps), Bloom filters
 ├── rusts-query/          # Query model, planner, executor, aggregation functions
 ├── rusts-api/            # REST API, line protocol parser, auth, rate limiting
+├── rusts-sql/            # SQL query interface (sqlparser-rs, AST to Query translation)
 ├── rusts-cluster/        # Static config, sharding strategies, query routing
 ├── rusts-aggregation/    # Continuous aggregates, downsampling
 ├── rusts-retention/      # Retention policies, storage tiering
@@ -94,6 +95,7 @@ Query → Planner → Partition Pruner → Series Resolver → Parallel Scanner 
 - `crates/rusts-query/src/executor.rs` - Query execution
 - `crates/rusts-api/src/line_protocol.rs` - InfluxDB line protocol parser
 - `crates/rusts-api/src/router.rs` - Axum REST API routes
+- `crates/rusts-sql/src/translator.rs` - SQL to Query translation
 - `crates/rusts-server/src/main.rs` - Server config parsing (rusts.yml)
 - `crates/rusts-importer/src/main.rs` - Data import CLI
 - `rusts.yml` - Default server configuration file
@@ -102,6 +104,7 @@ Query → Planner → Partition Pruner → Series Resolver → Parallel Scanner 
 
 - `POST /write` - Write data (InfluxDB line protocol)
 - `POST /query` - Query data (JSON)
+- `POST /sql` - Query data (SQL)
 - `GET /health` - Health check
 - `GET /ready` - Readiness check
 - `GET /stats` - Database statistics

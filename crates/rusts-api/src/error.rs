@@ -83,3 +83,9 @@ impl From<rusts_query::QueryError> for ApiError {
         ApiError::Query(e.to_string())
     }
 }
+
+impl From<rusts_sql::SqlError> for ApiError {
+    fn from(e: rusts_sql::SqlError) -> Self {
+        ApiError::Query(e.to_string())
+    }
+}

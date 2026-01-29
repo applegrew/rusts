@@ -9,6 +9,7 @@ use axum::{
 use rusts_core::TimeRange;
 use rusts_index::{SeriesIndex, TagIndex};
 use rusts_query::{AggregateFunction, Query, QueryExecutor};
+use rusts_sql::{SqlParser, SqlTranslator};
 use rusts_storage::StorageEngine;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -348,6 +349,70 @@ pub async fn stats(State(state): State<Arc<AppState>>) -> Json<StatsResponse> {
             total_points: partitions.total_points,
         },
     })
+}
+
+/// SQL query request body
+#[derive(Debug, Deserialize)]
+pub struct SqlQueryRequest {
+    pub query: String,
+}
+
+/// Execute a SQL query
+pub async fn sql_query(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SqlQueryRequest>,
+) -> std::result::Result<Json<QueryResponse>, ApiError> {
+    let start = Instant::now();
+
+    // Parse SQL
+    let stmt = SqlParser::parse_select(&req.query)?;
+
+    // Translate to Query model
+    let query = SqlTranslator::translate(&stmt)?;
+
+    // Execute query
+    let result = state.executor.execute(query)?;
+
+    // Convert to response (same format as /query endpoint)
+    let results: Vec<ResultRowResponse> = result
+        .rows
+        .iter()
+        .map(|row| {
+            let tags: HashMap<String, String> = row
+                .tags
+                .iter()
+                .map(|t| (t.key.clone(), t.value.clone()))
+                .collect();
+
+            let fields: HashMap<String, serde_json::Value> = row
+                .fields
+                .iter()
+                .map(|(k, v)| {
+                    let json_value = match v {
+                        rusts_core::FieldValue::Float(f) => serde_json::json!(f),
+                        rusts_core::FieldValue::Integer(i) => serde_json::json!(i),
+                        rusts_core::FieldValue::UnsignedInteger(u) => serde_json::json!(u),
+                        rusts_core::FieldValue::String(s) => serde_json::json!(s),
+                        rusts_core::FieldValue::Boolean(b) => serde_json::json!(b),
+                    };
+                    (k.clone(), json_value)
+                })
+                .collect();
+
+            ResultRowResponse {
+                time: row.timestamp,
+                tags,
+                fields,
+            }
+        })
+        .collect();
+
+    Ok(Json(QueryResponse {
+        measurement: result.measurement,
+        results,
+        total_rows: result.total_rows,
+        execution_time_ms: start.elapsed().as_secs_f64() * 1000.0,
+    }))
 }
 
 #[cfg(test)]

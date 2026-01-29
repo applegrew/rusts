@@ -15,5 +15,5 @@ pub mod planner;
 pub use aggregation::{AggregateFunction, Aggregator};
 pub use error::{QueryError, Result};
 pub use executor::QueryExecutor;
-pub use model::{Query, QueryBuilder, QueryResult};
+pub use model::{FieldSelection, Query, QueryBuilder, QueryResult, TagFilter};
 pub use planner::QueryPlanner;
