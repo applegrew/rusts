@@ -13,6 +13,15 @@ use sqlparser::ast::{
 };
 use tracing::debug;
 
+/// Represents the result of parsing and translating a SQL statement
+#[derive(Debug)]
+pub enum SqlCommand {
+    /// A SELECT query to execute
+    Query(Query),
+    /// SHOW TABLES command - returns list of measurements
+    ShowTables,
+}
+
 /// SQL to Query translator
 pub struct SqlTranslator;
 
@@ -24,6 +33,21 @@ impl SqlTranslator {
             _ => Err(SqlError::UnsupportedFeature(
                 "Only SELECT queries are supported".to_string(),
             )),
+        }
+    }
+
+    /// Translate a SQL statement into a SqlCommand (Query or ShowTables)
+    pub fn translate_command(stmt: &Statement) -> Result<SqlCommand> {
+        match stmt {
+            Statement::Query(query) => {
+                let q = Self::translate_query(query)?;
+                Ok(SqlCommand::Query(q))
+            }
+            Statement::ShowTables { .. } => Ok(SqlCommand::ShowTables),
+            _ => Err(SqlError::UnsupportedFeature(format!(
+                "Unsupported statement type: {:?}",
+                stmt
+            ))),
         }
     }
 
@@ -846,5 +870,12 @@ mod tests {
     fn test_or_rejected() {
         let result = translate("SELECT * FROM cpu WHERE host = 'a' OR host = 'b'");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_show_tables() {
+        let stmt = SqlParser::parse("SHOW TABLES").unwrap();
+        let cmd = SqlTranslator::translate_command(&stmt).unwrap();
+        assert!(matches!(cmd, SqlCommand::ShowTables));
     }
 }

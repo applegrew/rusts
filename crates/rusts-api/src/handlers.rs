@@ -9,7 +9,7 @@ use axum::{
 use rusts_core::TimeRange;
 use rusts_index::{SeriesIndex, TagIndex};
 use rusts_query::{AggregateFunction, Query, QueryExecutor};
-use rusts_sql::{SqlParser, SqlTranslator};
+use rusts_sql::{SqlCommand, SqlParser, SqlTranslator};
 use rusts_storage::StorageEngine;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -404,87 +404,115 @@ pub async fn sql_query(
 ) -> std::result::Result<Json<QueryResponse>, ApiError> {
     let start = Instant::now();
 
-    // Acquire semaphore permit (Layer 3: concurrent query limit)
-    let _permit = state.query_semaphore.acquire().await
-        .map_err(|_| ApiError::Internal("Query semaphore closed".to_string()))?;
-
     // Parse SQL
-    let stmt = SqlParser::parse_select(&req.query)?;
+    let stmt = SqlParser::parse(&req.query)?;
 
-    // Translate to Query model
-    let query = SqlTranslator::translate(&stmt)?;
+    // Translate to command
+    let command = SqlTranslator::translate_command(&stmt)?;
 
-    // Clone what we need for spawn_blocking
-    let executor = Arc::clone(&state.executor);
-    let timeout = state.query_timeout;
-    let cancel = CancellationToken::new();
-    let cancel_clone = cancel.clone();
-
-    // Execute with timeout and spawn_blocking (Layer 2 + 4)
-    let query_result = tokio::time::timeout(timeout, async {
-        tokio::task::spawn_blocking(move || {
-            executor.execute_with_cancellation(query, cancel_clone)
-        }).await
-    }).await;
-
-    // Handle results
-    let result = match query_result {
-        Ok(Ok(Ok(result))) => result,
-        Ok(Ok(Err(query_err))) => {
-            // Query error (including cancellation)
-            return Err(ApiError::Query(query_err.to_string()));
-        }
-        Ok(Err(join_err)) => {
-            // spawn_blocking panicked
-            return Err(ApiError::Internal(format!("Query task failed: {}", join_err)));
-        }
-        Err(_timeout) => {
-            // Timeout - cancel the query
-            cancel.cancel();
-            return Err(ApiError::Query("Query timeout exceeded".to_string()));
-        }
-    };
-
-    // Convert to response (same format as /query endpoint)
-    let results: Vec<ResultRowResponse> = result
-        .rows
-        .iter()
-        .map(|row| {
-            let tags: HashMap<String, String> = row
-                .tags
-                .iter()
-                .map(|t| (t.key.clone(), t.value.clone()))
-                .collect();
-
-            let fields: HashMap<String, serde_json::Value> = row
-                .fields
-                .iter()
-                .map(|(k, v)| {
-                    let json_value = match v {
-                        rusts_core::FieldValue::Float(f) => serde_json::json!(f),
-                        rusts_core::FieldValue::Integer(i) => serde_json::json!(i),
-                        rusts_core::FieldValue::UnsignedInteger(u) => serde_json::json!(u),
-                        rusts_core::FieldValue::String(s) => serde_json::json!(s),
-                        rusts_core::FieldValue::Boolean(b) => serde_json::json!(b),
-                    };
-                    (k.clone(), json_value)
+    match command {
+        SqlCommand::ShowTables => {
+            // Return list of measurements as tables
+            let measurements = state.series_index.measurements();
+            let results: Vec<ResultRowResponse> = measurements
+                .into_iter()
+                .map(|name| {
+                    let mut fields = HashMap::new();
+                    fields.insert("name".to_string(), serde_json::json!(name));
+                    ResultRowResponse {
+                        time: None,
+                        tags: HashMap::new(),
+                        fields,
+                    }
                 })
                 .collect();
 
-            ResultRowResponse {
-                time: row.timestamp,
-                tags,
-                fields,
-            }
-        })
-        .collect();
+            let total_rows = results.len();
+            Ok(Json(QueryResponse {
+                measurement: "_tables".to_string(),
+                results,
+                total_rows,
+                execution_time_ms: start.elapsed().as_secs_f64() * 1000.0,
+            }))
+        }
+        SqlCommand::Query(query) => {
+            // Acquire semaphore permit (Layer 3: concurrent query limit)
+            let _permit = state.query_semaphore.acquire().await
+                .map_err(|_| ApiError::Internal("Query semaphore closed".to_string()))?;
 
-    Ok(Json(QueryResponse {
-        measurement: result.measurement,
-        results,
-        total_rows: result.total_rows,
-        execution_time_ms: start.elapsed().as_secs_f64() * 1000.0,
-    }))
+            // Clone what we need for spawn_blocking
+            let executor = Arc::clone(&state.executor);
+            let timeout = state.query_timeout;
+            let cancel = CancellationToken::new();
+            let cancel_clone = cancel.clone();
+
+            // Execute with timeout and spawn_blocking (Layer 2 + 4)
+            let query_result = tokio::time::timeout(timeout, async {
+                tokio::task::spawn_blocking(move || {
+                    executor.execute_with_cancellation(query, cancel_clone)
+                }).await
+            }).await;
+
+            // Handle results
+            let result = match query_result {
+                Ok(Ok(Ok(result))) => result,
+                Ok(Ok(Err(query_err))) => {
+                    // Query error (including cancellation)
+                    return Err(ApiError::Query(query_err.to_string()));
+                }
+                Ok(Err(join_err)) => {
+                    // spawn_blocking panicked
+                    return Err(ApiError::Internal(format!("Query task failed: {}", join_err)));
+                }
+                Err(_timeout) => {
+                    // Timeout - cancel the query
+                    cancel.cancel();
+                    return Err(ApiError::Query("Query timeout exceeded".to_string()));
+                }
+            };
+
+            // Convert to response (same format as /query endpoint)
+            let results: Vec<ResultRowResponse> = result
+                .rows
+                .iter()
+                .map(|row| {
+                    let tags: HashMap<String, String> = row
+                        .tags
+                        .iter()
+                        .map(|t| (t.key.clone(), t.value.clone()))
+                        .collect();
+
+                    let fields: HashMap<String, serde_json::Value> = row
+                        .fields
+                        .iter()
+                        .map(|(k, v)| {
+                            let json_value = match v {
+                                rusts_core::FieldValue::Float(f) => serde_json::json!(f),
+                                rusts_core::FieldValue::Integer(i) => serde_json::json!(i),
+                                rusts_core::FieldValue::UnsignedInteger(u) => serde_json::json!(u),
+                                rusts_core::FieldValue::String(s) => serde_json::json!(s),
+                                rusts_core::FieldValue::Boolean(b) => serde_json::json!(b),
+                            };
+                            (k.clone(), json_value)
+                        })
+                        .collect();
+
+                    ResultRowResponse {
+                        time: row.timestamp,
+                        tags,
+                        fields,
+                    }
+                })
+                .collect();
+
+            Ok(Json(QueryResponse {
+                measurement: result.measurement,
+                results,
+                total_rows: result.total_rows,
+                execution_time_ms: start.elapsed().as_secs_f64() * 1000.0,
+            }))
+        }
+    }
 }
 
 #[cfg(test)]

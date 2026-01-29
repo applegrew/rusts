@@ -524,10 +524,29 @@ curl -X POST 'http://localhost:8086/sql' \
 | GROUP BY tags | `GROUP BY host, region` |
 | ORDER BY | `ORDER BY time DESC` |
 | LIMIT/OFFSET | `LIMIT 100 OFFSET 50` |
+| Show tables | `SHOW TABLES` |
 
 **Supported aggregate functions:** COUNT, SUM, AVG/MEAN, MIN, MAX, FIRST, LAST, STDDEV, VARIANCE, PERCENTILE_N
 
 **Not supported (v1):** JOINs, subqueries, CTEs, window functions, UNION, OR conditions
+
+### SHOW TABLES
+
+List all measurements (tables) in the database:
+
+```bash
+curl -X POST 'http://localhost:8086/sql' \
+  -H 'Content-Type: application/json' \
+  -d '{"query": "SHOW TABLES"}'
+
+# Response:
+# {
+#   "measurement": "_tables",
+#   "results": [{"fields": {"name": "cpu"}}, {"fields": {"name": "memory"}}],
+#   "total_rows": 2,
+#   "execution_time_ms": 0.5
+# }
+```
 
 ## Roadmap
 

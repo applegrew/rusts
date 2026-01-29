@@ -11,6 +11,7 @@
 //! - Aggregation functions (COUNT, SUM, AVG, MIN, MAX, etc.)
 //! - GROUP BY tags and time bucketing
 //! - ORDER BY, LIMIT, OFFSET
+//! - SHOW TABLES to list measurements
 //!
 //! # Example
 //!
@@ -30,4 +31,4 @@ mod translator;
 pub use error::{Result, SqlError};
 pub use functions::FunctionRegistry;
 pub use parser::SqlParser;
-pub use translator::SqlTranslator;
+pub use translator::{SqlCommand, SqlTranslator};
