@@ -22,9 +22,28 @@ cargo test -p rusts-compression --lib
 # Run benchmarks
 cargo bench -p rusts-server
 
-# Run the server
+# Run the server (reads rusts.yml if present)
 cargo run -p rusts-server
+
+# Generate default config file
+cargo run -p rusts-server -- --generate-config
+
+# Run with custom config
+cargo run -p rusts-server -- --config /path/to/rusts.yml
 ```
+
+## Configuration
+
+Server configuration is managed via `rusts.yml` (YAML). Key sections:
+
+- **server**: host, port, max_body_size, request_timeout
+- **storage**: data_dir, wal_dir, wal_durability, wal_retention_secs, memtable settings, compression
+- **auth**: enabled, jwt_secret, token_expiration
+- **logging**: level, show_target, show_thread_ids, show_location
+
+WAL durability modes: `every_write`, `periodic`, `os_default`, `none`
+
+WAL retention: Set `wal_retention_secs` for automatic cleanup, or `null` to retain forever (for CDC)
 
 ## Crate Structure
 
@@ -39,6 +58,7 @@ crates/
 ├── rusts-cluster/        # Static config, sharding strategies, query routing
 ├── rusts-aggregation/    # Continuous aggregates, downsampling
 ├── rusts-retention/      # Retention policies, storage tiering
+├── rusts-importer/       # Data import CLI (Parquet, streaming, direct mode)
 └── rusts-server/         # Main server binary
 ```
 
@@ -74,6 +94,9 @@ Query → Planner → Partition Pruner → Series Resolver → Parallel Scanner 
 - `crates/rusts-query/src/executor.rs` - Query execution
 - `crates/rusts-api/src/line_protocol.rs` - InfluxDB line protocol parser
 - `crates/rusts-api/src/router.rs` - Axum REST API routes
+- `crates/rusts-server/src/main.rs` - Server config parsing (rusts.yml)
+- `crates/rusts-importer/src/main.rs` - Data import CLI
+- `rusts.yml` - Default server configuration file
 
 ## API Endpoints
 
@@ -109,6 +132,33 @@ replica_shards = [0, 1, 2, 3, 4, 5, 6, 7]
 ```
 
 For dynamic clustering (auto-discovery, failover), integrate with external tools like etcd, Consul, or Kubernetes.
+
+## Data Import CLI
+
+The `rusts-import` CLI imports data from Parquet files with streaming support.
+
+```bash
+# Build
+cargo build --release -p rusts-importer
+
+# REST mode (streams to server via HTTP)
+./target/release/rusts-import parquet data.parquet -m metrics
+
+# Direct mode (writes directly to storage, ~5x faster)
+./target/release/rusts-import parquet data.parquet -m metrics --direct
+
+# With deduplication against existing DB records
+./target/release/rusts-import parquet data.parquet -m metrics --dedup-column id --direct
+```
+
+Key options:
+- `--direct`: Bypass REST API, write directly to storage engine
+- `--dedup-column <COL>`: Skip records where column value exists in DB
+- `--tags <COLS>`: Comma-separated columns to treat as tags
+- `--timestamp-column <COL>`: Column for point timestamp
+- `--config <PATH>`: Read data_dir from rusts.yml
+
+Dedup limitations: Direct mode can only dedup by fields (not tags)
 
 ## Testing Notes
 
