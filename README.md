@@ -2,6 +2,8 @@
 
 A high-performance time series database written in Rust, designed for monitoring, IoT, and real-time analytics workloads.
 
+[![Video Overview](https://img.youtube.com/vi/-aaLTkZcpJ8/maxresdefault.jpg)](https://youtu.be/-aaLTkZcpJ8)
+
 ## Features
 
 - **High Performance**: Optimized for time series workloads with columnar storage and specialized compression
