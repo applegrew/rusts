@@ -12,7 +12,8 @@ use rayon::prelude::*;
 use rusts_core::{FieldValue, SeriesId, Tag};
 use rusts_index::{SeriesIndex, TagIndex};
 use rusts_storage::StorageEngine;
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -20,6 +21,153 @@ use tokio_util::sync::CancellationToken;
 /// Global regex cache to avoid recompiling patterns
 static REGEX_CACHE: Lazy<RwLock<HashMap<String, regex::Regex>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
+
+// =============================================================================
+// TopKCollector: Bounded collection for LIMIT optimization
+// =============================================================================
+
+/// Wrapper for ResultRow that implements Ord by timestamp (max-heap for ascending order)
+struct TimestampedRow {
+    timestamp: i64,
+    row: ResultRow,
+}
+
+impl PartialEq for TimestampedRow {
+    fn eq(&self, other: &Self) -> bool {
+        self.timestamp == other.timestamp
+    }
+}
+
+impl Eq for TimestampedRow {}
+
+impl PartialOrd for TimestampedRow {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TimestampedRow {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Max-heap: larger timestamps at top (for easy removal when collecting smallest)
+        self.timestamp.cmp(&other.timestamp)
+    }
+}
+
+/// Efficiently collect top K rows by timestamp (ascending order).
+/// Uses a max-heap to track the K smallest timestamps seen.
+struct TopKCollector {
+    heap: BinaryHeap<TimestampedRow>,
+    capacity: usize,
+    total_seen: usize,
+}
+
+impl TopKCollector {
+    fn new(capacity: usize) -> Self {
+        Self {
+            heap: BinaryHeap::with_capacity(capacity + 1),
+            capacity,
+            total_seen: 0,
+        }
+    }
+
+    /// Add a row, keeping only the K smallest timestamps
+    fn push(&mut self, row: ResultRow) {
+        self.total_seen += 1;
+        let ts = row.timestamp.unwrap_or(i64::MAX);
+
+        if self.heap.len() < self.capacity {
+            self.heap.push(TimestampedRow { timestamp: ts, row });
+        } else if let Some(max_entry) = self.heap.peek() {
+            // Only insert if smaller than current max (which will be evicted)
+            if ts < max_entry.timestamp {
+                self.heap.pop();
+                self.heap.push(TimestampedRow { timestamp: ts, row });
+            }
+        }
+    }
+
+    /// Extract rows sorted by timestamp ascending
+    fn into_sorted_vec(self) -> Vec<ResultRow> {
+        let mut rows: Vec<_> = self.heap.into_iter().map(|tr| tr.row).collect();
+        rows.sort_by_key(|r| r.timestamp);
+        rows
+    }
+
+    fn total_seen(&self) -> usize {
+        self.total_seen
+    }
+}
+
+/// Wrapper for min-heap (descending order - keeps largest timestamps)
+struct TimestampedRowDesc(TimestampedRow);
+
+impl PartialEq for TimestampedRowDesc {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.timestamp == other.0.timestamp
+    }
+}
+
+impl Eq for TimestampedRowDesc {}
+
+impl PartialOrd for TimestampedRowDesc {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TimestampedRowDesc {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Min-heap: smaller timestamps at top (for easy removal when collecting largest)
+        other.0.timestamp.cmp(&self.0.timestamp) // Reversed!
+    }
+}
+
+/// Collect top K rows by timestamp (descending order).
+/// Uses a min-heap to track the K largest timestamps seen.
+struct TopKCollectorDesc {
+    heap: BinaryHeap<TimestampedRowDesc>,
+    capacity: usize,
+    total_seen: usize,
+}
+
+impl TopKCollectorDesc {
+    fn new(capacity: usize) -> Self {
+        Self {
+            heap: BinaryHeap::with_capacity(capacity + 1),
+            capacity,
+            total_seen: 0,
+        }
+    }
+
+    /// Add a row, keeping only the K largest timestamps
+    fn push(&mut self, row: ResultRow) {
+        self.total_seen += 1;
+        let ts = row.timestamp.unwrap_or(i64::MIN);
+
+        if self.heap.len() < self.capacity {
+            self.heap
+                .push(TimestampedRowDesc(TimestampedRow { timestamp: ts, row }));
+        } else if let Some(min_entry) = self.heap.peek() {
+            // Only insert if larger than current min (which will be evicted)
+            if ts > min_entry.0.timestamp {
+                self.heap.pop();
+                self.heap
+                    .push(TimestampedRowDesc(TimestampedRow { timestamp: ts, row }));
+            }
+        }
+    }
+
+    /// Extract rows sorted by timestamp descending
+    fn into_sorted_vec(self) -> Vec<ResultRow> {
+        let mut rows: Vec<_> = self.heap.into_iter().map(|tr| tr.0.row).collect();
+        rows.sort_by(|a, b| b.timestamp.cmp(&a.timestamp)); // Descending
+        rows
+    }
+
+    fn total_seen(&self) -> usize {
+        self.total_seen
+    }
+}
 
 /// Get or compile a regex pattern (cached)
 fn get_or_compile_regex(pattern: &str) -> Option<regex::Regex> {
@@ -86,6 +234,9 @@ impl QueryExecutor {
         // Resolve series IDs from filters
         let series_ids = self.resolve_series_ids(&query, None)?;
 
+        // Check if optimized LIMIT path is used (to avoid double limit application)
+        let uses_optimized_limit = self.can_use_optimized_limit(&query);
+
         // Execute based on field selection
         let result = match &query.field_selection {
             FieldSelection::All | FieldSelection::Fields(_) => {
@@ -96,8 +247,12 @@ impl QueryExecutor {
             }
         };
 
-        // Apply limit and offset
-        let result = self.apply_limit_offset(result, query.limit, query.offset);
+        // Apply limit and offset (skip for optimized path - already applied)
+        let result = if uses_optimized_limit {
+            result
+        } else {
+            self.apply_limit_offset(result, query.limit, query.offset)
+        };
 
         // Set execution time
         let mut result = result;
@@ -134,6 +289,9 @@ impl QueryExecutor {
         // Resolve series IDs from filters
         let series_ids = self.resolve_series_ids(&query, Some(&cancel))?;
 
+        // Check if optimized LIMIT path is used (to avoid double limit application)
+        let uses_optimized_limit = self.can_use_optimized_limit(&query);
+
         // Execute based on field selection
         let result = match &query.field_selection {
             FieldSelection::All | FieldSelection::Fields(_) => {
@@ -144,8 +302,12 @@ impl QueryExecutor {
             }
         };
 
-        // Apply limit and offset
-        let result = self.apply_limit_offset(result, query.limit, query.offset);
+        // Apply limit and offset (skip for optimized path - already applied)
+        let result = if uses_optimized_limit {
+            result
+        } else {
+            self.apply_limit_offset(result, query.limit, query.offset)
+        };
 
         // Set execution time
         let mut result = result;
@@ -229,6 +391,29 @@ impl QueryExecutor {
         Ok(result)
     }
 
+    /// Check if the query can use the optimized LIMIT path
+    fn can_use_optimized_limit(&self, query: &Query) -> bool {
+        // Must have a LIMIT
+        if query.limit.is_none() {
+            return false;
+        }
+
+        // Must be a SELECT (not aggregate)
+        if !matches!(
+            query.field_selection,
+            FieldSelection::All | FieldSelection::Fields(_)
+        ) {
+            return false;
+        }
+
+        // Must be default order (time ASC) or explicit time ASC/DESC
+        match &query.order_by {
+            None => true,                                        // Default: time ASC
+            Some((field, _)) if field == "time" => true,         // Explicit time order
+            Some(_) => false,                                    // Custom field order - can't optimize
+        }
+    }
+
     /// Execute a SELECT query (raw data) with parallel series processing
     fn execute_select(
         &self,
@@ -236,6 +421,12 @@ impl QueryExecutor {
         series_ids: &[SeriesId],
         cancel: Option<&CancellationToken>,
     ) -> Result<QueryResult> {
+        // Use optimized path for LIMIT queries with timestamp ordering
+        if self.can_use_optimized_limit(query) {
+            return self.execute_select_with_limit(query, series_ids, cancel);
+        }
+
+        // Full scan path for queries without LIMIT or with custom ordering
         // Use parallel processing for multiple series (threshold: 4+ series)
         let rows = if series_ids.len() >= 4 && cancel.is_none() {
             // Parallel path using rayon (only when not cancellable for simplicity)
@@ -309,6 +500,125 @@ impl QueryExecutor {
             total_rows,
             execution_time_ns: 0,
         })
+    }
+
+    /// Optimized SELECT with LIMIT using bounded collection.
+    /// Uses a heap to maintain only the top K rows during collection,
+    /// avoiding the O(n log n) sort of the full dataset.
+    fn execute_select_with_limit(
+        &self,
+        query: &Query,
+        series_ids: &[SeriesId],
+        cancel: Option<&CancellationToken>,
+    ) -> Result<QueryResult> {
+        let limit = query.limit.unwrap();
+        let offset = query.offset.unwrap_or(0);
+        let need = limit.saturating_add(offset); // Collect enough for offset + limit
+
+        // Determine sort order (default is ascending)
+        let descending = query
+            .order_by
+            .as_ref()
+            .map(|(_, asc)| !*asc)
+            .unwrap_or(false);
+
+        let (rows, total_seen) = if descending {
+            self.collect_top_k_desc(query, series_ids, need, cancel)?
+        } else {
+            self.collect_top_k_asc(query, series_ids, need, cancel)?
+        };
+
+        // Apply offset
+        let mut rows = rows;
+        if offset > 0 && offset < rows.len() {
+            rows = rows.split_off(offset);
+        } else if offset >= rows.len() {
+            rows = Vec::new();
+        }
+
+        // Truncate to limit (should already be at most `need`)
+        rows.truncate(limit);
+
+        Ok(QueryResult {
+            measurement: query.measurement.clone(),
+            rows,
+            total_rows: total_seen, // Report total rows scanned
+            execution_time_ns: 0,
+        })
+    }
+
+    /// Collect top K rows by ascending timestamp using a max-heap
+    fn collect_top_k_asc(
+        &self,
+        query: &Query,
+        series_ids: &[SeriesId],
+        k: usize,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<(Vec<ResultRow>, usize)> {
+        let mut collector = TopKCollector::new(k);
+
+        for &series_id in series_ids {
+            if let Some(cancel) = cancel {
+                if cancel.is_cancelled() {
+                    return Err(QueryError::Cancelled);
+                }
+            }
+
+            let points = self.storage.query(series_id, &query.time_range)?;
+            let series_meta = self.series_index.get(series_id);
+            let tags = series_meta.map(|m| m.tags).unwrap_or_default();
+
+            for point in points {
+                let fields = self.filter_fields(&point.fields, &query.field_selection);
+                collector.push(ResultRow {
+                    timestamp: Some(point.timestamp),
+                    series_id,
+                    tags: tags.clone(),
+                    fields,
+                });
+            }
+        }
+
+        let total_seen = collector.total_seen();
+        let rows = collector.into_sorted_vec();
+        Ok((rows, total_seen))
+    }
+
+    /// Collect top K rows by descending timestamp using a min-heap
+    fn collect_top_k_desc(
+        &self,
+        query: &Query,
+        series_ids: &[SeriesId],
+        k: usize,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<(Vec<ResultRow>, usize)> {
+        let mut collector = TopKCollectorDesc::new(k);
+
+        for &series_id in series_ids {
+            if let Some(cancel) = cancel {
+                if cancel.is_cancelled() {
+                    return Err(QueryError::Cancelled);
+                }
+            }
+
+            let points = self.storage.query(series_id, &query.time_range)?;
+            let series_meta = self.series_index.get(series_id);
+            let tags = series_meta.map(|m| m.tags).unwrap_or_default();
+
+            for point in points {
+                let fields = self.filter_fields(&point.fields, &query.field_selection);
+                collector.push(ResultRow {
+                    timestamp: Some(point.timestamp),
+                    series_id,
+                    tags: tags.clone(),
+                    fields,
+                });
+            }
+        }
+
+        let total_seen = collector.total_seen();
+        let rows = collector.into_sorted_vec();
+        Ok((rows, total_seen))
     }
 
     /// Execute an aggregate query with parallel series processing
@@ -1017,6 +1327,148 @@ mod tests {
         // This should NOT panic (was previously causing "attempt to subtract with overflow")
         let result = executor.execute(query).unwrap();
         assert_eq!(result.rows.len(), 10, "Should return all 10 rows");
+
+        storage.shutdown().unwrap();
+    }
+
+    // =========================================================================
+    // TopKCollector tests
+    // =========================================================================
+
+    fn make_row_with_ts(ts: i64) -> ResultRow {
+        ResultRow {
+            timestamp: Some(ts),
+            series_id: 0,
+            tags: Vec::new(),
+            fields: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn test_top_k_collector_basic() {
+        let mut collector = TopKCollector::new(3);
+        collector.push(make_row_with_ts(100));
+        collector.push(make_row_with_ts(50));
+        collector.push(make_row_with_ts(200));
+        collector.push(make_row_with_ts(25)); // Should evict 200
+
+        assert_eq!(collector.total_seen(), 4);
+
+        let rows = collector.into_sorted_vec();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].timestamp, Some(25));
+        assert_eq!(rows[1].timestamp, Some(50));
+        assert_eq!(rows[2].timestamp, Some(100));
+    }
+
+    #[test]
+    fn test_top_k_collector_fewer_than_k() {
+        let mut collector = TopKCollector::new(10);
+        collector.push(make_row_with_ts(300));
+        collector.push(make_row_with_ts(100));
+
+        assert_eq!(collector.total_seen(), 2);
+
+        let rows = collector.into_sorted_vec();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].timestamp, Some(100));
+        assert_eq!(rows[1].timestamp, Some(300));
+    }
+
+    #[test]
+    fn test_top_k_collector_desc_basic() {
+        let mut collector = TopKCollectorDesc::new(3);
+        collector.push(make_row_with_ts(100));
+        collector.push(make_row_with_ts(50));
+        collector.push(make_row_with_ts(200));
+        collector.push(make_row_with_ts(25)); // Should NOT evict anything (25 < 50)
+        collector.push(make_row_with_ts(300)); // Should evict 50
+
+        assert_eq!(collector.total_seen(), 5);
+
+        let rows = collector.into_sorted_vec();
+        assert_eq!(rows.len(), 3);
+        // Descending order: 300, 200, 100
+        assert_eq!(rows[0].timestamp, Some(300));
+        assert_eq!(rows[1].timestamp, Some(200));
+        assert_eq!(rows[2].timestamp, Some(100));
+    }
+
+    #[test]
+    fn test_top_k_collector_empty() {
+        let collector = TopKCollector::new(5);
+        assert_eq!(collector.total_seen(), 0);
+        let rows = collector.into_sorted_vec();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn test_limit_with_offset_optimized() {
+        let (storage, series_index, tag_index, _dir) = setup_test_env();
+
+        // Write 100 points
+        for i in 0..100 {
+            let point = create_test_point("server01", i * 1000, i as f64);
+            storage.write(&point).unwrap();
+
+            let series_id = point.series_id();
+            series_index.upsert(series_id, "cpu", &point.tags, point.timestamp);
+        }
+
+        let executor = QueryExecutor::new(
+            Arc::clone(&storage),
+            Arc::clone(&series_index),
+            Arc::clone(&tag_index),
+        );
+
+        // Query with limit and offset
+        let query = Query::builder("cpu")
+            .time_range(0, 1000000)
+            .limit(10)
+            .offset(5)
+            .build()
+            .unwrap();
+
+        let result = executor.execute(query).unwrap();
+        assert_eq!(result.rows.len(), 10);
+        assert_eq!(result.total_rows, 100);
+
+        // First row should be at timestamp 5000 (offset 5)
+        assert_eq!(result.rows[0].timestamp, Some(5000));
+        // Last row should be at timestamp 14000
+        assert_eq!(result.rows[9].timestamp, Some(14000));
+
+        storage.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_limit_preserves_total_rows_semantic() {
+        // Verify that total_rows reports pre-limit count (for pagination UIs)
+        let (storage, series_index, tag_index, _dir) = setup_test_env();
+
+        for i in 0..50 {
+            let point = create_test_point("server01", i * 1000, i as f64);
+            storage.write(&point).unwrap();
+
+            let series_id = point.series_id();
+            series_index.upsert(series_id, "cpu", &point.tags, point.timestamp);
+        }
+
+        let executor = QueryExecutor::new(
+            Arc::clone(&storage),
+            Arc::clone(&series_index),
+            Arc::clone(&tag_index),
+        );
+
+        let query = Query::builder("cpu")
+            .time_range(0, 1000000)
+            .limit(5)
+            .build()
+            .unwrap();
+
+        let result = executor.execute(query).unwrap();
+        assert_eq!(result.rows.len(), 5);
+        assert_eq!(result.total_rows, 50); // Pre-limit count
 
         storage.shutdown().unwrap();
     }
