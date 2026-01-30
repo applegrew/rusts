@@ -308,6 +308,37 @@ impl StorageEngine {
             .collect()
     }
 
+    /// Get all series from partitions (flushed data)
+    /// Used for rebuilding indexes on server startup
+    pub fn get_partition_series(&self) -> Vec<(SeriesId, String, Vec<rusts_core::Tag>)> {
+        self.partitions.get_all_series()
+    }
+
+    /// Get all series from both memtable and partitions
+    /// Used for complete index rebuilding on server startup
+    pub fn get_all_series(&self) -> Vec<(SeriesId, String, Vec<rusts_core::Tag>)> {
+        use std::collections::HashSet;
+
+        let mut seen = HashSet::new();
+        let mut result = Vec::new();
+
+        // Add series from memtable (recovered from WAL)
+        for (series_id, measurement, tags) in self.get_memtable_series() {
+            if seen.insert(series_id) {
+                result.push((series_id, measurement, tags));
+            }
+        }
+
+        // Add series from partitions (flushed to disk)
+        for (series_id, measurement, tags) in self.get_partition_series() {
+            if seen.insert(series_id) {
+                result.push((series_id, measurement, tags));
+            }
+        }
+
+        result
+    }
+
     /// Get partition stats
     pub fn partition_stats(&self) -> PartitionStats {
         let partitions = self.partitions.partitions();

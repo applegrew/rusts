@@ -216,6 +216,22 @@ impl Partition {
         self.segments.read().keys().copied().collect()
     }
 
+    /// Get all segment metadata for index rebuilding
+    /// Returns (series_id, measurement, tags) for each unique series
+    pub fn get_series_metadata(&self) -> Vec<(SeriesId, String, Vec<Tag>)> {
+        let metas = self.segment_metas.read();
+        let mut seen = std::collections::HashSet::new();
+        let mut result = Vec::new();
+
+        for meta in metas.iter() {
+            if seen.insert(meta.series_id) {
+                result.push((meta.series_id, meta.measurement.clone(), meta.tags.clone()));
+            }
+        }
+
+        result
+    }
+
     /// Get metadata
     pub fn meta(&self) -> PartitionMeta {
         PartitionMeta {
@@ -389,6 +405,24 @@ impl PartitionManager {
     /// Get partition count
     pub fn partition_count(&self) -> usize {
         self.partitions.read().len()
+    }
+
+    /// Get all unique series from all partitions for index rebuilding
+    /// Returns (series_id, measurement, tags) for each unique series
+    pub fn get_all_series(&self) -> Vec<(SeriesId, String, Vec<Tag>)> {
+        let partitions = self.partitions.read();
+        let mut seen = std::collections::HashSet::new();
+        let mut result = Vec::new();
+
+        for partition in partitions.iter() {
+            for (series_id, measurement, tags) in partition.get_series_metadata() {
+                if seen.insert(series_id) {
+                    result.push((series_id, measurement, tags));
+                }
+            }
+        }
+
+        result
     }
 }
 
