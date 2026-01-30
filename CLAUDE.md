@@ -170,3 +170,34 @@ Dedup limitations: Direct mode can only dedup by fields (not tags)
 - Tests use small timestamps (0, 1000, 2000...) which can trigger age-based flush
 - Some tests configure high flush thresholds to prevent auto-flush
 - Bloom filter FPR tests have tolerance due to hash function variation
+
+## Sample Test Data
+
+For performance testing with real-world data, use NYC TLC trip data (Parquet format):
+
+```bash
+# Download sample data (~200MB, ~1.25M rows)
+curl -O https://d37ci6vzurychx.cloudfront.net/trip-data/fhvhv_tripdata_2025-11.parquet
+
+# Import into RusTs (direct mode for speed)
+./target/release/rusts-import parquet fhvhv_tripdata_2025-11.parquet \
+  -m trips \
+  --tags hvfhs_license_num,dispatching_base_num \
+  --timestamp-column pickup_datetime \
+  --direct
+
+# Example queries after import:
+# SELECT * FROM trips LIMIT 10
+# SELECT * FROM trips ORDER BY time DESC LIMIT 10
+# SELECT COUNT(*) FROM trips
+# SELECT COUNT(*) FROM trips GROUP BY hvfhs_license_num
+```
+
+Data characteristics:
+- **Measurement**: `trips`
+- **Tags**: `hvfhs_license_num`, `dispatching_base_num`
+- **Fields**: `trip_miles`, `trip_time`, `base_passenger_fare`, `driver_pay`, `tips`, `tolls`, etc.
+- **Row count**: ~1.25 million
+- **Time range**: November 2025
+
+More trip data (different months/years) available at: https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page
