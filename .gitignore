@@ -17,3 +17,6 @@ Thumbs.db
 /data/
 /sample/
 
+# Benchmark results (generated)
+benchmarks/benchmark_results.csv
+
