@@ -304,8 +304,9 @@ async fn import_direct_streaming(
         wal_retention_secs: None,            // No retention needed for import
         flush_trigger: FlushTrigger {
             max_size: 256 * 1024 * 1024, // 256MB memtable
-            max_points: 10_000_000,       // 10M points
-            max_age_nanos: i64::MAX,      // Don't flush on age during import
+            max_points: 10_000_000,      // 10M points
+            max_age_nanos: i64::MAX,     // Don't flush on age during import
+            out_of_order_lag_ms: 0,      // No lag needed for bulk import
         },
         partition_duration: 24 * 60 * 60 * 1_000_000_000, // 1 day
         compression: rusts_compression::CompressionLevel::Default,

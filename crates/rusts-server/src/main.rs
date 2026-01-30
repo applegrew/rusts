@@ -116,6 +116,12 @@ pub struct MemTableSettings {
     pub max_points: usize,
     /// Maximum age in seconds
     pub max_age_secs: u64,
+    /// Out-of-order commit lag in milliseconds.
+    /// When set, the memtable waits this long after the last write before flushing,
+    /// allowing late-arriving out-of-order data to be sorted correctly within segments.
+    /// This is similar to QuestDB's cairo.o3.lag.millis setting.
+    /// Default: 1000ms (1 second)
+    pub out_of_order_lag_ms: u64,
 }
 
 impl Default for MemTableSettings {
@@ -124,6 +130,7 @@ impl Default for MemTableSettings {
             max_size_mb: 64,
             max_points: 1_000_000,
             max_age_secs: 60,
+            out_of_order_lag_ms: 1000, // 1 second default
         }
     }
 }
@@ -237,6 +244,7 @@ impl ServerConfig {
                 max_size: self.storage.memtable.max_size_mb * 1024 * 1024,
                 max_points: self.storage.memtable.max_points,
                 max_age_nanos: self.storage.memtable.max_age_secs as i64 * 1_000_000_000,
+                out_of_order_lag_ms: self.storage.memtable.out_of_order_lag_ms,
             },
             partition_duration: self.storage.partition_duration_hours as i64 * 60 * 60 * 1_000_000_000,
             compression,
@@ -376,6 +384,7 @@ EXAMPLE CONFIG (rusts.yml):
       memtable:
         max_size_mb: 64
         max_points: 1000000
+        out_of_order_lag_ms: 1000  # Wait 1s for late data
 
     auth:
       enabled: false

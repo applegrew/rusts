@@ -49,6 +49,17 @@ pub struct FlushTrigger {
     pub max_points: usize,
     /// Maximum age of oldest point (nanoseconds)
     pub max_age_nanos: i64,
+    /// Out-of-order commit lag in milliseconds.
+    /// When set, the memtable waits this long after the last write before flushing,
+    /// allowing late-arriving out-of-order data to be sorted correctly within segments.
+    /// This is similar to QuestDB's cairo.o3.lag.millis setting.
+    /// Default: 1000ms (1 second)
+    #[serde(default = "default_o3_lag")]
+    pub out_of_order_lag_ms: u64,
+}
+
+fn default_o3_lag() -> u64 {
+    1000 // 1 second default
 }
 
 impl Default for FlushTrigger {
@@ -57,6 +68,7 @@ impl Default for FlushTrigger {
             max_size: 64 * 1024 * 1024,          // 64MB
             max_points: 1_000_000,               // 1M points
             max_age_nanos: 60 * 1_000_000_000,   // 60 seconds
+            out_of_order_lag_ms: default_o3_lag(),
         }
     }
 }
@@ -75,6 +87,9 @@ pub struct MemTable {
     oldest_timestamp: RwLock<Option<Timestamp>>,
     /// Is the MemTable sealed (no more writes allowed)
     sealed: RwLock<bool>,
+    /// Last write time (wall clock, milliseconds since epoch)
+    /// Used for out-of-order lag calculation
+    last_write_time_ms: std::sync::atomic::AtomicU64,
 }
 
 impl MemTable {
@@ -92,6 +107,7 @@ impl MemTable {
             flush_trigger,
             oldest_timestamp: RwLock::new(None),
             sealed: RwLock::new(false),
+            last_write_time_ms: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -145,6 +161,14 @@ impl MemTable {
                 _ => {}
             }
         }
+
+        // Update last write time for O3 lag calculation
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        self.last_write_time_ms
+            .store(now_ms, std::sync::atomic::Ordering::Relaxed);
 
         Ok(())
     }
@@ -254,6 +278,14 @@ impl MemTable {
             }
         }
 
+        // Update last write time for O3 lag calculation
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        self.last_write_time_ms
+            .store(now_ms, std::sync::atomic::Ordering::Relaxed);
+
         Ok(())
     }
 
@@ -303,7 +335,42 @@ impl MemTable {
     }
 
     /// Check if flush should be triggered
+    ///
+    /// Flush is triggered when any threshold is exceeded (size, points, or age)
+    /// AND the out-of-order lag period has passed since the last write.
+    /// This gives late-arriving data time to be sorted correctly within segments.
     pub fn should_flush(&self) -> bool {
+        // First check if any threshold is exceeded
+        let threshold_exceeded = self.is_threshold_exceeded();
+
+        if !threshold_exceeded {
+            return false;
+        }
+
+        // Check if enough time has passed since the last write (O3 lag)
+        // This ensures we wait for late-arriving data before committing
+        let last_write = self
+            .last_write_time_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        // If no writes yet, don't flush
+        if last_write == 0 {
+            return false;
+        }
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        let elapsed_since_write = now_ms.saturating_sub(last_write);
+
+        // Only flush if O3 lag period has passed since last write
+        elapsed_since_write >= self.flush_trigger.out_of_order_lag_ms
+    }
+
+    /// Check if any flush threshold is exceeded (without considering O3 lag)
+    pub fn is_threshold_exceeded(&self) -> bool {
         if self.size.load(Ordering::Relaxed) >= self.flush_trigger.max_size {
             return true;
         }
@@ -323,6 +390,11 @@ impl MemTable {
         }
 
         false
+    }
+
+    /// Get the out-of-order lag configuration in milliseconds
+    pub fn out_of_order_lag_ms(&self) -> u64 {
+        self.flush_trigger.out_of_order_lag_ms
     }
 
     /// Seal the MemTable (no more writes allowed)
@@ -478,6 +550,7 @@ mod tests {
             max_size: 1000,
             max_points: 1_000_000,
             max_age_nanos: i64::MAX,
+            out_of_order_lag_ms: 0, // No lag for test
         };
         let memtable = MemTable::with_flush_trigger(trigger);
 
@@ -496,6 +569,7 @@ mod tests {
             max_size: usize::MAX,
             max_points: 50,
             max_age_nanos: i64::MAX,
+            out_of_order_lag_ms: 0, // No lag for test
         };
         let memtable = MemTable::with_flush_trigger(trigger);
 
@@ -504,6 +578,51 @@ mod tests {
             memtable.insert(&p).unwrap();
         }
 
+        assert!(memtable.should_flush());
+    }
+
+    #[test]
+    fn test_memtable_out_of_order_lag() {
+        // Test that O3 lag delays flushing to allow late data to arrive
+        let trigger = FlushTrigger {
+            max_size: 100,          // Very small - will exceed immediately
+            max_points: 1,          // Very small - will exceed immediately
+            max_age_nanos: i64::MAX,
+            out_of_order_lag_ms: 100, // 100ms lag
+        };
+        let memtable = MemTable::with_flush_trigger(trigger);
+
+        // Insert a point
+        let p = create_test_point("cpu", "server01", 1000, 64.5);
+        memtable.insert(&p).unwrap();
+
+        // Threshold is exceeded but O3 lag hasn't passed yet
+        assert!(memtable.is_threshold_exceeded());
+        // should_flush should return false because we're within the lag window
+        assert!(!memtable.should_flush());
+
+        // Wait for O3 lag to pass
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        // Now should_flush should return true
+        assert!(memtable.should_flush());
+    }
+
+    #[test]
+    fn test_memtable_out_of_order_lag_zero() {
+        // Test that O3 lag of 0 allows immediate flushing
+        let trigger = FlushTrigger {
+            max_size: 100,
+            max_points: 1,
+            max_age_nanos: i64::MAX,
+            out_of_order_lag_ms: 0, // No lag
+        };
+        let memtable = MemTable::with_flush_trigger(trigger);
+
+        let p = create_test_point("cpu", "server01", 1000, 64.5);
+        memtable.insert(&p).unwrap();
+
+        // With O3 lag of 0, should_flush should return true immediately
         assert!(memtable.should_flush());
     }
 

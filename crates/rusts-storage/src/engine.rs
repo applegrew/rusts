@@ -1231,9 +1231,10 @@ mod tests {
             data_dir: dir.path().to_path_buf(),
             wal_durability: WalDurability::None,
             flush_trigger: FlushTrigger {
-                max_size: 1024 * 1024 * 1024,  // 1GB
+                max_size: 1024 * 1024 * 1024,   // 1GB
                 max_points: 1_000_000_000,      // 1B points
                 max_age_nanos: i64::MAX,        // Never trigger on age
+                out_of_order_lag_ms: 0,         // No lag for tests
             },
             ..Default::default()
         };
@@ -1269,9 +1270,10 @@ mod tests {
             data_dir: data_dir.clone(),
             wal_durability: WalDurability::EveryWrite,
             flush_trigger: FlushTrigger {
-                max_size: 1024 * 1024 * 1024,  // Very high to prevent auto-flush
+                max_size: 1024 * 1024 * 1024,   // Very high to prevent auto-flush
                 max_points: 1_000_000_000,
                 max_age_nanos: i64::MAX,
+                out_of_order_lag_ms: 0,         // No lag for tests
             },
             ..Default::default()
         };
@@ -1327,6 +1329,7 @@ mod tests {
                 max_size: 1024 * 1024 * 1024,
                 max_points: 1_000_000_000,
                 max_age_nanos: i64::MAX,
+                out_of_order_lag_ms: 0,         // No lag for tests
             },
             ..Default::default()
         };
@@ -1382,6 +1385,7 @@ mod tests {
                 max_size: 1024 * 1024 * 1024,
                 max_points: 1_000_000_000,
                 max_age_nanos: i64::MAX,
+                out_of_order_lag_ms: 0,         // No lag for tests
             },
             ..Default::default()
         };
@@ -1459,6 +1463,7 @@ mod tests {
                 max_size: 1024 * 1024 * 1024,
                 max_points: 1_000_000_000,
                 max_age_nanos: i64::MAX,
+                out_of_order_lag_ms: 0,         // No lag for tests
             },
             ..Default::default()
         };
@@ -1532,6 +1537,7 @@ mod tests {
                 max_size: 1024 * 1024 * 1024,
                 max_points: 1_000_000_000,
                 max_age_nanos: i64::MAX,
+                out_of_order_lag_ms: 0,         // No lag for tests
             },
             ..Default::default()
         };
@@ -1726,6 +1732,7 @@ mod tests {
                 max_size: 1024, // Very small to trigger flush
                 max_points: 10,
                 max_age_nanos: i64::MAX,
+                out_of_order_lag_ms: 0, // No lag for tests
             },
             ..Default::default()
         };

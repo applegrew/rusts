@@ -1218,6 +1218,7 @@ mod tests {
                     max_size: 1024 * 1024 * 1024,
                     max_points: 1_000_000_000,
                     max_age_nanos: i64::MAX,
+                    out_of_order_lag_ms: 0, // No lag for tests
                 },
                 ..Default::default()
             };
@@ -1271,6 +1272,7 @@ mod tests {
                     max_size: 1024 * 1024 * 1024,
                     max_points: 1_000_000_000,
                     max_age_nanos: i64::MAX,
+                    out_of_order_lag_ms: 0, // No lag for tests
                 },
                 ..Default::default()
             };

@@ -15,6 +15,9 @@ storage:
     max_size_mb: 64
     max_points: 1000000
     max_age_secs: 60
+    # Out-of-order commit lag in milliseconds. Waits this long after the last
+    # write before flushing, allowing late-arriving data to be sorted correctly.
+    out_of_order_lag_ms: 1000
   partition_duration_hours: 24
   compression: default
 auth:
