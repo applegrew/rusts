@@ -176,6 +176,88 @@ impl Partition {
         Ok(all_points)
     }
 
+    /// Query with limit, leveraging sorted segment data.
+    /// For ascending order, reads segments oldest-first and stops early when possible.
+    /// For descending order, reads segments newest-first.
+    ///
+    /// Returns (points, total_in_partition) where total_in_partition is an estimate
+    /// of total points for this series in overlapping segments.
+    pub fn query_limit(
+        &self,
+        series_id: SeriesId,
+        time_range: &TimeRange,
+        limit: usize,
+        ascending: bool,
+    ) -> Result<(Vec<MemTablePoint>, usize)> {
+        let segments = self.segments.read();
+        let series_segments = match segments.get(&series_id) {
+            Some(segs) => segs,
+            None => return Ok((Vec::new(), 0)),
+        };
+
+        // Filter and sort segments by time range
+        let mut sorted_segments: Vec<_> = series_segments
+            .iter()
+            .filter(|s| s.overlaps(time_range))
+            .collect();
+
+        if sorted_segments.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+
+        // Sort segments by their start time
+        sorted_segments.sort_by_key(|s| s.meta().time_range.start);
+
+        // Reverse for descending order (newest first)
+        if !ascending {
+            sorted_segments.reverse();
+        }
+
+        // Estimate total points in overlapping segments
+        let total_estimate: usize = sorted_segments.iter().map(|s| s.meta().point_count).sum();
+
+        let mut collected_points: Vec<MemTablePoint> = Vec::new();
+
+        for segment in sorted_segments {
+            // Early termination check
+            if collected_points.len() >= limit {
+                if ascending {
+                    // For ASC: if we have K points and next segment starts after our max,
+                    // we can stop (since segments are time-ordered)
+                    if let Some(last) = collected_points.last() {
+                        if segment.meta().time_range.start > last.timestamp {
+                            break;
+                        }
+                    }
+                } else {
+                    // For DESC: if we have K points and next segment ends before our min,
+                    // we can stop
+                    if let Some(last) = collected_points.last() {
+                        if segment.meta().time_range.end <= last.timestamp {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Read segment data (already sorted internally)
+            let points = segment.read_range(time_range)?;
+            collected_points.extend(points);
+        }
+
+        // Sort collected points
+        if ascending {
+            collected_points.sort_by_key(|p| p.timestamp);
+        } else {
+            collected_points.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        }
+
+        // Truncate to limit
+        collected_points.truncate(limit);
+
+        Ok((collected_points, total_estimate))
+    }
+
     /// Get partition ID
     pub fn id(&self) -> u64 {
         self.id

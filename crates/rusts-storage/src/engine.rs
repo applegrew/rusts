@@ -13,6 +13,7 @@ use parking_lot::RwLock;
 use rusts_compression::CompressionLevel;
 use rusts_core::{Point, SeriesId, TimeRange};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -274,7 +275,9 @@ impl StorageEngine {
         }
     }
 
-    /// Query with limit, ascending order (smallest timestamps first)
+    /// Query with limit, ascending order (smallest timestamps first).
+    /// Leverages the fact that time series data is mostly sorted - segments within
+    /// partitions are sorted and can be queried in time order for early termination.
     fn query_with_limit_asc(
         &self,
         series_id: SeriesId,
@@ -323,6 +326,7 @@ impl StorageEngine {
         }
 
         // Query partitions (oldest first for ascending)
+        // Use partition's optimized query that reads segments in time order
         for partition in partitions {
             // Early termination: if heap is full and partition starts after our max timestamp,
             // no points from this or later partitions can improve our result
@@ -334,8 +338,10 @@ impl StorageEngine {
                 }
             }
 
-            let points = partition.query(series_id, time_range)?;
-            total_scanned += points.len();
+            // Use optimized partition query that leverages sorted segments
+            let (points, partition_total) =
+                partition.query_limit(series_id, time_range, limit, true)?;
+            total_scanned += partition_total;
 
             for point in points {
                 let ts = point.timestamp;
@@ -351,14 +357,14 @@ impl StorageEngine {
         }
 
         // Extract results in ascending order
-        // Note: Don't dedup here - multiple points can have the same timestamp
         let mut results: Vec<_> = heap.into_iter().map(|tp| tp.1).collect();
         results.sort_by_key(|p| p.timestamp);
 
         Ok((results, total_scanned))
     }
 
-    /// Query with limit, descending order (largest timestamps first)
+    /// Query with limit, descending order (largest timestamps first).
+    /// Leverages the fact that time series data is mostly sorted.
     fn query_with_limit_desc(
         &self,
         series_id: SeriesId,
@@ -407,6 +413,7 @@ impl StorageEngine {
         }
 
         // Query partitions (newest first for descending)
+        // Use partition's optimized query that reads segments in time order
         for partition in partitions {
             // Early termination: if heap is full and partition ends before our min timestamp,
             // no points from this or earlier partitions can improve our result
@@ -418,8 +425,10 @@ impl StorageEngine {
                 }
             }
 
-            let points = partition.query(series_id, time_range)?;
-            total_scanned += points.len();
+            // Use optimized partition query that leverages sorted segments
+            let (points, partition_total) =
+                partition.query_limit(series_id, time_range, limit, false)?;
+            total_scanned += partition_total;
 
             for point in points {
                 let ts = point.timestamp;
@@ -435,11 +444,226 @@ impl StorageEngine {
         }
 
         // Extract results in descending order
-        // Note: Don't dedup here - multiple points can have the same timestamp
         let mut results: Vec<_> = heap.into_iter().map(|tp| tp.1).collect();
         results.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
 
         Ok((results, total_scanned))
+    }
+
+    /// Query points for multiple series with early termination for LIMIT queries.
+    ///
+    /// This method optimizes multi-series queries by:
+    /// 1. Querying partitions in time order (oldest-first for ASC, newest-first for DESC)
+    /// 2. Querying all requested series from each partition
+    /// 3. Using a bounded heap to track top K results
+    /// 4. Early terminating when remaining partitions can't improve the result
+    ///
+    /// Returns (points_per_series, total_scanned)
+    pub fn query_multi_series_with_limit(
+        &self,
+        series_ids: &[SeriesId],
+        time_range: &TimeRange,
+        limit: usize,
+        ascending: bool,
+    ) -> Result<(Vec<(SeriesId, Vec<MemTablePoint>)>, usize)> {
+        use std::cmp::Ordering;
+        use std::collections::BinaryHeap;
+
+        // Collect memtable points for all series first
+        let mut memtable_points: HashMap<SeriesId, Vec<MemTablePoint>> = HashMap::new();
+        {
+            let memtable = self.active_memtable.read();
+            for &series_id in series_ids {
+                let points = memtable.query(series_id, time_range);
+                if !points.is_empty() {
+                    memtable_points.entry(series_id).or_default().extend(points);
+                }
+            }
+        }
+        {
+            let immutables = self.immutable_memtables.read();
+            for memtable in immutables.iter() {
+                for &series_id in series_ids {
+                    let points = memtable.query(series_id, time_range);
+                    if !points.is_empty() {
+                        memtable_points.entry(series_id).or_default().extend(points);
+                    }
+                }
+            }
+        }
+
+        let mut total_scanned: usize = memtable_points.values().map(|v| v.len()).sum();
+
+        // Get partitions in time order
+        let mut partitions = self.partitions.get_partitions_for_range(time_range);
+        if !ascending {
+            partitions.reverse();
+        }
+
+        if ascending {
+            // Max-heap for ascending (keeps K smallest)
+            struct TsPoint(i64, SeriesId, MemTablePoint);
+            impl PartialEq for TsPoint {
+                fn eq(&self, other: &Self) -> bool {
+                    self.0 == other.0
+                }
+            }
+            impl Eq for TsPoint {}
+            impl PartialOrd for TsPoint {
+                fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                    Some(self.cmp(other))
+                }
+            }
+            impl Ord for TsPoint {
+                fn cmp(&self, other: &Self) -> Ordering {
+                    self.0.cmp(&other.0) // Max-heap
+                }
+            }
+
+            let mut heap: BinaryHeap<TsPoint> = BinaryHeap::with_capacity(limit + 1);
+
+            // Add memtable points
+            for (&series_id, points) in &memtable_points {
+                for point in points {
+                    let ts = point.timestamp;
+                    if heap.len() < limit {
+                        heap.push(TsPoint(ts, series_id, point.clone()));
+                    } else if let Some(max) = heap.peek() {
+                        if ts < max.0 {
+                            heap.pop();
+                            heap.push(TsPoint(ts, series_id, point.clone()));
+                        }
+                    }
+                }
+            }
+
+            // Query partitions
+            for partition in partitions {
+                // Early termination check: if heap is full and this partition starts after
+                // our max timestamp, remaining partitions can't improve our result
+                if heap.len() >= limit {
+                    if let Some(max) = heap.peek() {
+                        if partition.time_range().start > max.0 {
+                            break;
+                        }
+                    }
+                }
+
+                // Query all series from this partition
+                for &series_id in series_ids {
+                    let (points, scanned) =
+                        partition.query_limit(series_id, time_range, limit, true)?;
+                    total_scanned += scanned;
+
+                    for point in points {
+                        let ts = point.timestamp;
+                        if heap.len() < limit {
+                            heap.push(TsPoint(ts, series_id, point));
+                        } else if let Some(max) = heap.peek() {
+                            if ts < max.0 {
+                                heap.pop();
+                                heap.push(TsPoint(ts, series_id, point));
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Group results by series
+            let mut results: HashMap<SeriesId, Vec<MemTablePoint>> = HashMap::new();
+            for TsPoint(_, series_id, point) in heap {
+                results.entry(series_id).or_default().push(point);
+            }
+
+            // Sort points within each series
+            for points in results.values_mut() {
+                points.sort_by_key(|p| p.timestamp);
+            }
+
+            let result_vec: Vec<_> = results.into_iter().collect();
+            Ok((result_vec, total_scanned))
+        } else {
+            // Min-heap for descending (keeps K largest)
+            struct TsPointDesc(i64, SeriesId, MemTablePoint);
+            impl PartialEq for TsPointDesc {
+                fn eq(&self, other: &Self) -> bool {
+                    self.0 == other.0
+                }
+            }
+            impl Eq for TsPointDesc {}
+            impl PartialOrd for TsPointDesc {
+                fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                    Some(self.cmp(other))
+                }
+            }
+            impl Ord for TsPointDesc {
+                fn cmp(&self, other: &Self) -> Ordering {
+                    other.0.cmp(&self.0) // Min-heap (reversed)
+                }
+            }
+
+            let mut heap: BinaryHeap<TsPointDesc> = BinaryHeap::with_capacity(limit + 1);
+
+            // Add memtable points
+            for (&series_id, points) in &memtable_points {
+                for point in points {
+                    let ts = point.timestamp;
+                    if heap.len() < limit {
+                        heap.push(TsPointDesc(ts, series_id, point.clone()));
+                    } else if let Some(min) = heap.peek() {
+                        if ts > min.0 {
+                            heap.pop();
+                            heap.push(TsPointDesc(ts, series_id, point.clone()));
+                        }
+                    }
+                }
+            }
+
+            // Query partitions (newest first)
+            for partition in partitions {
+                // Early termination check
+                if heap.len() >= limit {
+                    if let Some(min) = heap.peek() {
+                        if partition.time_range().end <= min.0 {
+                            break;
+                        }
+                    }
+                }
+
+                // Query all series from this partition
+                for &series_id in series_ids {
+                    let (points, scanned) =
+                        partition.query_limit(series_id, time_range, limit, false)?;
+                    total_scanned += scanned;
+
+                    for point in points {
+                        let ts = point.timestamp;
+                        if heap.len() < limit {
+                            heap.push(TsPointDesc(ts, series_id, point));
+                        } else if let Some(min) = heap.peek() {
+                            if ts > min.0 {
+                                heap.pop();
+                                heap.push(TsPointDesc(ts, series_id, point));
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Group results by series
+            let mut results: HashMap<SeriesId, Vec<MemTablePoint>> = HashMap::new();
+            for TsPointDesc(_, series_id, point) in heap {
+                results.entry(series_id).or_default().push(point);
+            }
+
+            // Sort points within each series (descending)
+            for points in results.values_mut() {
+                points.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+            }
+
+            let result_vec: Vec<_> = results.into_iter().collect();
+            Ok((result_vec, total_scanned))
+        }
     }
 
     /// Query points by measurement name
