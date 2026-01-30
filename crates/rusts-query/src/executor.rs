@@ -915,9 +915,10 @@ mod tests {
             let series_index = Arc::new(SeriesIndex::new());
             let tag_index = Arc::new(TagIndex::new());
 
-            // Rebuild indexes from recovered WAL data (same as main.rs does)
-            let recovered_series = storage.get_memtable_series();
-            assert_eq!(recovered_series.len(), 3, "Expected 3 series recovered from WAL");
+            // Rebuild indexes from storage (memtable + partitions)
+            // After clean shutdown, data is in partitions, so use get_all_series()
+            let recovered_series = storage.get_all_series();
+            assert_eq!(recovered_series.len(), 3, "Expected 3 series after restart");
 
             for (series_id, measurement, tags) in recovered_series {
                 series_index.upsert(series_id, &measurement, &tags, 0);

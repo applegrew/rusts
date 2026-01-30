@@ -542,16 +542,37 @@ async fn main() -> anyhow::Result<()> {
         info!("Server is ready to accept requests");
     });
 
-    // Handle shutdown gracefully
+    // Handle shutdown gracefully (SIGINT and SIGTERM)
     let app_state_for_shutdown = Arc::clone(&app_state);
     tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
-        info!("Shutdown signal received");
+        let ctrl_c = tokio::signal::ctrl_c();
+
+        #[cfg(unix)]
+        let terminate = async {
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("failed to install SIGTERM handler")
+                .recv()
+                .await;
+        };
+
+        #[cfg(not(unix))]
+        let terminate = std::future::pending::<()>();
+
+        tokio::select! {
+            _ = ctrl_c => {
+                info!("SIGINT received, shutting down gracefully...");
+            }
+            _ = terminate => {
+                info!("SIGTERM received, shutting down gracefully...");
+            }
+        }
+
         if let Some(storage) = app_state_for_shutdown.get_storage() {
             if let Err(e) = storage.shutdown() {
                 tracing::error!("Error during shutdown: {}", e);
             }
         }
+        info!("Shutdown complete");
         std::process::exit(0);
     });
 
