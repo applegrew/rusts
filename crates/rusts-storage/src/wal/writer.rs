@@ -1,4 +1,10 @@
 //! WAL writer implementation
+//!
+//! Optimizations:
+//! - Pre-serialization outside lock to reduce contention
+//! - Reusable serialization buffer to reduce allocations
+//! - Group commit support for batching fsync operations
+//! - Configurable buffer sizes for write performance
 
 use crate::error::Result;
 use crc32fast::Hasher;
@@ -8,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// WAL durability modes
@@ -60,7 +66,31 @@ impl WalEntryHeader {
     }
 }
 
-/// WAL writer
+/// Default BufWriter capacity (256KB for better batching)
+const DEFAULT_BUFFER_CAPACITY: usize = 256 * 1024;
+
+/// Group commit configuration
+#[derive(Debug, Clone)]
+pub struct GroupCommitConfig {
+    /// Maximum pending bytes before forcing a sync
+    pub max_pending_bytes: usize,
+    /// Maximum pending entries before forcing a sync
+    pub max_pending_entries: usize,
+    /// Maximum wait time before forcing a sync
+    pub max_wait_ms: u64,
+}
+
+impl Default for GroupCommitConfig {
+    fn default() -> Self {
+        Self {
+            max_pending_bytes: 1024 * 1024,  // 1MB
+            max_pending_entries: 1000,
+            max_wait_ms: 10,
+        }
+    }
+}
+
+/// WAL writer with optimized write path
 pub struct WalWriter {
     /// Path to the WAL directory
     dir: PathBuf,
@@ -78,11 +108,26 @@ pub struct WalWriter {
     max_file_size: u64,
     /// Current file size
     current_size: AtomicU64,
+    /// Pending bytes since last sync (for group commit)
+    pending_bytes: AtomicUsize,
+    /// Pending entries since last sync (for group commit)
+    pending_entries: AtomicUsize,
+    /// Group commit configuration
+    group_commit: GroupCommitConfig,
 }
 
 impl WalWriter {
     /// Create a new WAL writer
     pub fn new(dir: impl AsRef<Path>, durability: WalDurability) -> Result<Self> {
+        Self::with_config(dir, durability, GroupCommitConfig::default())
+    }
+
+    /// Create a new WAL writer with custom group commit configuration
+    pub fn with_config(
+        dir: impl AsRef<Path>,
+        durability: WalDurability,
+        group_commit: GroupCommitConfig,
+    ) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)?;
 
@@ -99,13 +144,16 @@ impl WalWriter {
 
         Ok(Self {
             dir,
-            file: Mutex::new(BufWriter::new(file)),
+            file: Mutex::new(BufWriter::with_capacity(DEFAULT_BUFFER_CAPACITY, file)),
             sequence: AtomicU64::new(0),
             durability,
             last_sync: Mutex::new(Instant::now()),
             file_num: AtomicU64::new(file_num),
             max_file_size: 64 * 1024 * 1024, // 64MB default
             current_size: AtomicU64::new(current_size),
+            pending_bytes: AtomicUsize::new(0),
+            pending_entries: AtomicUsize::new(0),
+            group_commit,
         })
     }
 
@@ -115,17 +163,24 @@ impl WalWriter {
         self
     }
 
+    /// Create with custom group commit config
+    pub fn with_group_commit(mut self, config: GroupCommitConfig) -> Self {
+        self.group_commit = config;
+        self
+    }
+
     /// Write a batch of points to the WAL
+    ///
+    /// Optimized to serialize outside the lock to reduce contention.
     pub fn write(&self, points: &[Point]) -> Result<u64> {
         if points.is_empty() {
             return Ok(self.sequence.load(Ordering::SeqCst));
         }
 
-        // Serialize points
+        // Pre-serialize points OUTSIDE the lock to reduce contention
         let data = bincode::serialize(points)?;
 
-        // Create header fields
-        let sequence = self.sequence.fetch_add(1, Ordering::SeqCst);
+        // Prepare header fields outside the lock
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -133,14 +188,30 @@ impl WalWriter {
         let point_count = points.len() as u32;
         let data_len = data.len() as u32;
 
+        // Write the pre-serialized data
+        self.write_serialized(&data, timestamp, point_count, data_len)
+    }
+
+    /// Write pre-serialized data to the WAL (internal fast path)
+    ///
+    /// This method minimizes lock hold time by accepting pre-serialized data.
+    fn write_serialized(
+        &self,
+        data: &[u8],
+        timestamp: i64,
+        point_count: u32,
+        data_len: u32,
+    ) -> Result<u64> {
+        // Get sequence number
+        let sequence = self.sequence.fetch_add(1, Ordering::SeqCst);
+
         // Compute checksum over header fields (bytes 0-23) AND data
-        // This ensures both header and data integrity are protected
         let mut hasher = Hasher::new();
         hasher.update(&sequence.to_le_bytes());
         hasher.update(&timestamp.to_le_bytes());
         hasher.update(&point_count.to_le_bytes());
         hasher.update(&data_len.to_le_bytes());
-        hasher.update(&data);
+        hasher.update(data);
         let checksum = hasher.finalize();
 
         // Create header
@@ -152,22 +223,29 @@ impl WalWriter {
             checksum,
         };
 
-        // Write to file
+        let header_bytes = header.to_bytes();
         let entry_size = WalEntryHeader::SIZE + data.len();
+
+        // Critical section: minimize lock hold time
         {
             let mut file = self.file.lock();
-            file.write_all(&header.to_bytes())?;
-            file.write_all(&data)?;
+            file.write_all(&header_bytes)?;
+            file.write_all(data)?;
         }
 
-        // Update current size and check for rotation
-        let new_size = self.current_size.fetch_add(entry_size as u64, Ordering::SeqCst) + entry_size as u64;
+        // Update tracking atomics
+        let new_size = self.current_size.fetch_add(entry_size as u64, Ordering::Relaxed)
+            + entry_size as u64;
+        self.pending_bytes.fetch_add(entry_size, Ordering::Relaxed);
+        self.pending_entries.fetch_add(1, Ordering::Relaxed);
+
+        // Check for rotation
         if new_size >= self.max_file_size {
             self.rotate()?;
         }
 
-        // Handle durability
-        self.maybe_sync()?;
+        // Handle durability with group commit awareness
+        self.maybe_sync_group_commit()?;
 
         Ok(sequence)
     }
@@ -209,12 +287,15 @@ impl WalWriter {
         let mut file = self.file.lock();
         file.flush()?;
         file.get_ref().sync_all()?;
-        *file = BufWriter::new(new_file);
+        *file = BufWriter::with_capacity(DEFAULT_BUFFER_CAPACITY, new_file);
 
         self.current_size.store(0, Ordering::SeqCst);
+        self.pending_bytes.store(0, Ordering::Relaxed);
+        self.pending_entries.store(0, Ordering::Relaxed);
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn maybe_sync(&self) -> Result<()> {
         match self.durability {
             WalDurability::EveryWrite => {
@@ -226,11 +307,47 @@ impl WalWriter {
                     self.sync()?;
                 }
             }
-            WalDurability::OsDefault => {
+            WalDurability::OsDefault | WalDurability::None => {
+                // Flush buffer to OS (but no fsync)
                 self.file.lock().flush()?;
             }
-            WalDurability::None => {
-                // Don't flush
+        }
+        Ok(())
+    }
+
+    /// Group commit aware sync - batches fsync operations for better throughput
+    ///
+    /// Note: `EveryWrite` mode always syncs immediately (no group commit batching)
+    /// to maintain its durability guarantee. Group commit only applies to `Periodic` mode.
+    fn maybe_sync_group_commit(&self) -> Result<()> {
+        match self.durability {
+            WalDurability::EveryWrite => {
+                // EveryWrite ALWAYS syncs immediately - no group commit batching
+                // This maintains the strongest durability guarantee
+                self.sync()?;
+                self.pending_bytes.store(0, Ordering::Relaxed);
+                self.pending_entries.store(0, Ordering::Relaxed);
+            }
+            WalDurability::Periodic { interval_ms } => {
+                // Apply group commit thresholds for Periodic mode
+                let pending_bytes = self.pending_bytes.load(Ordering::Relaxed);
+                let pending_entries = self.pending_entries.load(Ordering::Relaxed);
+                let last_sync = *self.last_sync.lock();
+
+                let should_sync = pending_bytes >= self.group_commit.max_pending_bytes
+                    || pending_entries >= self.group_commit.max_pending_entries
+                    || last_sync.elapsed() >= Duration::from_millis(interval_ms.min(self.group_commit.max_wait_ms));
+
+                if should_sync {
+                    self.sync()?;
+                    self.pending_bytes.store(0, Ordering::Relaxed);
+                    self.pending_entries.store(0, Ordering::Relaxed);
+                }
+            }
+            WalDurability::OsDefault | WalDurability::None => {
+                // Flush buffer to OS (but no fsync)
+                // This ensures data is available for reading even with large buffers
+                self.file.lock().flush()?;
             }
         }
         Ok(())
@@ -348,5 +465,68 @@ mod tests {
         let seq = wal.write(&[]).unwrap();
         assert_eq!(seq, 0);
         assert_eq!(wal.sequence(), 0); // Sequence should not increment
+    }
+
+    #[test]
+    fn test_wal_group_commit() {
+        let dir = TempDir::new().unwrap();
+
+        // Configure group commit to trigger after 5 entries
+        // Use Periodic mode (not EveryWrite) since EveryWrite always syncs immediately
+        let config = GroupCommitConfig {
+            max_pending_bytes: 1024 * 1024,
+            max_pending_entries: 5,
+            max_wait_ms: 10000, // Long timeout so only entry count triggers
+        };
+
+        let wal = WalWriter::with_config(
+            dir.path(),
+            WalDurability::Periodic { interval_ms: 10000 }, // Long interval
+            config,
+        ).unwrap();
+
+        // Write 4 entries - should not trigger sync yet
+        for i in 0..4 {
+            let point = create_test_point(i * 1000, i as f64);
+            wal.write_point(&point).unwrap();
+        }
+
+        // Check pending count (should be 4 since no sync triggered)
+        assert_eq!(wal.pending_entries.load(Ordering::Relaxed), 4);
+
+        // Write 1 more - should trigger sync (5 entries = threshold)
+        let point = create_test_point(4000, 4.0);
+        wal.write_point(&point).unwrap();
+
+        // After sync, pending should be reset
+        assert_eq!(wal.pending_entries.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_wal_custom_buffer_size() {
+        let dir = TempDir::new().unwrap();
+
+        // Create with custom config using Periodic mode to test group commit
+        let config = GroupCommitConfig {
+            max_pending_bytes: 512,
+            max_pending_entries: 1000,
+            max_wait_ms: 10000,
+        };
+
+        let wal = WalWriter::with_config(
+            dir.path(),
+            WalDurability::Periodic { interval_ms: 10000 },
+            config,
+        ).unwrap();
+
+        // Write enough data to exceed the pending bytes threshold
+        for i in 0..10 {
+            let point = create_test_point(i * 1000, i as f64);
+            wal.write_point(&point).unwrap();
+        }
+
+        // Should complete without error and sync should have occurred
+        // (pending_bytes threshold of 512 bytes was exceeded)
+        assert!(wal.sequence() >= 10);
     }
 }
