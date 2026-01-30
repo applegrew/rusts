@@ -704,6 +704,9 @@ impl QueryExecutor {
         }
 
         // Simple aggregation over all data - use parallel processing for many series
+        // Special case: COUNT(*) counts all rows, not a specific field
+        let is_count_star = field == "*" && function == AggregateFunction::Count;
+
         let aggregator = if series_ids.len() >= 4 && cancel.is_none() {
             // Parallel path: each thread gets its own aggregator, then merge
             let field_clone = field.to_string();
@@ -714,7 +717,12 @@ impl QueryExecutor {
                     let mut local_agg = Aggregator::new(function);
 
                     for point in points {
-                        if let Some((_, value)) = point.fields.iter().find(|(k, _)| k == &field_clone) {
+                        if is_count_star {
+                            // COUNT(*): count every row
+                            local_agg.add(&FieldValue::Integer(1));
+                        } else if let Some((_, value)) =
+                            point.fields.iter().find(|(k, _)| k == &field_clone)
+                        {
                             local_agg.add(value);
                         }
                     }
@@ -744,7 +752,10 @@ impl QueryExecutor {
                 let points = self.storage.query(series_id, &query.time_range)?;
 
                 for point in points {
-                    if let Some((_, value)) = point.fields.iter().find(|(k, _)| k == field) {
+                    if is_count_star {
+                        // COUNT(*): count every row
+                        aggregator.add(&FieldValue::Integer(1));
+                    } else if let Some((_, value)) = point.fields.iter().find(|(k, _)| k == field) {
                         aggregator.add(value);
                     }
                 }
@@ -785,6 +796,8 @@ impl QueryExecutor {
     ) -> Result<QueryResult> {
         // Group by series if group_by tags specified, otherwise aggregate all series
         let group_by_series = !query.group_by.is_empty();
+        // Special case: COUNT(*) counts all rows, not a specific field
+        let is_count_star = field == "*" && function == AggregateFunction::Count;
 
         if group_by_series {
             // Each series gets its own time buckets
@@ -807,7 +820,9 @@ impl QueryExecutor {
                 );
 
                 for point in points {
-                    if let Some((_, value)) = point.fields.iter().find(|(k, _)| k == field) {
+                    if is_count_star {
+                        time_agg.add(point.timestamp, &FieldValue::Integer(1));
+                    } else if let Some((_, value)) = point.fields.iter().find(|(k, _)| k == field) {
                         time_agg.add(point.timestamp, value);
                     }
                 }
@@ -859,7 +874,9 @@ impl QueryExecutor {
                 let points = self.storage.query(series_id, &query.time_range)?;
 
                 for point in points {
-                    if let Some((_, value)) = point.fields.iter().find(|(k, _)| k == field) {
+                    if is_count_star {
+                        time_agg.add(point.timestamp, &FieldValue::Integer(1));
+                    } else if let Some((_, value)) = point.fields.iter().find(|(k, _)| k == field) {
                         time_agg.add(point.timestamp, value);
                     }
                 }
@@ -901,6 +918,9 @@ impl QueryExecutor {
         field_name: &str,
         cancel: Option<&CancellationToken>,
     ) -> Result<QueryResult> {
+        // Special case: COUNT(*) counts all rows, not a specific field
+        let is_count_star = field == "*" && function == AggregateFunction::Count;
+
         // Group series by the group_by tags
         let mut groups: HashMap<Vec<(String, String)>, Vec<SeriesId>> = HashMap::new();
 
@@ -937,7 +957,9 @@ impl QueryExecutor {
                 let points = self.storage.query(series_id, &query.time_range)?;
 
                 for point in points {
-                    if let Some((_, value)) = point.fields.iter().find(|(k, _)| k == field) {
+                    if is_count_star {
+                        aggregator.add(&FieldValue::Integer(1));
+                    } else if let Some((_, value)) = point.fields.iter().find(|(k, _)| k == field) {
                         aggregator.add(value);
                     }
                 }
@@ -1153,6 +1175,46 @@ mod tests {
             assert!((v - 4.5).abs() < 0.01);
         } else {
             panic!("Expected avg_value field");
+        }
+
+        storage.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_executor_count_star() {
+        // Test that COUNT(*) counts all rows, not a specific field
+        let (storage, series_index, tag_index, _dir) = setup_test_env();
+
+        // Write 10 points
+        for i in 0..10 {
+            let point = create_test_point("server01", i * 1000, i as f64);
+            storage.write(&point).unwrap();
+
+            let series_id = point.series_id();
+            series_index.upsert(series_id, "cpu", &point.tags, point.timestamp);
+            tag_index.index_series(series_id, &point.tags);
+        }
+
+        let executor = QueryExecutor::new(
+            Arc::clone(&storage),
+            Arc::clone(&series_index),
+            Arc::clone(&tag_index),
+        );
+
+        // COUNT(*) should count all rows
+        let query = Query::builder("cpu")
+            .time_range(0, 100000)
+            .select_aggregate("*", AggregateFunction::Count, Some("row_count".to_string()))
+            .build()
+            .unwrap();
+
+        let result = executor.execute(query).unwrap();
+        assert_eq!(result.rows.len(), 1);
+
+        if let Some(FieldValue::Integer(count)) = result.rows[0].fields.get("row_count") {
+            assert_eq!(*count, 10, "COUNT(*) should return 10");
+        } else {
+            panic!("Expected row_count field with integer value");
         }
 
         storage.shutdown().unwrap();
