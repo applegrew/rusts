@@ -1,3 +1,5 @@
+[Logo](logo.png)
+
 # RusTs
 
 A high-performance time series database written in Rust, designed for monitoring, IoT, and real-time analytics workloads.
