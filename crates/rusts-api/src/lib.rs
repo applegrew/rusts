@@ -14,5 +14,6 @@ pub mod line_protocol;
 pub mod router;
 
 pub use error::{ApiError, Result};
+pub use handlers::{StartupPhase, StartupState};
 pub use line_protocol::LineProtocolParser;
 pub use router::create_router;

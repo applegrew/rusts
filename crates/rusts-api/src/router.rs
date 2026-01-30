@@ -41,9 +41,13 @@ pub fn create_router(state: Arc<AppState>, request_timeout: Duration) -> Router 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handlers::{StartupPhase, StartupState};
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
     use rusts_index::{SeriesIndex, TagIndex};
     use rusts_storage::{StorageEngine, StorageEngineConfig, WalDurability};
     use tempfile::TempDir;
+    use tower::ServiceExt;
 
     fn create_test_state() -> (Arc<AppState>, TempDir) {
         let dir = TempDir::new().unwrap();
@@ -68,9 +72,260 @@ mod tests {
         (state, dir)
     }
 
+    fn create_initializing_state() -> Arc<AppState> {
+        let startup_state = Arc::new(StartupState::new());
+        Arc::new(AppState::new_initializing(
+            Duration::from_secs(30),
+            100,
+            startup_state,
+        ))
+    }
+
     #[test]
     fn test_router_creation() {
         let (state, _dir) = create_test_state();
         let _router = create_router(state, Duration::from_secs(30));
+    }
+
+    #[tokio::test]
+    async fn test_health_endpoint_during_startup() {
+        let state = create_initializing_state();
+        state.startup_state.set_phase(StartupPhase::WalRecovery);
+
+        let app = create_router(state, Duration::from_secs(30));
+
+        let response = app
+            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["status"], "unhealthy");
+        assert_eq!(json["phase"], "wal_recovery");
+    }
+
+    #[tokio::test]
+    async fn test_health_endpoint_when_ready() {
+        let (state, _dir) = create_test_state();
+        let app = create_router(state, Duration::from_secs(30));
+
+        let response = app
+            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["status"], "healthy");
+        assert!(json.get("phase").is_none() || json["phase"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_ready_endpoint_during_startup() {
+        let state = create_initializing_state();
+        state.startup_state.set_phase(StartupPhase::IndexRebuilding);
+
+        let app = create_router(state, Duration::from_secs(30));
+
+        let response = app
+            .oneshot(Request::builder().uri("/ready").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["ready"], false);
+        assert_eq!(json["phase"], "index_rebuilding");
+    }
+
+    #[tokio::test]
+    async fn test_ready_endpoint_when_ready() {
+        let (state, _dir) = create_test_state();
+        let app = create_router(state, Duration::from_secs(30));
+
+        let response = app
+            .oneshot(Request::builder().uri("/ready").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["ready"], true);
+        assert!(json.get("phase").is_none() || json["phase"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_write_endpoint_during_startup() {
+        let state = create_initializing_state();
+        state.startup_state.set_phase(StartupPhase::WalRecovery);
+
+        let app = create_router(state, Duration::from_secs(30));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/write")
+                    .body(Body::from("cpu,host=server1 value=1.0"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["code"], "service_unavailable");
+        assert!(json["error"].as_str().unwrap().contains("starting up"));
+    }
+
+    #[tokio::test]
+    async fn test_query_endpoint_during_startup() {
+        let state = create_initializing_state();
+        state.startup_state.set_phase(StartupPhase::IndexRebuilding);
+
+        let app = create_router(state, Duration::from_secs(30));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/query")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"measurement":"cpu"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["code"], "service_unavailable");
+        assert!(json["error"].as_str().unwrap().contains("starting up"));
+    }
+
+    #[tokio::test]
+    async fn test_stats_endpoint_during_startup() {
+        let state = create_initializing_state();
+        state.startup_state.set_phase(StartupPhase::WalRecovery);
+
+        let app = create_router(state, Duration::from_secs(30));
+
+        let response = app
+            .oneshot(Request::builder().uri("/stats").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["code"], "service_unavailable");
+        assert!(json["error"].as_str().unwrap().contains("starting up"));
+    }
+
+    #[tokio::test]
+    async fn test_sql_endpoint_during_startup() {
+        let state = create_initializing_state();
+        state.startup_state.set_phase(StartupPhase::WalRecovery);
+
+        let app = create_router(state, Duration::from_secs(30));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/sql")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"query":"SELECT * FROM cpu"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["code"], "service_unavailable");
+        assert!(json["error"].as_str().unwrap().contains("starting up"));
+    }
+
+    #[tokio::test]
+    async fn test_write_endpoint_when_ready() {
+        let (state, _dir) = create_test_state();
+        let app = create_router(state, Duration::from_secs(30));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/write")
+                    .body(Body::from("cpu,host=server1 value=1.0"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["success"], true);
+        assert_eq!(json["points_written"], 1);
+    }
+
+    #[tokio::test]
+    async fn test_startup_phase_progression() {
+        let state = create_initializing_state();
+
+        // Simulate the startup progression
+        let phases = [
+            StartupPhase::Initializing,
+            StartupPhase::WalRecovery,
+            StartupPhase::IndexRebuilding,
+            StartupPhase::Ready,
+        ];
+
+        for phase in phases {
+            state.startup_state.set_phase(phase.clone());
+            let app = create_router(Arc::clone(&state), Duration::from_secs(30));
+
+            let response = app
+                .oneshot(Request::builder().uri("/ready").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+            if phase == StartupPhase::Ready {
+                assert_eq!(json["ready"], true);
+            } else {
+                assert_eq!(json["ready"], false);
+                assert_eq!(json["phase"], phase.to_string());
+            }
+        }
     }
 }

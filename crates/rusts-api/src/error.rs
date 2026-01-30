@@ -37,6 +37,9 @@ pub enum ApiError {
 
     #[error("Parse error: {0}")]
     Parse(String),
+
+    #[error("Service unavailable: {0}")]
+    ServiceUnavailable(String),
 }
 
 /// Result type for API operations
@@ -61,6 +64,7 @@ impl IntoResponse for ApiError {
             ApiError::Storage(msg) => (StatusCode::INTERNAL_SERVER_ERROR, "storage", msg.clone()),
             ApiError::Query(msg) => (StatusCode::BAD_REQUEST, "query", msg.clone()),
             ApiError::Parse(msg) => (StatusCode::BAD_REQUEST, "parse", msg.clone()),
+            ApiError::ServiceUnavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, "service_unavailable", msg.clone()),
         };
 
         let body = ErrorResponse {

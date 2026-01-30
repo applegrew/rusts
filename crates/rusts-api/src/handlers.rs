@@ -6,6 +6,7 @@ use axum::{
     extract::State,
     response::Json,
 };
+use parking_lot::RwLock;
 use rusts_core::TimeRange;
 use rusts_index::{SeriesIndex, TagIndex};
 use rusts_query::{AggregateFunction, Query, QueryExecutor};
@@ -18,17 +19,81 @@ use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
+/// Server startup phase
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupPhase {
+    /// Server is initializing
+    Initializing,
+    /// WAL recovery in progress
+    WalRecovery,
+    /// Index rebuilding from partitions
+    IndexRebuilding,
+    /// Server is ready to serve requests
+    Ready,
+}
+
+impl std::fmt::Display for StartupPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StartupPhase::Initializing => write!(f, "initializing"),
+            StartupPhase::WalRecovery => write!(f, "wal_recovery"),
+            StartupPhase::IndexRebuilding => write!(f, "index_rebuilding"),
+            StartupPhase::Ready => write!(f, "ready"),
+        }
+    }
+}
+
+/// Startup state tracking
+pub struct StartupState {
+    phase: RwLock<StartupPhase>,
+    start_time: Instant,
+}
+
+impl StartupState {
+    pub fn new() -> Self {
+        Self {
+            phase: RwLock::new(StartupPhase::Initializing),
+            start_time: Instant::now(),
+        }
+    }
+
+    pub fn phase(&self) -> StartupPhase {
+        self.phase.read().clone()
+    }
+
+    pub fn set_phase(&self, phase: StartupPhase) {
+        *self.phase.write() = phase;
+    }
+
+    pub fn is_ready(&self) -> bool {
+        *self.phase.read() == StartupPhase::Ready
+    }
+
+    pub fn uptime_seconds(&self) -> u64 {
+        self.start_time.elapsed().as_secs()
+    }
+}
+
+impl Default for StartupState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Application state shared across handlers
 pub struct AppState {
-    pub storage: Arc<StorageEngine>,
+    pub storage: RwLock<Option<Arc<StorageEngine>>>,
     pub series_index: Arc<SeriesIndex>,
     pub tag_index: Arc<TagIndex>,
-    pub executor: Arc<QueryExecutor>,
+    pub executor: RwLock<Option<Arc<QueryExecutor>>>,
     pub query_semaphore: Arc<Semaphore>,
     pub query_timeout: Duration,
+    pub startup_state: Arc<StartupState>,
 }
 
 impl AppState {
+    /// Create a new AppState with storage already initialized (ready state)
     pub fn new(
         storage: Arc<StorageEngine>,
         series_index: Arc<SeriesIndex>,
@@ -36,6 +101,9 @@ impl AppState {
         query_timeout: Duration,
         max_concurrent_queries: usize,
     ) -> Self {
+        let startup_state = Arc::new(StartupState::new());
+        startup_state.set_phase(StartupPhase::Ready);
+
         let executor = Arc::new(QueryExecutor::new(
             Arc::clone(&storage),
             Arc::clone(&series_index),
@@ -43,13 +111,57 @@ impl AppState {
         ));
 
         Self {
-            storage,
+            storage: RwLock::new(Some(storage)),
             series_index,
             tag_index,
-            executor,
+            executor: RwLock::new(Some(executor)),
             query_semaphore: Arc::new(Semaphore::new(max_concurrent_queries)),
             query_timeout,
+            startup_state,
         }
+    }
+
+    /// Create a new AppState in initializing mode (no storage yet)
+    pub fn new_initializing(
+        query_timeout: Duration,
+        max_concurrent_queries: usize,
+        startup_state: Arc<StartupState>,
+    ) -> Self {
+        Self {
+            storage: RwLock::new(None),
+            series_index: Arc::new(SeriesIndex::new()),
+            tag_index: Arc::new(TagIndex::new()),
+            executor: RwLock::new(None),
+            query_semaphore: Arc::new(Semaphore::new(max_concurrent_queries)),
+            query_timeout,
+            startup_state,
+        }
+    }
+
+    /// Set the storage engine once it's initialized
+    pub fn set_storage(&self, storage: Arc<StorageEngine>) {
+        let executor = Arc::new(QueryExecutor::new(
+            Arc::clone(&storage),
+            Arc::clone(&self.series_index),
+            Arc::clone(&self.tag_index),
+        ));
+        *self.storage.write() = Some(storage);
+        *self.executor.write() = Some(executor);
+    }
+
+    /// Check if storage is ready
+    pub fn is_storage_ready(&self) -> bool {
+        self.storage.read().is_some()
+    }
+
+    /// Get storage if ready
+    pub fn get_storage(&self) -> Option<Arc<StorageEngine>> {
+        self.storage.read().clone()
+    }
+
+    /// Get executor if ready
+    pub fn get_executor(&self) -> Option<Arc<QueryExecutor>> {
+        self.executor.read().clone()
     }
 }
 
@@ -58,13 +170,19 @@ impl AppState {
 pub struct HealthResponse {
     pub status: String,
     pub version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
 }
 
-/// Health check handler
-pub async fn health() -> Json<HealthResponse> {
+/// Health check handler - always responds, even during startup
+pub async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
+    let phase = state.startup_state.phase();
+    let is_ready = phase == StartupPhase::Ready;
+
     Json(HealthResponse {
-        status: "healthy".to_string(),
+        status: if is_ready { "healthy".to_string() } else { "unhealthy".to_string() },
         version: env!("CARGO_PKG_VERSION").to_string(),
+        phase: if is_ready { None } else { Some(phase.to_string()) },
     })
 }
 
@@ -72,19 +190,20 @@ pub async fn health() -> Json<HealthResponse> {
 #[derive(Serialize)]
 pub struct ReadyResponse {
     pub ready: bool,
-    pub storage: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
     pub uptime_seconds: u64,
 }
 
-/// Ready check handler
-pub async fn ready(State(_state): State<Arc<AppState>>) -> Json<ReadyResponse> {
-    // Check storage health
-    let storage_status = "ok".to_string();
+/// Ready check handler - always responds, returns ready=false during startup
+pub async fn ready(State(state): State<Arc<AppState>>) -> Json<ReadyResponse> {
+    let phase = state.startup_state.phase();
+    let is_ready = phase == StartupPhase::Ready;
 
     Json(ReadyResponse {
-        ready: true,
-        storage: storage_status,
-        uptime_seconds: 0, // Would track actual uptime
+        ready: is_ready,
+        phase: if is_ready { None } else { Some(phase.to_string()) },
+        uptime_seconds: state.startup_state.uptime_seconds(),
     })
 }
 
@@ -101,6 +220,12 @@ pub async fn write(
     State(state): State<Arc<AppState>>,
     body: String,
 ) -> std::result::Result<Json<WriteResponse>, ApiError> {
+    // Check if storage is ready
+    let storage = state.get_storage().ok_or_else(|| {
+        let phase = state.startup_state.phase();
+        ApiError::ServiceUnavailable(format!("Server is starting up ({})", phase))
+    })?;
+
     let (points, parse_errors) = LineProtocolParser::parse_lines_ok(&body);
 
     if points.is_empty() && !parse_errors.is_empty() {
@@ -120,7 +245,7 @@ pub async fn write(
     }
 
     // Write to storage
-    state.storage.write_batch(&points)?;
+    storage.write_batch(&points)?;
 
     Ok(Json(WriteResponse {
         success: true,
@@ -179,6 +304,12 @@ pub async fn query(
 ) -> std::result::Result<Json<QueryResponse>, ApiError> {
     let start = Instant::now();
 
+    // Check if storage/executor is ready
+    let executor = state.get_executor().ok_or_else(|| {
+        let phase = state.startup_state.phase();
+        ApiError::ServiceUnavailable(format!("Server is starting up ({})", phase))
+    })?;
+
     // Acquire semaphore permit (Layer 3: concurrent query limit)
     let _permit = state.query_semaphore.acquire().await
         .map_err(|_| ApiError::Internal("Query semaphore closed".to_string()))?;
@@ -227,8 +358,7 @@ pub async fn query(
 
     let query = builder.build().map_err(|e| ApiError::Query(e.to_string()))?;
 
-    // Clone what we need for spawn_blocking
-    let executor = Arc::clone(&state.executor);
+    // Clone for spawn_blocking
     let timeout = state.query_timeout;
     let cancel = CancellationToken::new();
     let cancel_clone = cancel.clone();
@@ -370,11 +500,17 @@ pub struct PartitionStatsResponse {
 }
 
 /// Get database statistics
-pub async fn stats(State(state): State<Arc<AppState>>) -> Json<StatsResponse> {
-    let memtable = state.storage.memtable_stats();
-    let partitions = state.storage.partition_stats();
+pub async fn stats(State(state): State<Arc<AppState>>) -> std::result::Result<Json<StatsResponse>, ApiError> {
+    // Check if storage is ready
+    let storage = state.get_storage().ok_or_else(|| {
+        let phase = state.startup_state.phase();
+        ApiError::ServiceUnavailable(format!("Server is starting up ({})", phase))
+    })?;
 
-    Json(StatsResponse {
+    let memtable = storage.memtable_stats();
+    let partitions = storage.partition_stats();
+
+    Ok(Json(StatsResponse {
         series_count: state.series_index.len(),
         measurement_count: state.series_index.measurements().len(),
         memtable: MemTableStatsResponse {
@@ -388,7 +524,7 @@ pub async fn stats(State(state): State<Arc<AppState>>) -> Json<StatsResponse> {
             total_segments: partitions.total_segments,
             total_points: partitions.total_points,
         },
-    })
+    }))
 }
 
 /// SQL query request body
@@ -436,12 +572,17 @@ pub async fn sql_query(
             }))
         }
         SqlCommand::Query(query) => {
+            // Check if storage/executor is ready
+            let executor = state.get_executor().ok_or_else(|| {
+                let phase = state.startup_state.phase();
+                ApiError::ServiceUnavailable(format!("Server is starting up ({})", phase))
+            })?;
+
             // Acquire semaphore permit (Layer 3: concurrent query limit)
             let _permit = state.query_semaphore.acquire().await
                 .map_err(|_| ApiError::Internal("Query semaphore closed".to_string()))?;
 
-            // Clone what we need for spawn_blocking
-            let executor = Arc::clone(&state.executor);
+            // Clone for spawn_blocking
             let timeout = state.query_timeout;
             let cancel = CancellationToken::new();
             let cancel_clone = cancel.clone();
@@ -518,6 +659,8 @@ pub async fn sql_query(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusts_storage::{StorageEngine, StorageEngineConfig, WalDurability};
+    use tempfile::TempDir;
 
     #[test]
     fn test_parse_duration() {
@@ -529,5 +672,152 @@ mod tests {
 
         assert!(parse_duration("invalid").is_err());
         assert!(parse_duration("").is_err());
+    }
+
+    #[test]
+    fn test_startup_phase_display() {
+        assert_eq!(StartupPhase::Initializing.to_string(), "initializing");
+        assert_eq!(StartupPhase::WalRecovery.to_string(), "wal_recovery");
+        assert_eq!(StartupPhase::IndexRebuilding.to_string(), "index_rebuilding");
+        assert_eq!(StartupPhase::Ready.to_string(), "ready");
+    }
+
+    #[test]
+    fn test_startup_state_new() {
+        let state = StartupState::new();
+        assert_eq!(state.phase(), StartupPhase::Initializing);
+        assert!(!state.is_ready());
+    }
+
+    #[test]
+    fn test_startup_state_phase_transitions() {
+        let state = StartupState::new();
+
+        // Initially Initializing
+        assert_eq!(state.phase(), StartupPhase::Initializing);
+        assert!(!state.is_ready());
+
+        // Transition to WalRecovery
+        state.set_phase(StartupPhase::WalRecovery);
+        assert_eq!(state.phase(), StartupPhase::WalRecovery);
+        assert!(!state.is_ready());
+
+        // Transition to IndexRebuilding
+        state.set_phase(StartupPhase::IndexRebuilding);
+        assert_eq!(state.phase(), StartupPhase::IndexRebuilding);
+        assert!(!state.is_ready());
+
+        // Transition to Ready
+        state.set_phase(StartupPhase::Ready);
+        assert_eq!(state.phase(), StartupPhase::Ready);
+        assert!(state.is_ready());
+    }
+
+    #[test]
+    fn test_startup_state_uptime() {
+        let state = StartupState::new();
+        // Uptime should be 0 or very small right after creation
+        assert!(state.uptime_seconds() < 2);
+    }
+
+    #[test]
+    fn test_app_state_new_initializing() {
+        let startup_state = Arc::new(StartupState::new());
+        let app_state = AppState::new_initializing(
+            Duration::from_secs(30),
+            100,
+            Arc::clone(&startup_state),
+        );
+
+        // Storage should not be available
+        assert!(!app_state.is_storage_ready());
+        assert!(app_state.get_storage().is_none());
+        assert!(app_state.get_executor().is_none());
+
+        // Startup state should be Initializing
+        assert_eq!(app_state.startup_state.phase(), StartupPhase::Initializing);
+    }
+
+    #[test]
+    fn test_app_state_new_with_storage() {
+        let dir = TempDir::new().unwrap();
+        let config = StorageEngineConfig {
+            data_dir: dir.path().to_path_buf(),
+            wal_durability: WalDurability::None,
+            ..Default::default()
+        };
+
+        let storage = Arc::new(StorageEngine::new(config).unwrap());
+        let series_index = Arc::new(SeriesIndex::new());
+        let tag_index = Arc::new(TagIndex::new());
+
+        let app_state = AppState::new(
+            storage,
+            series_index,
+            tag_index,
+            Duration::from_secs(30),
+            100,
+        );
+
+        // Storage should be available
+        assert!(app_state.is_storage_ready());
+        assert!(app_state.get_storage().is_some());
+        assert!(app_state.get_executor().is_some());
+
+        // Startup state should be Ready
+        assert_eq!(app_state.startup_state.phase(), StartupPhase::Ready);
+        assert!(app_state.startup_state.is_ready());
+    }
+
+    #[test]
+    fn test_app_state_set_storage() {
+        let startup_state = Arc::new(StartupState::new());
+        let app_state = AppState::new_initializing(
+            Duration::from_secs(30),
+            100,
+            Arc::clone(&startup_state),
+        );
+
+        // Initially no storage
+        assert!(!app_state.is_storage_ready());
+        assert!(app_state.get_storage().is_none());
+        assert!(app_state.get_executor().is_none());
+
+        // Create and set storage
+        let dir = TempDir::new().unwrap();
+        let config = StorageEngineConfig {
+            data_dir: dir.path().to_path_buf(),
+            wal_durability: WalDurability::None,
+            ..Default::default()
+        };
+        let storage = Arc::new(StorageEngine::new(config).unwrap());
+
+        app_state.set_storage(storage);
+
+        // Now storage should be available
+        assert!(app_state.is_storage_ready());
+        assert!(app_state.get_storage().is_some());
+        assert!(app_state.get_executor().is_some());
+    }
+
+    #[test]
+    fn test_app_state_startup_phase_during_initialization() {
+        let startup_state = Arc::new(StartupState::new());
+        let app_state = AppState::new_initializing(
+            Duration::from_secs(30),
+            100,
+            Arc::clone(&startup_state),
+        );
+
+        // Simulate startup phases
+        startup_state.set_phase(StartupPhase::WalRecovery);
+        assert_eq!(app_state.startup_state.phase(), StartupPhase::WalRecovery);
+
+        startup_state.set_phase(StartupPhase::IndexRebuilding);
+        assert_eq!(app_state.startup_state.phase(), StartupPhase::IndexRebuilding);
+
+        startup_state.set_phase(StartupPhase::Ready);
+        assert_eq!(app_state.startup_state.phase(), StartupPhase::Ready);
+        assert!(app_state.startup_state.is_ready());
     }
 }

@@ -10,8 +10,7 @@
 //!   --host <HOST>       Bind address (overrides config)
 
 use rusts_api::auth::AuthConfig;
-use rusts_api::{create_router, handlers::AppState};
-use rusts_index::{SeriesIndex, TagIndex};
+use rusts_api::{create_router, handlers::AppState, StartupPhase, StartupState};
 use rusts_storage::memtable::FlushTrigger;
 use rusts_storage::{StorageEngine, StorageEngineConfig, WalDurability};
 use serde::{Deserialize, Serialize};
@@ -456,27 +455,8 @@ async fn main() -> anyhow::Result<()> {
         info!("WAL retention: forever (CDC mode)");
     }
 
-    // Initialize storage engine
-    let storage_config = config.to_storage_config();
-    info!("Initializing storage engine...");
-    let storage = Arc::new(StorageEngine::new(storage_config)?);
-    info!("Storage engine initialized");
-
-    // Initialize indexes
-    let series_index = Arc::new(SeriesIndex::new());
-    let tag_index = Arc::new(TagIndex::new());
-
-    // Rebuild indexes from all data (memtable + partitions)
-    let all_series = storage.get_all_series();
-    if !all_series.is_empty() {
-        info!("Rebuilding indexes from {} series (memtable + partitions)", all_series.len());
-        for (series_id, measurement, tags) in all_series {
-            // Get the latest timestamp from the series (use 0 as placeholder)
-            series_index.upsert(series_id, &measurement, &tags, 0);
-            tag_index.index_series(series_id, &tags);
-        }
-        info!("Index rebuild complete");
-    }
+    // Create startup state for tracking initialization progress
+    let startup_state = Arc::new(StartupState::new());
 
     // Query protection settings
     let query_timeout = std::time::Duration::from_secs(config.server.query_timeout_secs);
@@ -484,20 +464,19 @@ async fn main() -> anyhow::Result<()> {
     info!("Query timeout: {} seconds", config.server.query_timeout_secs);
     info!("Max concurrent queries: {}", max_concurrent_queries);
 
-    // Create application state
-    let app_state = Arc::new(AppState::new(
-        Arc::clone(&storage),
-        Arc::clone(&series_index),
-        Arc::clone(&tag_index),
+    // Create application state in initializing mode (no storage yet)
+    // This allows health/ready endpoints to respond immediately
+    let app_state = Arc::new(AppState::new_initializing(
         query_timeout,
         max_concurrent_queries,
+        Arc::clone(&startup_state),
     ));
 
-    // Create router with request timeout (slightly longer than query timeout for proper error responses)
+    // Create router with request timeout
     let request_timeout = std::time::Duration::from_secs(config.server.request_timeout_secs);
-    let app = create_router(app_state, request_timeout);
+    let app = create_router(Arc::clone(&app_state), request_timeout);
 
-    // Start server
+    // Start HTTP server FIRST - before storage initialization
     let addr: SocketAddr = format!("{}:{}", config.server.host, config.server.port).parse()?;
     let listener = TcpListener::bind(addr).await?;
 
@@ -505,14 +484,73 @@ async fn main() -> anyhow::Result<()> {
     info!("Write endpoint: POST http://{}/write", addr);
     info!("Query endpoint: POST http://{}/query", addr);
     info!("Health check: GET http://{}/health", addr);
+    info!("Server is starting up - health/ready endpoints are available");
+
+    // Spawn background task for storage initialization and index rebuilding
+    let storage_config = config.to_storage_config();
+    let app_state_for_init = Arc::clone(&app_state);
+    let startup_state_for_init = Arc::clone(&startup_state);
+    tokio::spawn(async move {
+        // Initialize storage engine (this includes WAL recovery)
+        startup_state_for_init.set_phase(StartupPhase::WalRecovery);
+        info!("Initializing storage engine...");
+
+        // Run blocking storage initialization in spawn_blocking
+        let storage_result = tokio::task::spawn_blocking(move || {
+            StorageEngine::new(storage_config)
+        }).await;
+
+        let storage = match storage_result {
+            Ok(Ok(storage)) => Arc::new(storage),
+            Ok(Err(e)) => {
+                tracing::error!("Failed to initialize storage engine: {}", e);
+                std::process::exit(1);
+            }
+            Err(e) => {
+                tracing::error!("Storage initialization task panicked: {}", e);
+                std::process::exit(1);
+            }
+        };
+        info!("Storage engine initialized");
+
+        // Set storage in app state
+        app_state_for_init.set_storage(Arc::clone(&storage));
+
+        // Now rebuild indexes
+        startup_state_for_init.set_phase(StartupPhase::IndexRebuilding);
+
+        // Get all series (this can be slow for large datasets)
+        let all_series = storage.get_all_series();
+
+        if !all_series.is_empty() {
+            info!("Rebuilding indexes from {} series (memtable + partitions)", all_series.len());
+            let total = all_series.len();
+            for (i, (series_id, measurement, tags)) in all_series.into_iter().enumerate() {
+                app_state_for_init.series_index.upsert(series_id, &measurement, &tags, 0);
+                app_state_for_init.tag_index.index_series(series_id, &tags);
+
+                // Log progress every 10000 series
+                if (i + 1) % 10000 == 0 {
+                    info!("Index rebuild progress: {}/{} series", i + 1, total);
+                }
+            }
+            info!("Index rebuild complete");
+        }
+
+        // Mark server as ready
+        startup_state_for_init.set_phase(StartupPhase::Ready);
+        info!("Server is ready to accept requests");
+    });
 
     // Handle shutdown gracefully
-    let storage_clone = Arc::clone(&storage);
+    let app_state_for_shutdown = Arc::clone(&app_state);
     tokio::spawn(async move {
         tokio::signal::ctrl_c().await.ok();
         info!("Shutdown signal received");
-        if let Err(e) = storage_clone.shutdown() {
-            tracing::error!("Error during shutdown: {}", e);
+        if let Some(storage) = app_state_for_shutdown.get_storage() {
+            if let Err(e) = storage.shutdown() {
+                tracing::error!("Error during shutdown: {}", e);
+            }
         }
         std::process::exit(0);
     });
