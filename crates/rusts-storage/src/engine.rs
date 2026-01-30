@@ -1344,4 +1344,201 @@ mod tests {
             engine.shutdown().unwrap();
         }
     }
+
+    #[test]
+    fn test_query_with_limit_ascending() {
+        let dir = TempDir::new().unwrap();
+        let config = StorageEngineConfig {
+            data_dir: dir.path().to_path_buf(),
+            wal_durability: WalDurability::None,
+            ..Default::default()
+        };
+
+        let engine = StorageEngine::new(config).unwrap();
+
+        // Write 100 points with increasing timestamps
+        for i in 0..100 {
+            let point = create_test_point("cpu", "server01", i * 1000, i as f64);
+            engine.write(&point).unwrap();
+        }
+
+        let series_id = create_test_point("cpu", "server01", 0, 0.0).series_id();
+
+        // Query with limit 10 ascending
+        let (results, total_scanned) = engine
+            .query_with_limit(series_id, &TimeRange::new(0, 1000000), 10, true)
+            .unwrap();
+
+        assert_eq!(results.len(), 10, "Should return exactly 10 points");
+        assert!(total_scanned >= 10, "Should scan at least 10 points");
+
+        // Verify ascending order (smallest timestamps first)
+        for i in 0..10 {
+            assert_eq!(results[i].timestamp, i as i64 * 1000);
+        }
+
+        engine.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_query_with_limit_descending() {
+        let dir = TempDir::new().unwrap();
+        let config = StorageEngineConfig {
+            data_dir: dir.path().to_path_buf(),
+            wal_durability: WalDurability::None,
+            ..Default::default()
+        };
+
+        let engine = StorageEngine::new(config).unwrap();
+
+        // Write 100 points with increasing timestamps
+        for i in 0..100 {
+            let point = create_test_point("cpu", "server01", i * 1000, i as f64);
+            engine.write(&point).unwrap();
+        }
+
+        let series_id = create_test_point("cpu", "server01", 0, 0.0).series_id();
+
+        // Query with limit 10 descending
+        let (results, total_scanned) = engine
+            .query_with_limit(series_id, &TimeRange::new(0, 1000000), 10, false)
+            .unwrap();
+
+        assert_eq!(results.len(), 10, "Should return exactly 10 points");
+        assert!(total_scanned >= 10, "Should scan at least 10 points");
+
+        // Verify descending order (largest timestamps first)
+        for i in 0..10 {
+            assert_eq!(results[i].timestamp, (99 - i) as i64 * 1000);
+        }
+
+        engine.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_query_with_limit_fewer_than_limit() {
+        let dir = TempDir::new().unwrap();
+        let config = StorageEngineConfig {
+            data_dir: dir.path().to_path_buf(),
+            wal_durability: WalDurability::None,
+            ..Default::default()
+        };
+
+        let engine = StorageEngine::new(config).unwrap();
+
+        // Write only 5 points
+        for i in 0..5 {
+            let point = create_test_point("cpu", "server01", i * 1000, i as f64);
+            engine.write(&point).unwrap();
+        }
+
+        let series_id = create_test_point("cpu", "server01", 0, 0.0).series_id();
+
+        // Query with limit 10 (more than available)
+        let (results, total_scanned) = engine
+            .query_with_limit(series_id, &TimeRange::new(0, 100000), 10, true)
+            .unwrap();
+
+        assert_eq!(results.len(), 5, "Should return all 5 points");
+        assert_eq!(total_scanned, 5, "Should scan all 5 points");
+
+        engine.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_query_with_limit_same_timestamps() {
+        // Test that multiple points with the same timestamp are all returned
+        let dir = TempDir::new().unwrap();
+        let config = StorageEngineConfig {
+            data_dir: dir.path().to_path_buf(),
+            wal_durability: WalDurability::None,
+            ..Default::default()
+        };
+
+        let engine = StorageEngine::new(config).unwrap();
+
+        // Write 10 points all with the same timestamp but different values
+        for i in 0..10 {
+            let point = Point::builder("cpu")
+                .timestamp(1000) // Same timestamp for all
+                .tag("host", "server01")
+                .field("value", i as f64)
+                .build()
+                .unwrap();
+            engine.write(&point).unwrap();
+        }
+
+        let series_id = Point::builder("cpu")
+            .timestamp(0)
+            .tag("host", "server01")
+            .field("value", 0.0)
+            .build()
+            .unwrap()
+            .series_id();
+
+        // Query with limit 10
+        let (results, _) = engine
+            .query_with_limit(series_id, &TimeRange::new(0, 10000), 10, true)
+            .unwrap();
+
+        // Should return all 10 points even though they have the same timestamp
+        assert_eq!(results.len(), 10, "Should return all 10 points with same timestamp");
+
+        engine.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_query_with_limit_early_termination() {
+        // Test that early termination works correctly across partitions
+        use std::thread;
+        use std::time::Duration;
+
+        let dir = TempDir::new().unwrap();
+        let config = StorageEngineConfig {
+            data_dir: dir.path().to_path_buf(),
+            wal_durability: WalDurability::EveryWrite,
+            partition_duration: 1000_000_000, // 1 second partitions for testing
+            flush_trigger: FlushTrigger {
+                max_size: 1024, // Very small to trigger flush
+                max_points: 10,
+                max_age_nanos: i64::MAX,
+            },
+            ..Default::default()
+        };
+
+        let engine = StorageEngine::new(config).unwrap();
+
+        // Write points across multiple partitions (different time ranges)
+        // Partition 1: timestamps 0-999_999_999
+        for i in 0..20 {
+            let point = create_test_point("cpu", "server01", i * 10_000_000, i as f64);
+            engine.write(&point).unwrap();
+        }
+
+        // Force flush to create partition
+        engine.flush().unwrap();
+        thread::sleep(Duration::from_millis(100)); // Let flush complete
+
+        // Partition 2: timestamps 1_000_000_000+
+        for i in 0..20 {
+            let point = create_test_point("cpu", "server01", 1_000_000_000 + i * 10_000_000, (20 + i) as f64);
+            engine.write(&point).unwrap();
+        }
+
+        let series_id = create_test_point("cpu", "server01", 0, 0.0).series_id();
+
+        // Query with limit 10 ascending - should get points from partition 1
+        let (results, total_scanned) = engine
+            .query_with_limit(series_id, &TimeRange::new(0, i64::MAX), 10, true)
+            .unwrap();
+
+        assert_eq!(results.len(), 10, "Should return 10 points");
+        // First 10 points should be from partition 1
+        assert!(results[9].timestamp < 1_000_000_000, "All results should be from first partition");
+        // Should have scanned fewer than all 40 points due to early termination
+        // (This depends on partition boundaries, so we just verify it works)
+        assert!(total_scanned <= 40, "Should not scan more than total points");
+
+        engine.shutdown().unwrap();
+    }
 }

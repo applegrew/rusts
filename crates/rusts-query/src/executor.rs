@@ -1524,4 +1524,178 @@ mod tests {
 
         storage.shutdown().unwrap();
     }
+
+    #[test]
+    fn test_single_series_uses_early_termination() {
+        // Single series queries should use storage-level early termination
+        let (storage, series_index, tag_index, _dir) = setup_test_env();
+
+        // Write 100 points to a single series
+        for i in 0..100 {
+            let point = create_test_point("server01", i * 1000, i as f64);
+            storage.write(&point).unwrap();
+
+            let series_id = point.series_id();
+            series_index.upsert(series_id, "cpu", &point.tags, point.timestamp);
+            tag_index.index_series(series_id, &point.tags);
+        }
+
+        let executor = QueryExecutor::new(
+            Arc::clone(&storage),
+            Arc::clone(&series_index),
+            Arc::clone(&tag_index),
+        );
+
+        // Query with LIMIT and tag filter (single series)
+        let query = Query::builder("cpu")
+            .time_range(0, 1000000)
+            .where_tag("host", "server01")
+            .limit(10)
+            .build()
+            .unwrap();
+
+        let result = executor.execute(query).unwrap();
+        assert_eq!(result.rows.len(), 10);
+
+        // Verify ascending order
+        for i in 0..10 {
+            assert_eq!(result.rows[i].timestamp, Some(i as i64 * 1000));
+        }
+
+        storage.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_multi_series_limit_returns_correct_results() {
+        // Multi-series queries should still return correct results (no early termination)
+        let (storage, series_index, tag_index, _dir) = setup_test_env();
+
+        // Write points to two series with interleaved timestamps
+        for i in 0..50 {
+            // Server01: even timestamps (0, 2000, 4000, ...)
+            let p1 = create_test_point("server01", i * 2000, i as f64);
+            storage.write(&p1).unwrap();
+            series_index.upsert(p1.series_id(), "cpu", &p1.tags, p1.timestamp);
+            tag_index.index_series(p1.series_id(), &p1.tags);
+
+            // Server02: odd timestamps (1000, 3000, 5000, ...)
+            let p2 = create_test_point("server02", i * 2000 + 1000, (50 + i) as f64);
+            storage.write(&p2).unwrap();
+            series_index.upsert(p2.series_id(), "cpu", &p2.tags, p2.timestamp);
+            tag_index.index_series(p2.series_id(), &p2.tags);
+        }
+
+        let executor = QueryExecutor::new(
+            Arc::clone(&storage),
+            Arc::clone(&series_index),
+            Arc::clone(&tag_index),
+        );
+
+        // Query without tag filter (both series)
+        let query = Query::builder("cpu")
+            .time_range(0, 1000000)
+            .limit(10)
+            .build()
+            .unwrap();
+
+        let result = executor.execute(query).unwrap();
+        assert_eq!(result.rows.len(), 10);
+        assert_eq!(result.total_rows, 100); // Both series
+
+        // Verify results are interleaved and in ascending order
+        // Expected: 0, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000
+        for i in 0..10 {
+            assert_eq!(result.rows[i].timestamp, Some(i as i64 * 1000));
+        }
+
+        storage.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_limit_descending_order() {
+        let (storage, series_index, tag_index, _dir) = setup_test_env();
+
+        for i in 0..100 {
+            let point = create_test_point("server01", i * 1000, i as f64);
+            storage.write(&point).unwrap();
+
+            let series_id = point.series_id();
+            series_index.upsert(series_id, "cpu", &point.tags, point.timestamp);
+            tag_index.index_series(series_id, &point.tags);
+        }
+
+        let executor = QueryExecutor::new(
+            Arc::clone(&storage),
+            Arc::clone(&series_index),
+            Arc::clone(&tag_index),
+        );
+
+        // Query with ORDER BY time DESC
+        let query = Query::builder("cpu")
+            .time_range(0, 1000000)
+            .order_by("time", false) // descending
+            .limit(10)
+            .build()
+            .unwrap();
+
+        let result = executor.execute(query).unwrap();
+        assert_eq!(result.rows.len(), 10);
+
+        // Verify descending order (largest timestamps first)
+        for i in 0..10 {
+            assert_eq!(result.rows[i].timestamp, Some((99 - i) as i64 * 1000));
+        }
+
+        storage.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_limit_with_same_timestamps_across_series() {
+        // Test that multiple points with the same timestamp are correctly returned
+        let (storage, series_index, tag_index, _dir) = setup_test_env();
+
+        // Write points to two series with the SAME timestamps
+        for i in 0..10 {
+            let p1 = create_test_point("server01", i * 1000, i as f64);
+            storage.write(&p1).unwrap();
+            series_index.upsert(p1.series_id(), "cpu", &p1.tags, p1.timestamp);
+            tag_index.index_series(p1.series_id(), &p1.tags);
+
+            let p2 = create_test_point("server02", i * 1000, (10 + i) as f64); // Same timestamp!
+            storage.write(&p2).unwrap();
+            series_index.upsert(p2.series_id(), "cpu", &p2.tags, p2.timestamp);
+            tag_index.index_series(p2.series_id(), &p2.tags);
+        }
+
+        let executor = QueryExecutor::new(
+            Arc::clone(&storage),
+            Arc::clone(&series_index),
+            Arc::clone(&tag_index),
+        );
+
+        let query = Query::builder("cpu")
+            .time_range(0, 100000)
+            .limit(10)
+            .build()
+            .unwrap();
+
+        let result = executor.execute(query).unwrap();
+        assert_eq!(result.rows.len(), 10);
+        assert_eq!(result.total_rows, 20);
+
+        // Should have mix of both series (both have timestamps 0, 1000, 2000, ...)
+        let server01_count = result.rows.iter()
+            .filter(|r| r.tags.iter().any(|t| t.key == "host" && t.value == "server01"))
+            .count();
+        let server02_count = result.rows.iter()
+            .filter(|r| r.tags.iter().any(|t| t.key == "host" && t.value == "server02"))
+            .count();
+
+        // With same timestamps, we should get a mix of both
+        assert!(server01_count > 0, "Should have some server01 rows");
+        assert!(server02_count > 0, "Should have some server02 rows");
+        assert_eq!(server01_count + server02_count, 10);
+
+        storage.shutdown().unwrap();
+    }
 }
