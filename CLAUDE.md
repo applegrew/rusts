@@ -75,6 +75,8 @@ crates/
 - **MemTable**: In-memory write buffer with flush triggers (size, points, age)
 - **Segments**: Columnar compressed storage format
 - **Partitions**: Time-based data organization
+- **Checkpoint**: Tracks last flushed WAL sequence for efficient recovery
+- **Clean Shutdown**: Flushes memtable and updates checkpoint (instant restart, no WAL recovery)
 
 ### Write Path
 ```

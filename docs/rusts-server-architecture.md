@@ -244,16 +244,41 @@ pub struct AppState {
 | /query | POST | Query data (JSON) |
 | /stats | GET | Database statistics |
 
-## Graceful Shutdown (main.rs:483-491)
+## Graceful Shutdown (main.rs:545-580)
+
+Handles both SIGINT (Ctrl+C) and SIGTERM signals for graceful shutdown:
 
 ```rust
 tokio::spawn(async move {
-    tokio::signal::ctrl_c().await.ok();
-    info!("Shutdown signal received");
-    storage_clone.shutdown().expect("Failed to shutdown storage");
+    let ctrl_c = tokio::signal::ctrl_c();
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    tokio::select! {
+        _ = ctrl_c => info!("SIGINT received"),
+        _ = terminate => info!("SIGTERM received"),
+    }
+
+    storage.shutdown().expect("Failed to shutdown storage");
     std::process::exit(0);
 });
 ```
+
+**Shutdown Sequence:**
+1. Signal received (SIGINT or SIGTERM)
+2. Storage engine shutdown called
+   - Flushes active memtable to partitions
+   - Updates WAL checkpoint
+   - Syncs WAL to disk
+3. Process exits cleanly
+
+**Result:** After graceful shutdown, server restarts instantly with no WAL recovery needed.
 
 ## Dependencies
 

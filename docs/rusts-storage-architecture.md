@@ -57,7 +57,28 @@ pub struct StorageEngine {
 2. Initialize WalWriter with durability mode
 3. Create PartitionManager
 4. Spawn background flusher thread
-5. Perform WAL recovery
+5. Load checkpoint from disk (if exists)
+6. Perform WAL recovery (skips entries ≤ checkpoint)
+
+### Shutdown (engine.rs:267-315)
+
+Clean shutdown ensures no WAL recovery is needed on restart:
+
+```
+shutdown()
+    ↓
+1. Set running = false
+    ↓
+2. If memtable has data:
+   ├─ Flush to partitions (synchronous)
+   └─ Update checkpoint to current WAL sequence
+    ↓
+3. Send Shutdown command to background flusher
+    ↓
+4. Sync WAL to disk
+```
+
+**Result:** After clean shutdown, restart is instant (no WAL recovery needed).
 
 ## Write Path
 
@@ -156,10 +177,30 @@ bytes 28-31: padding
 
 ### WAL Recovery (wal/reader.rs)
 
-- Reads all WAL files in sequence order
-- Validates checksums
+- Uses binary search to efficiently skip already-flushed WAL files
+- Only reads files that may contain entries after the checkpoint
+- Validates checksums on read entries
 - Handles truncated entries gracefully
 - Supports `read_from(start_sequence)` for incremental reads
+- `read_after_checkpoint(seq)` returns entries > checkpoint with file skip stats
+
+### WAL Checkpoint (engine.rs)
+
+The checkpoint file (`wal_checkpoint`) tracks the last WAL sequence number that has been successfully flushed to segments.
+
+**File Location:** `{data_dir}/wal_checkpoint`
+
+**Format:** Plain text containing the sequence number
+
+**Usage:**
+- Loaded on startup to determine which WAL entries need recovery
+- Updated after each successful memtable flush to segments
+- Updated during clean shutdown after final memtable flush
+
+**Recovery Behavior:**
+- If checkpoint exists: Only recover entries with sequence > checkpoint
+- If no checkpoint: Recover all WAL entries (fresh start or crash recovery)
+- Binary search efficiently skips files where all entries ≤ checkpoint
 
 ### WAL Retention (engine.rs:306-371)
 
