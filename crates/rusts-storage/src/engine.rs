@@ -213,6 +213,235 @@ impl StorageEngine {
         Ok(all_points)
     }
 
+    /// Query points with early termination for LIMIT queries.
+    ///
+    /// Returns (points, total_scanned) where:
+    /// - points: up to `limit` points in the requested order
+    /// - total_scanned: total number of points seen (for pagination info)
+    ///
+    /// This method queries partitions in time order and terminates early
+    /// when remaining partitions cannot contribute to the result.
+    pub fn query_with_limit(
+        &self,
+        series_id: SeriesId,
+        time_range: &TimeRange,
+        limit: usize,
+        ascending: bool,
+    ) -> Result<(Vec<MemTablePoint>, usize)> {
+        let mut total_scanned = 0;
+
+        // Collect all memtable points first (can't skip - might have any timestamps)
+        let mut memtable_points = Vec::new();
+        {
+            let memtable = self.active_memtable.read();
+            memtable_points.extend(memtable.query(series_id, time_range));
+        }
+        {
+            let immutables = self.immutable_memtables.read();
+            for memtable in immutables.iter() {
+                memtable_points.extend(memtable.query(series_id, time_range));
+            }
+        }
+        total_scanned += memtable_points.len();
+
+        // Get partitions in time order
+        let mut partitions = self.partitions.get_partitions_for_range(time_range);
+        if !ascending {
+            // Reverse for descending order (newest first)
+            partitions.reverse();
+        }
+
+        if ascending {
+            // Ascending: use max-heap to track K smallest timestamps
+            self.query_with_limit_asc(
+                series_id,
+                time_range,
+                limit,
+                memtable_points,
+                partitions,
+                total_scanned,
+            )
+        } else {
+            // Descending: use min-heap to track K largest timestamps
+            self.query_with_limit_desc(
+                series_id,
+                time_range,
+                limit,
+                memtable_points,
+                partitions,
+                total_scanned,
+            )
+        }
+    }
+
+    /// Query with limit, ascending order (smallest timestamps first)
+    fn query_with_limit_asc(
+        &self,
+        series_id: SeriesId,
+        time_range: &TimeRange,
+        limit: usize,
+        memtable_points: Vec<MemTablePoint>,
+        partitions: Vec<&crate::partition::Partition>,
+        mut total_scanned: usize,
+    ) -> Result<(Vec<MemTablePoint>, usize)> {
+        use std::cmp::Ordering;
+        use std::collections::BinaryHeap;
+
+        // Wrapper for heap that compares by timestamp only (max-heap)
+        struct TsPoint(i64, MemTablePoint);
+        impl PartialEq for TsPoint {
+            fn eq(&self, other: &Self) -> bool {
+                self.0 == other.0
+            }
+        }
+        impl Eq for TsPoint {}
+        impl PartialOrd for TsPoint {
+            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        impl Ord for TsPoint {
+            fn cmp(&self, other: &Self) -> Ordering {
+                self.0.cmp(&other.0) // Max-heap by timestamp
+            }
+        }
+
+        // Max-heap to track K smallest timestamps (largest of the K at top for eviction)
+        let mut heap: BinaryHeap<TsPoint> = BinaryHeap::with_capacity(limit + 1);
+
+        // Add memtable points to heap
+        for point in memtable_points {
+            let ts = point.timestamp;
+            if heap.len() < limit {
+                heap.push(TsPoint(ts, point));
+            } else if let Some(max_entry) = heap.peek() {
+                if ts < max_entry.0 {
+                    heap.pop();
+                    heap.push(TsPoint(ts, point));
+                }
+            }
+        }
+
+        // Query partitions (oldest first for ascending)
+        for partition in partitions {
+            // Early termination: if heap is full and partition starts after our max timestamp,
+            // no points from this or later partitions can improve our result
+            if heap.len() >= limit {
+                if let Some(max_entry) = heap.peek() {
+                    if partition.time_range().start > max_entry.0 {
+                        break;
+                    }
+                }
+            }
+
+            let points = partition.query(series_id, time_range)?;
+            total_scanned += points.len();
+
+            for point in points {
+                let ts = point.timestamp;
+                if heap.len() < limit {
+                    heap.push(TsPoint(ts, point));
+                } else if let Some(max_entry) = heap.peek() {
+                    if ts < max_entry.0 {
+                        heap.pop();
+                        heap.push(TsPoint(ts, point));
+                    }
+                }
+            }
+        }
+
+        // Extract results in ascending order
+        // Note: Don't dedup here - multiple points can have the same timestamp
+        let mut results: Vec<_> = heap.into_iter().map(|tp| tp.1).collect();
+        results.sort_by_key(|p| p.timestamp);
+
+        Ok((results, total_scanned))
+    }
+
+    /// Query with limit, descending order (largest timestamps first)
+    fn query_with_limit_desc(
+        &self,
+        series_id: SeriesId,
+        time_range: &TimeRange,
+        limit: usize,
+        memtable_points: Vec<MemTablePoint>,
+        partitions: Vec<&crate::partition::Partition>,
+        mut total_scanned: usize,
+    ) -> Result<(Vec<MemTablePoint>, usize)> {
+        use std::cmp::Ordering;
+        use std::collections::BinaryHeap;
+
+        // Wrapper for heap that compares by timestamp only (min-heap via reversed comparison)
+        struct TsPointDesc(i64, MemTablePoint);
+        impl PartialEq for TsPointDesc {
+            fn eq(&self, other: &Self) -> bool {
+                self.0 == other.0
+            }
+        }
+        impl Eq for TsPointDesc {}
+        impl PartialOrd for TsPointDesc {
+            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        impl Ord for TsPointDesc {
+            fn cmp(&self, other: &Self) -> Ordering {
+                other.0.cmp(&self.0) // Min-heap by timestamp (reversed)
+            }
+        }
+
+        // Min-heap to track K largest timestamps (smallest of the K at top for eviction)
+        let mut heap: BinaryHeap<TsPointDesc> = BinaryHeap::with_capacity(limit + 1);
+
+        // Add memtable points to heap
+        for point in memtable_points {
+            let ts = point.timestamp;
+            if heap.len() < limit {
+                heap.push(TsPointDesc(ts, point));
+            } else if let Some(min_entry) = heap.peek() {
+                if ts > min_entry.0 {
+                    heap.pop();
+                    heap.push(TsPointDesc(ts, point));
+                }
+            }
+        }
+
+        // Query partitions (newest first for descending)
+        for partition in partitions {
+            // Early termination: if heap is full and partition ends before our min timestamp,
+            // no points from this or earlier partitions can improve our result
+            if heap.len() >= limit {
+                if let Some(min_entry) = heap.peek() {
+                    if partition.time_range().end <= min_entry.0 {
+                        break;
+                    }
+                }
+            }
+
+            let points = partition.query(series_id, time_range)?;
+            total_scanned += points.len();
+
+            for point in points {
+                let ts = point.timestamp;
+                if heap.len() < limit {
+                    heap.push(TsPointDesc(ts, point));
+                } else if let Some(min_entry) = heap.peek() {
+                    if ts > min_entry.0 {
+                        heap.pop();
+                        heap.push(TsPointDesc(ts, point));
+                    }
+                }
+            }
+        }
+
+        // Extract results in descending order
+        // Note: Don't dedup here - multiple points can have the same timestamp
+        let mut results: Vec<_> = heap.into_iter().map(|tp| tp.1).collect();
+        results.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+
+        Ok((results, total_scanned))
+    }
+
     /// Query points by measurement name
     pub fn query_measurement(
         &self,

@@ -547,7 +547,8 @@ impl QueryExecutor {
         })
     }
 
-    /// Collect top K rows by ascending timestamp using a max-heap
+    /// Collect top K rows by ascending timestamp.
+    /// Uses storage-level early termination for single-series queries.
     fn collect_top_k_asc(
         &self,
         query: &Query,
@@ -556,6 +557,12 @@ impl QueryExecutor {
         cancel: Option<&CancellationToken>,
     ) -> Result<(Vec<ResultRow>, usize)> {
         let mut collector = TopKCollector::new(k);
+        let mut total_seen = 0;
+
+        // Use storage-level early termination only for single-series queries.
+        // For multi-series queries, early termination per-series can miss rows
+        // because series timestamps are interleaved across partitions.
+        let use_early_termination = series_ids.len() == 1;
 
         for &series_id in series_ids {
             if let Some(cancel) = cancel {
@@ -564,27 +571,48 @@ impl QueryExecutor {
                 }
             }
 
-            let points = self.storage.query(series_id, &query.time_range)?;
             let series_meta = self.series_index.get(series_id);
             let tags = series_meta.map(|m| m.tags).unwrap_or_default();
 
-            for point in points {
-                let fields = self.filter_fields(&point.fields, &query.field_selection);
-                collector.push(ResultRow {
-                    timestamp: Some(point.timestamp),
-                    series_id,
-                    tags: tags.clone(),
-                    fields,
-                });
+            if use_early_termination {
+                // Single series: use storage-level early termination
+                let (points, scanned) = self
+                    .storage
+                    .query_with_limit(series_id, &query.time_range, k, true)?;
+                total_seen += scanned;
+
+                for point in points {
+                    let fields = self.filter_fields(&point.fields, &query.field_selection);
+                    collector.push(ResultRow {
+                        timestamp: Some(point.timestamp),
+                        series_id,
+                        tags: tags.clone(),
+                        fields,
+                    });
+                }
+            } else {
+                // Multiple series: query all points, use heap for bounded collection
+                let points = self.storage.query(series_id, &query.time_range)?;
+                total_seen += points.len();
+
+                for point in points {
+                    let fields = self.filter_fields(&point.fields, &query.field_selection);
+                    collector.push(ResultRow {
+                        timestamp: Some(point.timestamp),
+                        series_id,
+                        tags: tags.clone(),
+                        fields,
+                    });
+                }
             }
         }
 
-        let total_seen = collector.total_seen();
         let rows = collector.into_sorted_vec();
         Ok((rows, total_seen))
     }
 
-    /// Collect top K rows by descending timestamp using a min-heap
+    /// Collect top K rows by descending timestamp.
+    /// Uses storage-level early termination for single-series queries.
     fn collect_top_k_desc(
         &self,
         query: &Query,
@@ -593,6 +621,10 @@ impl QueryExecutor {
         cancel: Option<&CancellationToken>,
     ) -> Result<(Vec<ResultRow>, usize)> {
         let mut collector = TopKCollectorDesc::new(k);
+        let mut total_seen = 0;
+
+        // Use storage-level early termination only for single-series queries.
+        let use_early_termination = series_ids.len() == 1;
 
         for &series_id in series_ids {
             if let Some(cancel) = cancel {
@@ -601,22 +633,42 @@ impl QueryExecutor {
                 }
             }
 
-            let points = self.storage.query(series_id, &query.time_range)?;
             let series_meta = self.series_index.get(series_id);
             let tags = series_meta.map(|m| m.tags).unwrap_or_default();
 
-            for point in points {
-                let fields = self.filter_fields(&point.fields, &query.field_selection);
-                collector.push(ResultRow {
-                    timestamp: Some(point.timestamp),
-                    series_id,
-                    tags: tags.clone(),
-                    fields,
-                });
+            if use_early_termination {
+                // Single series: use storage-level early termination
+                let (points, scanned) = self
+                    .storage
+                    .query_with_limit(series_id, &query.time_range, k, false)?;
+                total_seen += scanned;
+
+                for point in points {
+                    let fields = self.filter_fields(&point.fields, &query.field_selection);
+                    collector.push(ResultRow {
+                        timestamp: Some(point.timestamp),
+                        series_id,
+                        tags: tags.clone(),
+                        fields,
+                    });
+                }
+            } else {
+                // Multiple series: query all points, use heap for bounded collection
+                let points = self.storage.query(series_id, &query.time_range)?;
+                total_seen += points.len();
+
+                for point in points {
+                    let fields = self.filter_fields(&point.fields, &query.field_selection);
+                    collector.push(ResultRow {
+                        timestamp: Some(point.timestamp),
+                        series_id,
+                        tags: tags.clone(),
+                        fields,
+                    });
+                }
             }
         }
 
-        let total_seen = collector.total_seen();
         let rows = collector.into_sorted_vec();
         Ok((rows, total_seen))
     }
