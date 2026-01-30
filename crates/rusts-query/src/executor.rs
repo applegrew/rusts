@@ -1,9 +1,14 @@
 //! Query executor
+//!
+//! Uses rayon for parallel query execution across multiple series.
 
 use crate::aggregation::{AggregateFunction, Aggregator, TimeBucketAggregator};
 use crate::error::{QueryError, Result};
 use crate::model::{FieldSelection, Query, QueryResult, ResultRow, TagFilter};
 use crate::planner::{QueryOptimizer, QueryPlanner};
+use once_cell::sync::Lazy;
+use parking_lot::RwLock;
+use rayon::prelude::*;
 use rusts_core::{FieldValue, SeriesId, Tag};
 use rusts_index::{SeriesIndex, TagIndex};
 use rusts_storage::StorageEngine;
@@ -11,6 +16,34 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
+
+/// Global regex cache to avoid recompiling patterns
+static REGEX_CACHE: Lazy<RwLock<HashMap<String, regex::Regex>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+
+/// Get or compile a regex pattern (cached)
+fn get_or_compile_regex(pattern: &str) -> Option<regex::Regex> {
+    // Try to get from cache first (read lock)
+    {
+        let cache = REGEX_CACHE.read();
+        if let Some(re) = cache.get(pattern) {
+            return Some(re.clone());
+        }
+    }
+
+    // Compile and cache (write lock)
+    match regex::Regex::new(pattern) {
+        Ok(re) => {
+            let mut cache = REGEX_CACHE.write();
+            // Double-check in case another thread compiled it
+            if !cache.contains_key(pattern) {
+                cache.insert(pattern.to_string(), re.clone());
+            }
+            Some(re)
+        }
+        Err(_) => None,
+    }
+}
 
 /// Query executor for running queries against the storage engine
 pub struct QueryExecutor {
@@ -179,7 +212,8 @@ impl QueryExecutor {
                     });
                 }
                 TagFilter::Regex { key, pattern } => {
-                    if let Ok(re) = regex::Regex::new(pattern) {
+                    // Use cached regex to avoid recompilation
+                    if let Some(re) = get_or_compile_regex(pattern) {
                         result.retain(|id| {
                             if let Some(meta) = self.series_index.get(*id) {
                                 meta.tags.iter().any(|t| &t.key == key && re.is_match(&t.value))
@@ -195,41 +229,76 @@ impl QueryExecutor {
         Ok(result)
     }
 
-    /// Execute a SELECT query (raw data)
+    /// Execute a SELECT query (raw data) with parallel series processing
     fn execute_select(
         &self,
         query: &Query,
         series_ids: &[SeriesId],
         cancel: Option<&CancellationToken>,
     ) -> Result<QueryResult> {
-        let mut rows = Vec::new();
+        // Use parallel processing for multiple series (threshold: 4+ series)
+        let rows = if series_ids.len() >= 4 && cancel.is_none() {
+            // Parallel path using rayon (only when not cancellable for simplicity)
+            let results: Vec<Result<Vec<ResultRow>>> = series_ids
+                .par_iter()
+                .map(|&series_id| {
+                    let points = self.storage.query(series_id, &query.time_range)?;
+                    let series_meta = self.series_index.get(series_id);
+                    let tags = series_meta.map(|m| m.tags).unwrap_or_default();
 
-        for &series_id in series_ids {
-            // Check cancellation before each series
-            if let Some(cancel) = cancel {
-                if cancel.is_cancelled() {
-                    return Err(QueryError::Cancelled);
+                    let mut series_rows = Vec::with_capacity(points.len());
+                    for point in points {
+                        let fields = self.filter_fields(&point.fields, &query.field_selection);
+                        series_rows.push(ResultRow {
+                            timestamp: Some(point.timestamp),
+                            series_id,
+                            tags: tags.clone(),
+                            fields,
+                        });
+                    }
+                    Ok(series_rows)
+                })
+                .collect();
+
+            // Collect and flatten results
+            let mut all_rows = Vec::new();
+            for result in results {
+                all_rows.extend(result?);
+            }
+            all_rows
+        } else {
+            // Sequential path (for cancellation support or small queries)
+            let mut rows = Vec::new();
+
+            for &series_id in series_ids {
+                // Check cancellation before each series
+                if let Some(cancel) = cancel {
+                    if cancel.is_cancelled() {
+                        return Err(QueryError::Cancelled);
+                    }
+                }
+
+                let points = self.storage.query(series_id, &query.time_range)?;
+
+                let series_meta = self.series_index.get(series_id);
+                let tags = series_meta.map(|m| m.tags).unwrap_or_default();
+
+                for point in points {
+                    let fields = self.filter_fields(&point.fields, &query.field_selection);
+
+                    rows.push(ResultRow {
+                        timestamp: Some(point.timestamp),
+                        series_id,
+                        tags: tags.clone(),
+                        fields,
+                    });
                 }
             }
-
-            let points = self.storage.query(series_id, &query.time_range)?;
-
-            let series_meta = self.series_index.get(series_id);
-            let tags = series_meta.map(|m| m.tags).unwrap_or_default();
-
-            for point in points {
-                let fields = self.filter_fields(&point.fields, &query.field_selection);
-
-                rows.push(ResultRow {
-                    timestamp: Some(point.timestamp),
-                    series_id,
-                    tags: tags.clone(),
-                    fields,
-                });
-            }
-        }
+            rows
+        };
 
         // Sort by timestamp
+        let mut rows = rows;
         rows.sort_by_key(|r| r.timestamp);
 
         let total_rows = rows.len();
@@ -242,7 +311,7 @@ impl QueryExecutor {
         })
     }
 
-    /// Execute an aggregate query
+    /// Execute an aggregate query with parallel series processing
     fn execute_aggregate(
         &self,
         query: &Query,
@@ -268,25 +337,54 @@ impl QueryExecutor {
             );
         }
 
-        // Simple aggregation over all data
-        let mut aggregator = Aggregator::new(function);
+        // Simple aggregation over all data - use parallel processing for many series
+        let aggregator = if series_ids.len() >= 4 && cancel.is_none() {
+            // Parallel path: each thread gets its own aggregator, then merge
+            let field_clone = field.to_string();
+            let partial_results: Vec<Result<Aggregator>> = series_ids
+                .par_iter()
+                .map(|&series_id| {
+                    let points = self.storage.query(series_id, &query.time_range)?;
+                    let mut local_agg = Aggregator::new(function);
 
-        for &series_id in series_ids {
-            // Check cancellation before each series
-            if let Some(cancel) = cancel {
-                if cancel.is_cancelled() {
-                    return Err(QueryError::Cancelled);
+                    for point in points {
+                        if let Some((_, value)) = point.fields.iter().find(|(k, _)| k == &field_clone) {
+                            local_agg.add(value);
+                        }
+                    }
+                    Ok(local_agg)
+                })
+                .collect();
+
+            // Merge all partial aggregators
+            let mut final_agg = Aggregator::new(function);
+            for result in partial_results {
+                let partial = result?;
+                final_agg.merge(&partial);
+            }
+            final_agg
+        } else {
+            // Sequential path
+            let mut aggregator = Aggregator::new(function);
+
+            for &series_id in series_ids {
+                // Check cancellation before each series
+                if let Some(cancel) = cancel {
+                    if cancel.is_cancelled() {
+                        return Err(QueryError::Cancelled);
+                    }
+                }
+
+                let points = self.storage.query(series_id, &query.time_range)?;
+
+                for point in points {
+                    if let Some((_, value)) = point.fields.iter().find(|(k, _)| k == field) {
+                        aggregator.add(value);
+                    }
                 }
             }
-
-            let points = self.storage.query(series_id, &query.time_range)?;
-
-            for point in points {
-                if let Some((_, value)) = point.fields.iter().find(|(k, _)| k == field) {
-                    aggregator.add(value);
-                }
-            }
-        }
+            aggregator
+        };
 
         let mut fields = HashMap::new();
         if let Some(value) = aggregator.result() {

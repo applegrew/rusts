@@ -20,6 +20,8 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 regex = "1.10"
+rayon = { workspace = true }
+once_cell = { workspace = true }
 
 [dev-dependencies]
 rand = { workspace = true }

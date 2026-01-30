@@ -6,6 +6,7 @@
 //! - **Dictionary encoding**: For strings/tags (3-10x)
 //! - **Block compression**: LZ4 (fast) / Zstd (ratio)
 
+pub mod bits;
 pub mod block;
 pub mod dictionary;
 pub mod error;

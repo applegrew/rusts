@@ -16,13 +16,13 @@
 //! - If |DoD| <= 2047: '1110' + 12 bits
 //! - Otherwise: '1111' + 64 bits
 
-use crate::error::{CompressionError, Result};
+use crate::bits::{BitReader, BitWriter};
+use crate::error::Result;
 use rusts_core::Timestamp;
 
 /// Delta-of-delta timestamp encoder
 pub struct TimestampEncoder {
-    buffer: Vec<u8>,
-    bit_pos: u8,
+    writer: BitWriter,
     prev_timestamp: Timestamp,
     prev_delta: i64,
     count: usize,
@@ -32,8 +32,7 @@ impl TimestampEncoder {
     /// Create a new encoder
     pub fn new() -> Self {
         Self {
-            buffer: Vec::with_capacity(256),
-            bit_pos: 0,
+            writer: BitWriter::with_capacity(256),
             prev_timestamp: 0,
             prev_delta: 0,
             count: 0,
@@ -43,8 +42,7 @@ impl TimestampEncoder {
     /// Create encoder with capacity hint
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            buffer: Vec::with_capacity(capacity),
-            bit_pos: 0,
+            writer: BitWriter::with_capacity(capacity),
             prev_timestamp: 0,
             prev_delta: 0,
             count: 0,
@@ -52,10 +50,11 @@ impl TimestampEncoder {
     }
 
     /// Encode a timestamp
+    #[inline]
     pub fn encode(&mut self, timestamp: Timestamp) {
         if self.count == 0 {
             // First timestamp: store full 64 bits
-            self.write_bits(timestamp as u64, 64);
+            self.writer.write_u64(timestamp as u64);
             self.prev_timestamp = timestamp;
             self.count = 1;
             return;
@@ -84,7 +83,7 @@ impl TimestampEncoder {
 
     /// Finish encoding and return compressed bytes
     pub fn finish(self) -> Vec<u8> {
-        self.buffer
+        self.writer.finish()
     }
 
     /// Get the number of timestamps encoded
@@ -94,67 +93,50 @@ impl TimestampEncoder {
 
     /// Get current compressed size
     pub fn compressed_size(&self) -> usize {
-        self.buffer.len()
+        self.writer.len()
     }
 
+    #[inline]
     fn encode_delta(&mut self, delta: i64) {
         // Variable-length encoding for first delta
         if delta == 0 {
-            self.write_bit(false);
+            self.writer.write_bit(false);
         } else if delta >= -63 && delta <= 64 {
-            self.write_bits(0b10, 2);
-            self.write_bits(((delta + 63) as u64) & 0x7F, 7);
+            self.writer.write_bits(0b10, 2);
+            self.writer.write_bits(((delta + 63) as u64) & 0x7F, 7);
         } else if delta >= -255 && delta <= 256 {
-            self.write_bits(0b110, 3);
-            self.write_bits(((delta + 255) as u64) & 0x1FF, 9);
+            self.writer.write_bits(0b110, 3);
+            self.writer.write_bits(((delta + 255) as u64) & 0x1FF, 9);
         } else if delta >= -2047 && delta <= 2048 {
-            self.write_bits(0b1110, 4);
-            self.write_bits(((delta + 2047) as u64) & 0xFFF, 12);
+            self.writer.write_bits(0b1110, 4);
+            self.writer.write_bits(((delta + 2047) as u64) & 0xFFF, 12);
         } else {
-            self.write_bits(0b1111, 4);
-            self.write_bits(delta as u64, 64);
+            self.writer.write_bits(0b1111, 4);
+            self.writer.write_u64(delta as u64);
         }
     }
 
+    #[inline]
     fn encode_dod(&mut self, dod: i64) {
         if dod == 0 {
             // Single 0 bit for zero delta-of-delta
-            self.write_bit(false);
+            self.writer.write_bit(false);
         } else if dod >= -63 && dod <= 64 {
             // '10' prefix + 7 bits
-            self.write_bits(0b10, 2);
-            self.write_bits(((dod + 63) as u64) & 0x7F, 7);
+            self.writer.write_bits(0b10, 2);
+            self.writer.write_bits(((dod + 63) as u64) & 0x7F, 7);
         } else if dod >= -255 && dod <= 256 {
             // '110' prefix + 9 bits
-            self.write_bits(0b110, 3);
-            self.write_bits(((dod + 255) as u64) & 0x1FF, 9);
+            self.writer.write_bits(0b110, 3);
+            self.writer.write_bits(((dod + 255) as u64) & 0x1FF, 9);
         } else if dod >= -2047 && dod <= 2048 {
             // '1110' prefix + 12 bits
-            self.write_bits(0b1110, 4);
-            self.write_bits(((dod + 2047) as u64) & 0xFFF, 12);
+            self.writer.write_bits(0b1110, 4);
+            self.writer.write_bits(((dod + 2047) as u64) & 0xFFF, 12);
         } else {
             // '1111' prefix + 64 bits
-            self.write_bits(0b1111, 4);
-            self.write_bits(dod as u64, 64);
-        }
-    }
-
-    fn write_bit(&mut self, bit: bool) {
-        if self.bit_pos == 0 {
-            self.buffer.push(0);
-        }
-
-        if bit {
-            let idx = self.buffer.len() - 1;
-            self.buffer[idx] |= 1 << (7 - self.bit_pos);
-        }
-
-        self.bit_pos = (self.bit_pos + 1) % 8;
-    }
-
-    fn write_bits(&mut self, value: u64, num_bits: usize) {
-        for i in (0..num_bits).rev() {
-            self.write_bit((value >> i) & 1 == 1);
+            self.writer.write_bits(0b1111, 4);
+            self.writer.write_u64(dod as u64);
         }
     }
 }
@@ -167,9 +149,7 @@ impl Default for TimestampEncoder {
 
 /// Delta-of-delta timestamp decoder
 pub struct TimestampDecoder<'a> {
-    data: &'a [u8],
-    byte_idx: usize,
-    bit_pos: u8,
+    reader: BitReader<'a>,
     prev_timestamp: Timestamp,
     prev_delta: i64,
     count: usize,
@@ -180,9 +160,7 @@ impl<'a> TimestampDecoder<'a> {
     /// Create a new decoder
     pub fn new(data: &'a [u8], expected_count: usize) -> Self {
         Self {
-            data,
-            byte_idx: 0,
-            bit_pos: 0,
+            reader: BitReader::new(data),
             prev_timestamp: 0,
             prev_delta: 0,
             count: 0,
@@ -191,6 +169,7 @@ impl<'a> TimestampDecoder<'a> {
     }
 
     /// Decode the next timestamp
+    #[inline]
     pub fn decode(&mut self) -> Result<Option<Timestamp>> {
         if self.count >= self.expected_count {
             return Ok(None);
@@ -198,7 +177,7 @@ impl<'a> TimestampDecoder<'a> {
 
         let timestamp = if self.count == 0 {
             // First timestamp: read 64 bits
-            self.read_bits(64)? as Timestamp
+            self.reader.read_u64()? as Timestamp
         } else if self.count == 1 {
             // Second timestamp: read delta
             let delta = self.decode_delta()?;
@@ -226,80 +205,60 @@ impl<'a> TimestampDecoder<'a> {
         Ok(timestamps)
     }
 
+    #[inline]
     fn decode_delta(&mut self) -> Result<i64> {
-        if !self.read_bit()? {
+        if !self.reader.read_bit()? {
             return Ok(0);
         }
 
-        if !self.read_bit()? {
+        if !self.reader.read_bit()? {
             // '10' prefix
-            let val = self.read_bits(7)?;
+            let val = self.reader.read_bits(7)?;
             return Ok(val as i64 - 63);
         }
 
-        if !self.read_bit()? {
+        if !self.reader.read_bit()? {
             // '110' prefix
-            let val = self.read_bits(9)?;
+            let val = self.reader.read_bits(9)?;
             return Ok(val as i64 - 255);
         }
 
-        if !self.read_bit()? {
+        if !self.reader.read_bit()? {
             // '1110' prefix
-            let val = self.read_bits(12)?;
+            let val = self.reader.read_bits(12)?;
             return Ok(val as i64 - 2047);
         }
 
         // '1111' prefix - full 64 bits
-        Ok(self.read_bits(64)? as i64)
+        Ok(self.reader.read_u64()? as i64)
     }
 
+    #[inline]
     fn decode_dod(&mut self) -> Result<i64> {
-        if !self.read_bit()? {
+        if !self.reader.read_bit()? {
             return Ok(0);
         }
 
-        if !self.read_bit()? {
+        if !self.reader.read_bit()? {
             // '10' prefix
-            let val = self.read_bits(7)?;
+            let val = self.reader.read_bits(7)?;
             return Ok(val as i64 - 63);
         }
 
-        if !self.read_bit()? {
+        if !self.reader.read_bit()? {
             // '110' prefix
-            let val = self.read_bits(9)?;
+            let val = self.reader.read_bits(9)?;
             return Ok(val as i64 - 255);
         }
 
-        if !self.read_bit()? {
+        if !self.reader.read_bit()? {
             // '1110' prefix
-            let val = self.read_bits(12)?;
+            let val = self.reader.read_bits(12)?;
             return Ok(val as i64 - 2047);
         }
 
         // '1111' prefix - full 64 bits
-        Ok(self.read_bits(64)? as i64)
-    }
-
-    fn read_bit(&mut self) -> Result<bool> {
-        if self.byte_idx >= self.data.len() {
-            return Err(CompressionError::BufferUnderflow);
-        }
-
-        let bit = (self.data[self.byte_idx] >> (7 - self.bit_pos)) & 1 == 1;
-        self.bit_pos += 1;
-        if self.bit_pos == 8 {
-            self.bit_pos = 0;
-            self.byte_idx += 1;
-        }
-        Ok(bit)
-    }
-
-    fn read_bits(&mut self, num_bits: usize) -> Result<u64> {
-        let mut value = 0u64;
-        for _ in 0..num_bits {
-            value = (value << 1) | (self.read_bit()? as u64);
-        }
-        Ok(value)
+        Ok(self.reader.read_u64()? as i64)
     }
 }
 

@@ -1,4 +1,9 @@
 //! Aggregation functions for time series data
+//!
+//! Uses optimized streaming algorithms where possible:
+//! - Welford's algorithm for mean/variance/stddev (single-pass)
+//! - Running min/max/sum/count without storing values
+//! - Only stores values when necessary (First, Last, Percentile)
 
 use crate::error::{QueryError, Result};
 use rusts_core::FieldValue;
@@ -60,11 +65,99 @@ impl AggregateFunction {
             _ => Err(QueryError::InvalidAggregation(s.to_string())),
         }
     }
+
+    /// Returns true if this aggregation requires storing all values
+    #[inline]
+    fn requires_stored_values(&self) -> bool {
+        matches!(self, AggregateFunction::First | AggregateFunction::Last | AggregateFunction::Percentile(_))
+    }
 }
 
-/// Aggregator for computing aggregate values
+/// Streaming state for Welford's algorithm (mean/variance/stddev)
+#[derive(Default)]
+struct WelfordState {
+    count: u64,
+    mean: f64,
+    m2: f64, // Sum of squared deviations from mean
+}
+
+impl WelfordState {
+    #[inline]
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add a value using Welford's online algorithm
+    #[inline]
+    fn add(&mut self, value: f64) {
+        self.count += 1;
+        let delta = value - self.mean;
+        self.mean += delta / self.count as f64;
+        let delta2 = value - self.mean;
+        self.m2 += delta * delta2;
+    }
+
+    /// Merge another Welford state into this one (parallel Welford algorithm)
+    ///
+    /// This allows combining variance computations from parallel streams.
+    #[inline]
+    fn merge(&mut self, other: &WelfordState) {
+        if other.count == 0 {
+            return;
+        }
+        if self.count == 0 {
+            *self = WelfordState {
+                count: other.count,
+                mean: other.mean,
+                m2: other.m2,
+            };
+            return;
+        }
+
+        let combined_count = self.count + other.count;
+        let delta = other.mean - self.mean;
+
+        // Combined mean
+        let combined_mean = self.mean + delta * other.count as f64 / combined_count as f64;
+
+        // Combined M2 using parallel Welford formula
+        let combined_m2 = self.m2 + other.m2
+            + delta * delta * self.count as f64 * other.count as f64 / combined_count as f64;
+
+        self.count = combined_count;
+        self.mean = combined_mean;
+        self.m2 = combined_m2;
+    }
+
+    #[inline]
+    fn variance(&self) -> f64 {
+        if self.count < 2 {
+            0.0
+        } else {
+            self.m2 / (self.count - 1) as f64
+        }
+    }
+
+    #[inline]
+    fn stddev(&self) -> f64 {
+        self.variance().sqrt()
+    }
+}
+
+/// Aggregator for computing aggregate values using streaming algorithms
 pub struct Aggregator {
     function: AggregateFunction,
+    /// Running count
+    count: u64,
+    /// Running sum
+    sum: f64,
+    /// Running min
+    min: f64,
+    /// Running max
+    max: f64,
+    /// Welford state for variance/stddev
+    welford: WelfordState,
+    /// Stored values (only used for First, Last, Percentile)
     values: Vec<f64>,
 }
 
@@ -73,16 +166,50 @@ impl Aggregator {
     pub fn new(function: AggregateFunction) -> Self {
         Self {
             function,
-            values: Vec::new(),
+            count: 0,
+            sum: 0.0,
+            min: f64::INFINITY,
+            max: f64::NEG_INFINITY,
+            welford: WelfordState::new(),
+            values: if function.requires_stored_values() {
+                Vec::new()
+            } else {
+                Vec::new() // Won't be used but keeps size predictable
+            },
         }
     }
 
     /// Add a value to the aggregation
+    #[inline]
     pub fn add(&mut self, value: &FieldValue) {
         if let Some(v) = value.as_f64() {
             if !v.is_nan() {
-                self.values.push(v);
+                self.add_f64(v);
             }
+        }
+    }
+
+    /// Add a f64 value directly (internal fast path)
+    #[inline]
+    fn add_f64(&mut self, v: f64) {
+        // Update streaming aggregates
+        self.count += 1;
+        self.sum += v;
+
+        // Update min/max (branchless would be ideal but this is clear)
+        if v < self.min {
+            self.min = v;
+        }
+        if v > self.max {
+            self.max = v;
+        }
+
+        // Update Welford state for variance/stddev
+        self.welford.add(v);
+
+        // Store value only if needed
+        if self.function.requires_stored_values() {
+            self.values.push(v);
         }
     }
 
@@ -95,7 +222,7 @@ impl Aggregator {
 
     /// Compute the aggregate result
     pub fn result(&self) -> Option<FieldValue> {
-        if self.values.is_empty() {
+        if self.count == 0 {
             return match self.function {
                 AggregateFunction::Count => Some(FieldValue::Integer(0)),
                 _ => None,
@@ -103,55 +230,37 @@ impl Aggregator {
         }
 
         match self.function {
-            AggregateFunction::Count => Some(FieldValue::Integer(self.values.len() as i64)),
+            AggregateFunction::Count => Some(FieldValue::Integer(self.count as i64)),
 
-            AggregateFunction::Sum => {
-                let sum: f64 = self.values.iter().sum();
-                Some(FieldValue::Float(sum))
+            AggregateFunction::Sum => Some(FieldValue::Float(self.sum)),
+
+            AggregateFunction::Mean => Some(FieldValue::Float(self.sum / self.count as f64)),
+
+            AggregateFunction::Min => Some(FieldValue::Float(self.min)),
+
+            AggregateFunction::Max => Some(FieldValue::Float(self.max)),
+
+            AggregateFunction::First => {
+                self.values.first().map(|&v| FieldValue::Float(v))
             }
 
-            AggregateFunction::Mean => {
-                let sum: f64 = self.values.iter().sum();
-                Some(FieldValue::Float(sum / self.values.len() as f64))
+            AggregateFunction::Last => {
+                self.values.last().map(|&v| FieldValue::Float(v))
             }
-
-            AggregateFunction::Min => {
-                let min = self.values.iter().cloned().fold(f64::INFINITY, f64::min);
-                Some(FieldValue::Float(min))
-            }
-
-            AggregateFunction::Max => {
-                let max = self.values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                Some(FieldValue::Float(max))
-            }
-
-            AggregateFunction::First => Some(FieldValue::Float(self.values[0])),
-
-            AggregateFunction::Last => Some(FieldValue::Float(*self.values.last().unwrap())),
 
             AggregateFunction::StdDev => {
-                if self.values.len() < 2 {
-                    return Some(FieldValue::Float(0.0));
-                }
-                let mean: f64 = self.values.iter().sum::<f64>() / self.values.len() as f64;
-                let variance: f64 = self.values.iter()
-                    .map(|v| (v - mean).powi(2))
-                    .sum::<f64>() / (self.values.len() - 1) as f64;
-                Some(FieldValue::Float(variance.sqrt()))
+                Some(FieldValue::Float(self.welford.stddev()))
             }
 
             AggregateFunction::Variance => {
-                if self.values.len() < 2 {
-                    return Some(FieldValue::Float(0.0));
-                }
-                let mean: f64 = self.values.iter().sum::<f64>() / self.values.len() as f64;
-                let variance: f64 = self.values.iter()
-                    .map(|v| (v - mean).powi(2))
-                    .sum::<f64>() / (self.values.len() - 1) as f64;
-                Some(FieldValue::Float(variance))
+                Some(FieldValue::Float(self.welford.variance()))
             }
 
             AggregateFunction::Percentile(p) => {
+                if self.values.is_empty() {
+                    return None;
+                }
+
                 let mut sorted = self.values.clone();
                 sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -170,14 +279,51 @@ impl Aggregator {
         }
     }
 
+    /// Merge another aggregator into this one (for parallel aggregation)
+    ///
+    /// Combines the state from two aggregators that processed different data.
+    /// Useful for parallelizing aggregation across multiple series.
+    pub fn merge(&mut self, other: &Aggregator) {
+        if other.count == 0 {
+            return;
+        }
+
+        // Merge streaming aggregates
+        self.count += other.count;
+        self.sum += other.sum;
+
+        if other.min < self.min {
+            self.min = other.min;
+        }
+        if other.max > self.max {
+            self.max = other.max;
+        }
+
+        // Merge Welford state (for variance/stddev)
+        self.welford.merge(&other.welford);
+
+        // Merge stored values (for First, Last, Percentile)
+        // Note: For First/Last, order matters - we append other's values
+        // which may not preserve global ordering. This is acceptable for
+        // parallel aggregation where we don't have a global timestamp order.
+        if self.function.requires_stored_values() {
+            self.values.extend_from_slice(&other.values);
+        }
+    }
+
     /// Reset the aggregator
     pub fn reset(&mut self) {
+        self.count = 0;
+        self.sum = 0.0;
+        self.min = f64::INFINITY;
+        self.max = f64::NEG_INFINITY;
+        self.welford = WelfordState::new();
         self.values.clear();
     }
 
     /// Get the number of values
     pub fn count(&self) -> usize {
-        self.values.len()
+        self.count as usize
     }
 }
 
@@ -222,6 +368,7 @@ impl TimeBucketAggregator {
     }
 
     /// Add a value with timestamp
+    #[inline]
     pub fn add(&mut self, timestamp: i64, value: &FieldValue) {
         // Use checked subtraction to handle timestamps before start
         if let Some(offset) = timestamp.checked_sub(self.start) {
@@ -557,5 +704,147 @@ mod tests {
         let results = agg.results();
         // First bucket should be empty since the value was before start
         assert!(results[0].1.is_none());
+    }
+
+    #[test]
+    fn test_welford_accuracy() {
+        // Test that Welford's algorithm gives same results as two-pass
+        let values: Vec<f64> = (1..=1000).map(|i| i as f64).collect();
+
+        // Using Aggregator (Welford)
+        let mut agg = Aggregator::new(AggregateFunction::StdDev);
+        for v in &values {
+            agg.add(&FieldValue::Float(*v));
+        }
+        let welford_stddev = if let Some(FieldValue::Float(v)) = agg.result() { v } else { panic!() };
+
+        // Two-pass calculation
+        let mean: f64 = values.iter().sum::<f64>() / values.len() as f64;
+        let variance: f64 = values.iter()
+            .map(|v| (v - mean) * (v - mean))
+            .sum::<f64>() / (values.len() - 1) as f64;
+        let two_pass_stddev = variance.sqrt();
+
+        // Should be very close (within floating point precision)
+        assert!((welford_stddev - two_pass_stddev).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_aggregator_merge() {
+        // Test merging aggregators (used for parallel aggregation)
+        let values1: Vec<f64> = (1..=500).map(|i| i as f64).collect();
+        let values2: Vec<f64> = (501..=1000).map(|i| i as f64).collect();
+
+        // Single aggregator with all values
+        let mut single = Aggregator::new(AggregateFunction::Sum);
+        for v in values1.iter().chain(values2.iter()) {
+            single.add(&FieldValue::Float(*v));
+        }
+
+        // Two aggregators merged
+        let mut agg1 = Aggregator::new(AggregateFunction::Sum);
+        let mut agg2 = Aggregator::new(AggregateFunction::Sum);
+        for v in &values1 {
+            agg1.add(&FieldValue::Float(*v));
+        }
+        for v in &values2 {
+            agg2.add(&FieldValue::Float(*v));
+        }
+        agg1.merge(&agg2);
+
+        // Results should match
+        if let (Some(FieldValue::Float(s)), Some(FieldValue::Float(m))) = (single.result(), agg1.result()) {
+            assert!((s - m).abs() < f64::EPSILON, "Sum mismatch: {} vs {}", s, m);
+        } else {
+            panic!("Expected float results");
+        }
+    }
+
+    #[test]
+    fn test_aggregator_merge_mean() {
+        // Test that merged mean is correct
+        let mut agg1 = Aggregator::new(AggregateFunction::Mean);
+        let mut agg2 = Aggregator::new(AggregateFunction::Mean);
+
+        for v in [1.0, 2.0, 3.0] {
+            agg1.add(&FieldValue::Float(v));
+        }
+        for v in [4.0, 5.0, 6.0] {
+            agg2.add(&FieldValue::Float(v));
+        }
+
+        agg1.merge(&agg2);
+
+        // Mean of 1,2,3,4,5,6 = 3.5
+        if let Some(FieldValue::Float(v)) = agg1.result() {
+            assert!((v - 3.5).abs() < f64::EPSILON);
+        } else {
+            panic!("Expected float");
+        }
+    }
+
+    #[test]
+    fn test_aggregator_merge_min_max() {
+        let mut agg1 = Aggregator::new(AggregateFunction::Min);
+        let mut agg2 = Aggregator::new(AggregateFunction::Min);
+
+        agg1.add(&FieldValue::Float(5.0));
+        agg1.add(&FieldValue::Float(10.0));
+        agg2.add(&FieldValue::Float(3.0));
+        agg2.add(&FieldValue::Float(8.0));
+
+        agg1.merge(&agg2);
+
+        if let Some(FieldValue::Float(v)) = agg1.result() {
+            assert!((v - 3.0).abs() < f64::EPSILON);
+        } else {
+            panic!("Expected float");
+        }
+
+        // Test max
+        let mut agg1 = Aggregator::new(AggregateFunction::Max);
+        let mut agg2 = Aggregator::new(AggregateFunction::Max);
+
+        agg1.add(&FieldValue::Float(5.0));
+        agg1.add(&FieldValue::Float(10.0));
+        agg2.add(&FieldValue::Float(3.0));
+        agg2.add(&FieldValue::Float(15.0));
+
+        agg1.merge(&agg2);
+
+        if let Some(FieldValue::Float(v)) = agg1.result() {
+            assert!((v - 15.0).abs() < f64::EPSILON);
+        } else {
+            panic!("Expected float");
+        }
+    }
+
+    #[test]
+    fn test_aggregator_merge_stddev() {
+        // Verify parallel Welford gives same result as sequential
+        let values: Vec<f64> = (1..=100).map(|i| i as f64).collect();
+
+        // Sequential
+        let mut sequential = Aggregator::new(AggregateFunction::StdDev);
+        for v in &values {
+            sequential.add(&FieldValue::Float(*v));
+        }
+
+        // Parallel (split in half)
+        let mut agg1 = Aggregator::new(AggregateFunction::StdDev);
+        let mut agg2 = Aggregator::new(AggregateFunction::StdDev);
+        for v in &values[..50] {
+            agg1.add(&FieldValue::Float(*v));
+        }
+        for v in &values[50..] {
+            agg2.add(&FieldValue::Float(*v));
+        }
+        agg1.merge(&agg2);
+
+        if let (Some(FieldValue::Float(s)), Some(FieldValue::Float(m))) = (sequential.result(), agg1.result()) {
+            assert!((s - m).abs() < 1e-10, "StdDev mismatch: {} vs {}", s, m);
+        } else {
+            panic!("Expected float results");
+        }
     }
 }

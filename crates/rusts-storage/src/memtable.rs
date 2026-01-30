@@ -149,11 +149,111 @@ impl MemTable {
         Ok(())
     }
 
-    /// Insert multiple points
+    /// Insert multiple points (optimized batch operation)
+    ///
+    /// Groups points by series and performs batch updates to reduce
+    /// lock contention and atomic operations.
     pub fn insert_batch(&self, points: &[Point]) -> Result<()> {
-        for point in points {
-            self.insert(point)?;
+        if points.is_empty() {
+            return Ok(());
         }
+
+        if *self.sealed.read() {
+            return Err(StorageError::MemTableFull);
+        }
+
+        // Group points by series_id for batch processing
+        let mut by_series: std::collections::HashMap<SeriesId, Vec<&Point>> =
+            std::collections::HashMap::new();
+        for point in points {
+            by_series
+                .entry(point.series_id())
+                .or_default()
+                .push(point);
+        }
+
+        let mut total_size = 0usize;
+        let mut total_points = 0usize;
+        let mut min_timestamp: Option<Timestamp> = None;
+
+        // Process each series batch
+        for (series_id, series_points) in by_series {
+            // Convert points and calculate size
+            let mem_points: Vec<MemTablePoint> = series_points
+                .iter()
+                .map(|p| MemTablePoint::from_point(p))
+                .collect();
+
+            // Calculate size for all points in this series
+            let batch_size: usize = mem_points
+                .iter()
+                .map(|mp| {
+                    std::mem::size_of::<MemTablePoint>()
+                        + mp.fields
+                            .iter()
+                            .map(|(k, v)| {
+                                k.len()
+                                    + match v {
+                                        rusts_core::FieldValue::String(s) => s.len(),
+                                        _ => 8,
+                                    }
+                            })
+                            .sum::<usize>()
+                })
+                .sum();
+
+            total_size += batch_size;
+            total_points += mem_points.len();
+
+            // Track minimum timestamp
+            for mp in &mem_points {
+                match min_timestamp {
+                    None => min_timestamp = Some(mp.timestamp),
+                    Some(ts) if mp.timestamp < ts => min_timestamp = Some(mp.timestamp),
+                    _ => {}
+                }
+            }
+
+            // Get or create series entry and insert all points at once
+            let first_point = series_points[0];
+            self.series
+                .entry(series_id)
+                .or_insert_with(|| {
+                    // New series - add overhead (counted separately)
+                    let series_size = std::mem::size_of::<SeriesData>()
+                        + first_point.measurement.len()
+                        + first_point
+                            .tags
+                            .iter()
+                            .map(|t| t.key.len() + t.value.len())
+                            .sum::<usize>();
+                    total_size += series_size;
+
+                    SeriesData {
+                        measurement: first_point.measurement.clone(),
+                        tags: first_point.tags.clone(),
+                        points: RwLock::new(Vec::new()),
+                    }
+                })
+                .points
+                .write()
+                .extend(mem_points);
+        }
+
+        // Single atomic updates for all points
+        self.size.fetch_add(total_size, Ordering::Relaxed);
+        self.point_count.fetch_add(total_points, Ordering::Relaxed);
+
+        // Single lock acquisition for oldest timestamp
+        if let Some(new_min) = min_timestamp {
+            let mut oldest = self.oldest_timestamp.write();
+            match *oldest {
+                None => *oldest = Some(new_min),
+                Some(ts) if new_min < ts => *oldest = Some(new_min),
+                _ => {}
+            }
+        }
+
         Ok(())
     }
 
