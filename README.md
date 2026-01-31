@@ -564,6 +564,15 @@ curl -X POST 'http://localhost:8086/sql' \
 - [ ] Kubernetes operator
 - [ ] Continuous queries
 - [ ] Materialized views
+- [ ] **Continuous Aggregates**: Pre-computed aggregations maintained automatically on write:
+  ```sql
+  CREATE CONTINUOUS AGGREGATE hourly_metrics AS
+    SELECT time_bucket('1 hour', time) as bucket,
+           COUNT(*), AVG(value), SUM(value)
+    FROM metrics
+    GROUP BY bucket;
+  ```
+  Query from the aggregate table for instant results on large time ranges.
 
 ## License
 

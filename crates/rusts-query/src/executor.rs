@@ -317,6 +317,11 @@ impl QueryExecutor {
     }
 
     /// Resolve series IDs matching the query filters
+    ///
+    /// Uses bitmap operations for efficient filtering when possible:
+    /// - Equals filters use bitmap AND operations
+    /// - NotEquals filters use bitmap AND NOT operations
+    /// - In filters use bitmap OR followed by AND
     fn resolve_series_ids(
         &self,
         query: &Query,
@@ -333,8 +338,11 @@ impl QueryExecutor {
             return Ok(measurement_series);
         }
 
-        // Filter by tags
-        let mut result = measurement_series;
+        // Convert measurement series to bitmap for efficient filtering
+        let mut result_bitmap = self.tag_index.series_to_bitmap(&measurement_series);
+
+        // Track whether we need to fall back to per-series filtering for some filters
+        let mut needs_per_series_filter = Vec::new();
 
         for filter in &query.tag_filters {
             // Check cancellation before each filter
@@ -346,25 +354,54 @@ impl QueryExecutor {
 
             match filter {
                 TagFilter::Equals { key, value } => {
-                    let matching = self.tag_index.find_by_tag(key, value);
-                    let matching_set: std::collections::HashSet<_> = matching.into_iter().collect();
-                    result.retain(|id| matching_set.contains(id));
+                    // Use bitmap AND operation
+                    self.tag_index.intersect_with(key, value, &mut result_bitmap);
+                    if result_bitmap.is_empty() {
+                        return Ok(Vec::new());
+                    }
                 }
                 TagFilter::NotEquals { key, value } => {
-                    let matching = self.tag_index.find_by_tag(key, value);
-                    let matching_set: std::collections::HashSet<_> = matching.into_iter().collect();
-                    result.retain(|id| !matching_set.contains(id));
+                    // Get matching bitmap and subtract from result
+                    if let Some(matching_bitmap) = self.tag_index.find_by_tag_bitmap(key, value) {
+                        result_bitmap -= &matching_bitmap;
+                        if result_bitmap.is_empty() {
+                            return Ok(Vec::new());
+                        }
+                    }
+                    // If tag doesn't exist, all series pass the filter (no change needed)
                 }
                 TagFilter::In { key, values } => {
-                    let tags: Vec<Tag> = values.iter()
-                        .map(|v| Tag::new(key, v))
-                        .collect();
-                    let matching = self.tag_index.find_by_tags_any(&tags);
-                    let matching_set: std::collections::HashSet<_> = matching.into_iter().collect();
-                    result.retain(|id| matching_set.contains(id));
+                    // Build OR bitmap of all matching values, then AND with result
+                    let mut or_bitmap = roaring::RoaringBitmap::new();
+                    for value in values {
+                        self.tag_index.union_with(key, value, &mut or_bitmap);
+                    }
+                    result_bitmap &= &or_bitmap;
+                    if result_bitmap.is_empty() {
+                        return Ok(Vec::new());
+                    }
                 }
+                TagFilter::Exists { .. } | TagFilter::Regex { .. } => {
+                    // These require per-series evaluation, defer to later
+                    needs_per_series_filter.push(filter.clone());
+                }
+            }
+        }
+
+        // Convert bitmap back to series IDs
+        let mut result = self.tag_index.bitmap_to_series(&result_bitmap);
+
+        // Apply remaining filters that require per-series evaluation
+        for filter in needs_per_series_filter {
+            // Check cancellation before each filter
+            if let Some(cancel) = cancel {
+                if cancel.is_cancelled() {
+                    return Err(QueryError::Cancelled);
+                }
+            }
+
+            match &filter {
                 TagFilter::Exists { key } => {
-                    // Check which series have this tag
                     result.retain(|id| {
                         if let Some(meta) = self.series_index.get(*id) {
                             meta.tags.iter().any(|t| &t.key == key)
@@ -385,6 +422,7 @@ impl QueryExecutor {
                         });
                     }
                 }
+                _ => unreachable!("Only Exists and Regex filters are deferred"),
             }
         }
 
@@ -677,7 +715,7 @@ impl QueryExecutor {
         }
     }
 
-    /// Execute an aggregate query with parallel series processing
+    /// Execute an aggregate query with parallel series and partition processing
     fn execute_aggregate(
         &self,
         query: &Query,
@@ -703,22 +741,24 @@ impl QueryExecutor {
             );
         }
 
-        // Simple aggregation over all data - use parallel processing for many series
+        // Simple aggregation over all data
         // Special case: COUNT(*) counts all rows, not a specific field
         let is_count_star = field == "*" && function == AggregateFunction::Count;
 
         let aggregator = if series_ids.len() >= 4 && cancel.is_none() {
-            // Parallel path: each thread gets its own aggregator, then merge
-            let field_clone = field.to_string();
-            let partial_results: Vec<Result<Aggregator>> = series_ids
-                .par_iter()
-                .map(|&series_id| {
-                    let points = self.storage.query(series_id, &query.time_range)?;
-                    let mut local_agg = Aggregator::new(function);
+            // Use parallel partition scanning for aggregations
+            let all_series_data = self
+                .storage
+                .query_measurement_parallel(series_ids, &query.time_range)?;
 
+            // Parallel aggregation across series
+            let field_clone = field.to_string();
+            let partial_results: Vec<Aggregator> = all_series_data
+                .par_iter()
+                .map(|(_, points)| {
+                    let mut local_agg = Aggregator::new(function);
                     for point in points {
                         if is_count_star {
-                            // COUNT(*): count every row
                             local_agg.add(&FieldValue::Integer(1));
                         } else if let Some((_, value)) =
                             point.fields.iter().find(|(k, _)| k == &field_clone)
@@ -726,19 +766,18 @@ impl QueryExecutor {
                             local_agg.add(value);
                         }
                     }
-                    Ok(local_agg)
+                    local_agg
                 })
                 .collect();
 
             // Merge all partial aggregators
             let mut final_agg = Aggregator::new(function);
-            for result in partial_results {
-                let partial = result?;
+            for partial in partial_results {
                 final_agg.merge(&partial);
             }
             final_agg
         } else {
-            // Sequential path
+            // Sequential path for small queries or when cancellation is needed
             let mut aggregator = Aggregator::new(function);
 
             for &series_id in series_ids {

@@ -157,6 +157,71 @@ impl TagIndex {
         self.tag_values.iter().map(|r| r.key().clone()).collect()
     }
 
+    // ==========================================================================
+    // Bitmap-native methods for efficient query execution
+    // ==========================================================================
+
+    /// Return raw bitmap for a tag (internal IDs, not SeriesIds)
+    /// Returns None if the tag doesn't exist
+    pub fn find_by_tag_bitmap(&self, key: &str, value: &str) -> Option<RoaringBitmap> {
+        let tag_key = TagKey::new(key, value);
+        self.index.get(&tag_key).map(|bitmap| bitmap.value().clone())
+    }
+
+    /// Intersect an existing bitmap with a tag's bitmap (for AND operations)
+    /// Modifies the input bitmap in place
+    /// Returns false if the tag doesn't exist (resulting in empty bitmap)
+    pub fn intersect_with(&self, key: &str, value: &str, bitmap: &mut RoaringBitmap) -> bool {
+        let tag_key = TagKey::new(key, value);
+        if let Some(tag_bitmap) = self.index.get(&tag_key) {
+            *bitmap &= tag_bitmap.value();
+            true
+        } else {
+            bitmap.clear();
+            false
+        }
+    }
+
+    /// Union an existing bitmap with a tag's bitmap (for OR operations)
+    /// Modifies the input bitmap in place
+    pub fn union_with(&self, key: &str, value: &str, bitmap: &mut RoaringBitmap) {
+        let tag_key = TagKey::new(key, value);
+        if let Some(tag_bitmap) = self.index.get(&tag_key) {
+            *bitmap |= tag_bitmap.value();
+        }
+    }
+
+    /// Get all indexed series as a bitmap
+    pub fn all_series_bitmap(&self) -> RoaringBitmap {
+        let internal_map = self.internal_to_series.read();
+        let mut bitmap = RoaringBitmap::new();
+        for i in 0..internal_map.len() {
+            bitmap.insert(i as u32);
+        }
+        bitmap
+    }
+
+    /// Convert a bitmap of internal IDs to SeriesIds
+    pub fn bitmap_to_series(&self, bitmap: &RoaringBitmap) -> Vec<SeriesId> {
+        self.bitmap_to_series_ids(bitmap)
+    }
+
+    /// Get internal ID for a series (for bitmap operations)
+    pub fn get_internal_id(&self, series_id: SeriesId) -> Option<u32> {
+        self.series_to_internal.get(&series_id).map(|v| *v)
+    }
+
+    /// Convert a slice of series IDs to a bitmap of internal IDs
+    pub fn series_to_bitmap(&self, series_ids: &[SeriesId]) -> RoaringBitmap {
+        let mut bitmap = RoaringBitmap::new();
+        for &series_id in series_ids {
+            if let Some(internal_id) = self.series_to_internal.get(&series_id) {
+                bitmap.insert(*internal_id);
+            }
+        }
+        bitmap
+    }
+
     /// Remove a series from the index
     pub fn remove_series(&self, series_id: SeriesId) {
         if let Some((_, internal_id)) = self.series_to_internal.remove(&series_id) {

@@ -61,6 +61,31 @@ pub enum FieldSelection {
     },
 }
 
+impl FieldSelection {
+    /// Get the list of fields required for this selection.
+    ///
+    /// Returns:
+    /// - `None` for All (read all fields)
+    /// - `Some(fields)` for Fields or Aggregate
+    /// - `Some([])` for COUNT(*) (no fields needed, just count rows)
+    pub fn required_fields(&self) -> Option<Vec<String>> {
+        match self {
+            FieldSelection::All => None,
+            FieldSelection::Fields(fields) => Some(fields.clone()),
+            FieldSelection::Aggregate { field, function, .. } => {
+                // COUNT(*) doesn't need any specific field
+                if field == "*" && *function == AggregateFunction::Count {
+                    Some(Vec::new())
+                } else if field == "*" {
+                    None // Other aggregations on * need all fields
+                } else {
+                    Some(vec![field.clone()])
+                }
+            }
+        }
+    }
+}
+
 /// Query definition
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Query {

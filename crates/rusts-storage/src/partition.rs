@@ -157,6 +157,19 @@ impl Partition {
         series_id: SeriesId,
         time_range: &TimeRange,
     ) -> Result<Vec<MemTablePoint>> {
+        self.query_with_fields(series_id, time_range, None)
+    }
+
+    /// Query points for a series with optional field selection (column pruning).
+    ///
+    /// When `fields` is Some, only the specified fields are read from segments,
+    /// which can significantly reduce I/O and decompression time for wide tables.
+    pub fn query_with_fields(
+        &self,
+        series_id: SeriesId,
+        time_range: &TimeRange,
+        fields: Option<&[String]>,
+    ) -> Result<Vec<MemTablePoint>> {
         let segments = self.segments.read();
         let series_segments = match segments.get(&series_id) {
             Some(segs) => segs,
@@ -166,7 +179,7 @@ impl Partition {
         let mut all_points = Vec::new();
         for segment in series_segments {
             if segment.overlaps(time_range) {
-                let points = segment.read_range(time_range)?;
+                let points = segment.read_range_with_fields(time_range, fields)?;
                 all_points.extend(points);
             }
         }

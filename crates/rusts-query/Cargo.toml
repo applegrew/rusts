@@ -6,6 +6,11 @@ authors.workspace = true
 license.workspace = true
 description = "Query engine for RusTs time series database"
 
+[features]
+default = []
+# Enable SIMD-accelerated aggregations (requires nightly Rust for portable_simd)
+simd = []
+
 [dependencies]
 rusts-core = { workspace = true }
 rusts-storage = { workspace = true }
@@ -22,6 +27,7 @@ tracing = { workspace = true }
 regex = "1.10"
 rayon = { workspace = true }
 once_cell = { workspace = true }
+roaring = { workspace = true }
 
 [dev-dependencies]
 rand = { workspace = true }
