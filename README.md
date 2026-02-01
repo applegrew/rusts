@@ -453,9 +453,38 @@ cargo bench -p rusts-compression
 # Ingestion benchmarks
 cargo bench -p rusts-server --bench ingestion
 
-# Query benchmarks
-cargo bench -p rusts-server --bench query
+# Query benchmarks (SQL)
+python3 benchmarks/benchmark.py --iterations 3
 ```
+
+### Query Performance Results
+
+Benchmark performed on **1.25 million points** with the following data shape:
+
+| Attribute | Value |
+|-----------|-------|
+| **Measurement** | `trips` |
+| **Tags** | `hvfhs_license_num`, `dispatching_base_num` (2 unique series) |
+| **Fields** | 17 numeric/string fields (`trip_miles`, `trip_time`, `base_passenger_fare`, `driver_pay`, `tips`, `tolls`, `airport_fee`, `congestion_surcharge`, `sales_tax`, `bcf`, `PULocationID`, `DOLocationID`, etc.) |
+| **Time range** | ~30 days |
+| **Segments** | 4 segments across 2 partitions |
+
+**Results (44 queries, single iteration):**
+
+| Query Type | Avg Time | Example |
+|------------|----------|---------|
+| Simple aggregations | ~950ms | `SELECT COUNT(*) FROM trips` |
+| Filtered aggregations | ~940ms | `SELECT SUM(trip_miles) FROM trips WHERE trip_miles > 0` |
+| Tag-filtered queries | ~650ms | `SELECT COUNT(*) FROM trips WHERE hvfhs_license_num = 'HV0003'` |
+| GROUP BY queries | ~940ms | `SELECT hvfhs_license_num, COUNT(*) FROM trips GROUP BY hvfhs_license_num` |
+| LIMIT queries | ~250-700ms | `SELECT * FROM trips ORDER BY time DESC LIMIT 10` |
+
+**Summary:**
+- Total benchmark time: **37 seconds** (44 queries)
+- Average query time: **841ms**
+- All queries complete in **under 1 second**
+
+Data source: [NYC TLC Trip Record Data](https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page) (FHVHV trips, November 2025)
 
 ### Code Coverage
 
