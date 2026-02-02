@@ -425,6 +425,7 @@ rusts/
 │   ├── rusts-aggregation/    # Continuous aggregates, downsampling
 │   ├── rusts-retention/      # Retention policies, tiering
 │   ├── rusts-importer/       # Data import CLI (Parquet, etc.)
+│   ├── rusts-endpoint-monitor-simulator/  # DEX workload simulator
 │   └── rusts-server/         # Main server binary
 └── README.md
 ```
@@ -485,6 +486,49 @@ Benchmark performed on **1.25 million points** with the following data shape:
 - All queries complete in **under 1 second**
 
 Data source: [NYC TLC Trip Record Data](https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page) (FHVHV trips, November 2025)
+
+### Endpoint Monitoring Benchmark
+
+Simulated Digital Employee Experience (DEX) workload using the `rusts-endpoint-monitor-simulator`:
+
+**Configuration:**
+| Parameter | Value |
+|-----------|-------|
+| Devices | 1,000 |
+| Series | ~7,500 |
+| Duration | 5 minutes |
+| Write interval | 15 seconds |
+| Query rate | 5 queries/sec |
+| Measurements | `device_health`, `app_performance`, `network_health`, `experience_score` |
+
+**Write Performance:**
+| Metric | Value |
+|--------|-------|
+| Points Written | 382,653 |
+| Throughput | 1,275 points/sec |
+| Data Volume | 73.19 MB (249.78 KB/s) |
+| p50 Latency | 26.5ms |
+| p95 Latency | 51.6ms |
+| p99 Latency | 109.5ms |
+
+**Query Performance:**
+| Query Type | Count | p50 | p95 | p99 |
+|------------|-------|-----|-----|-----|
+| Dashboard (aggregations, GROUP BY) | 901 | 13.7ms | 51.4ms | 62.5ms |
+| Alerting (HAVING thresholds) | 451 | 12.6ms | 55.3ms | 62.6ms |
+| Historical (single-device trends) | 149 | 0.9ms | 2.1ms | 4.0ms |
+
+**Summary:**
+- Zero errors during 5-minute benchmark
+- Sustained 1,275 writes/sec + 5 queries/sec concurrently
+- Sub-100ms p99 write latency under mixed read/write load
+- Historical point queries complete in under 1ms (p50)
+
+Run the benchmark yourself:
+```bash
+cargo run -p rusts-endpoint-monitor-simulator --release -- benchmark \
+  --devices 1000 --duration 300 --write-interval 15 --query-rate 5
+```
 
 ### Code Coverage
 
