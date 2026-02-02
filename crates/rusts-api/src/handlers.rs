@@ -3,7 +3,10 @@
 use crate::error::ApiError;
 use crate::line_protocol::LineProtocolParser;
 use axum::{
+    body::Bytes,
     extract::State,
+    http::header::CONTENT_TYPE,
+    http::HeaderMap,
     response::Json,
 };
 use parking_lot::RwLock;
@@ -590,15 +593,49 @@ pub enum SqlQueryResponse {
     Explain(ExplainResponse),
 }
 
+/// Parse SQL query from request body based on Content-Type header
+fn parse_sql_body(headers: &HeaderMap, body: &Bytes) -> Result<String, ApiError> {
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    if content_type.starts_with("application/json") {
+        // Parse as JSON
+        let req: SqlQueryRequest = serde_json::from_slice(body)
+            .map_err(|e| ApiError::BadRequest(format!("Invalid JSON: {}", e)))?;
+        Ok(req.query)
+    } else {
+        // Treat as plain text (text/plain or no Content-Type)
+        let query = std::str::from_utf8(body)
+            .map_err(|e| ApiError::BadRequest(format!("Invalid UTF-8: {}", e)))?
+            .trim()
+            .to_string();
+
+        if query.is_empty() {
+            return Err(ApiError::BadRequest("Empty query".to_string()));
+        }
+        Ok(query)
+    }
+}
+
 /// Execute a SQL query
+///
+/// Accepts either:
+/// - `Content-Type: application/json` with body `{"query": "SELECT ..."}`
+/// - `Content-Type: text/plain` (or no Content-Type) with body `SELECT ...`
 pub async fn sql_query(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<SqlQueryRequest>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> std::result::Result<Json<SqlQueryResponse>, ApiError> {
     let start = Instant::now();
 
+    // Parse query from body based on Content-Type
+    let query_str = parse_sql_body(&headers, &body)?;
+
     // Parse SQL
-    let stmt = SqlParser::parse(&req.query)?;
+    let stmt = SqlParser::parse(&query_str)?;
 
     // Translate to command
     let command = SqlTranslator::translate_command(&stmt)?;
@@ -915,5 +952,71 @@ mod tests {
         startup_state.set_phase(StartupPhase::Ready);
         assert_eq!(app_state.startup_state.phase(), StartupPhase::Ready);
         assert!(app_state.startup_state.is_ready());
+    }
+
+    #[test]
+    fn test_parse_sql_body_json() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+
+        let body = Bytes::from(r#"{"query": "SELECT * FROM cpu"}"#);
+        let result = parse_sql_body(&headers, &body).unwrap();
+        assert_eq!(result, "SELECT * FROM cpu");
+    }
+
+    #[test]
+    fn test_parse_sql_body_json_charset() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, "application/json; charset=utf-8".parse().unwrap());
+
+        let body = Bytes::from(r#"{"query": "SELECT * FROM cpu"}"#);
+        let result = parse_sql_body(&headers, &body).unwrap();
+        assert_eq!(result, "SELECT * FROM cpu");
+    }
+
+    #[test]
+    fn test_parse_sql_body_plain_text() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, "text/plain".parse().unwrap());
+
+        let body = Bytes::from("SELECT * FROM cpu");
+        let result = parse_sql_body(&headers, &body).unwrap();
+        assert_eq!(result, "SELECT * FROM cpu");
+    }
+
+    #[test]
+    fn test_parse_sql_body_plain_text_with_whitespace() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, "text/plain".parse().unwrap());
+
+        let body = Bytes::from("  SELECT * FROM cpu  \n");
+        let result = parse_sql_body(&headers, &body).unwrap();
+        assert_eq!(result, "SELECT * FROM cpu");
+    }
+
+    #[test]
+    fn test_parse_sql_body_no_content_type() {
+        let headers = HeaderMap::new();
+        let body = Bytes::from("SELECT * FROM cpu");
+        let result = parse_sql_body(&headers, &body).unwrap();
+        assert_eq!(result, "SELECT * FROM cpu");
+    }
+
+    #[test]
+    fn test_parse_sql_body_empty_plain_text() {
+        let headers = HeaderMap::new();
+        let body = Bytes::from("");
+        let result = parse_sql_body(&headers, &body);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_sql_body_invalid_json() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+
+        let body = Bytes::from("not valid json");
+        let result = parse_sql_body(&headers, &body);
+        assert!(result.is_err());
     }
 }
