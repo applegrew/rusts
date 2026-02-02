@@ -44,6 +44,7 @@ mod tests {
     use crate::handlers::{StartupPhase, StartupState};
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use rusts_core::ParallelConfig;
     use rusts_index::{SeriesIndex, TagIndex};
     use rusts_storage::{StorageEngine, StorageEngineConfig, WalDurability};
     use tempfile::TempDir;
@@ -67,6 +68,7 @@ mod tests {
             tag_index,
             Duration::from_secs(30),
             100,
+            ParallelConfig::default(),
         ));
 
         (state, dir)
@@ -78,6 +80,7 @@ mod tests {
             Duration::from_secs(30),
             100,
             startup_state,
+            ParallelConfig::default(),
         ))
     }
 

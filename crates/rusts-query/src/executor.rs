@@ -9,7 +9,7 @@ use crate::planner::{QueryOptimizer, QueryPlanner};
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
 use rayon::prelude::*;
-use rusts_core::{FieldValue, SeriesId, Tag};
+use rusts_core::{FieldValue, ParallelConfig, SeriesId, Tag};
 use rusts_index::{SeriesIndex, TagIndex};
 use rusts_storage::StorageEngine;
 use std::cmp::Ordering;
@@ -203,21 +203,44 @@ pub struct QueryExecutor {
     tag_index: Arc<TagIndex>,
     /// Query planner
     planner: QueryPlanner,
+    /// Parallel execution configuration
+    parallel_config: ParallelConfig,
 }
 
 impl QueryExecutor {
-    /// Create a new query executor
+    /// Create a new query executor with default parallel configuration
     pub fn new(
         storage: Arc<StorageEngine>,
         series_index: Arc<SeriesIndex>,
         tag_index: Arc<TagIndex>,
+    ) -> Self {
+        Self::with_parallel_config(storage, series_index, tag_index, ParallelConfig::default())
+    }
+
+    /// Create a new query executor with custom parallel configuration
+    pub fn with_parallel_config(
+        storage: Arc<StorageEngine>,
+        series_index: Arc<SeriesIndex>,
+        tag_index: Arc<TagIndex>,
+        parallel_config: ParallelConfig,
     ) -> Self {
         Self {
             storage,
             series_index,
             tag_index,
             planner: QueryPlanner::new(),
+            parallel_config,
         }
+    }
+
+    /// Returns a reference to the parallel configuration
+    pub fn parallel_config(&self) -> &ParallelConfig {
+        &self.parallel_config
+    }
+
+    /// Updates the parallel configuration
+    pub fn set_parallel_config(&mut self, config: ParallelConfig) {
+        self.parallel_config = config;
     }
 
     /// Execute a query
@@ -465,36 +488,76 @@ impl QueryExecutor {
         }
 
         // Full scan path for queries without LIMIT or with custom ordering
-        // Use parallel processing for multiple series (threshold: 4+ series)
-        let rows = if series_ids.len() >= 4 && cancel.is_none() {
+        // Use parallel processing based on config thresholds
+        let rows = if self.parallel_config.should_parallelize_series(series_ids.len())
+            && cancel.is_none()
+        {
             // Parallel path using rayon (only when not cancellable for simplicity)
-            let results: Vec<Result<Vec<ResultRow>>> = series_ids
-                .par_iter()
-                .map(|&series_id| {
-                    let points = self.storage.query(series_id, &query.time_range)?;
-                    let series_meta = self.series_index.get(series_id);
-                    let tags = series_meta.map(|m| m.tags).unwrap_or_default();
+            let effective_parallelism =
+                self.parallel_config.effective_series_parallelism(series_ids.len());
 
-                    let mut series_rows = Vec::with_capacity(points.len());
-                    for point in points {
-                        let fields = self.filter_fields(&point.fields, &query.field_selection);
-                        series_rows.push(ResultRow {
-                            timestamp: Some(point.timestamp),
-                            series_id,
-                            tags: tags.clone(),
-                            fields,
-                        });
+            if effective_parallelism >= series_ids.len() {
+                // Full parallelism - process all series in parallel
+                let results: Vec<Result<Vec<ResultRow>>> = series_ids
+                    .par_iter()
+                    .map(|&series_id| {
+                        let points = self.storage.query(series_id, &query.time_range)?;
+                        let series_meta = self.series_index.get(series_id);
+                        let tags = series_meta.map(|m| m.tags).unwrap_or_default();
+
+                        let mut series_rows = Vec::with_capacity(points.len());
+                        for point in points {
+                            let fields =
+                                self.filter_fields(&point.fields, &query.field_selection);
+                            series_rows.push(ResultRow {
+                                timestamp: Some(point.timestamp),
+                                series_id,
+                                tags: tags.clone(),
+                                fields,
+                            });
+                        }
+                        Ok(series_rows)
+                    })
+                    .collect();
+
+                // Collect and flatten results
+                let mut all_rows = Vec::new();
+                for result in results {
+                    all_rows.extend(result?);
+                }
+                all_rows
+            } else {
+                // Limited parallelism - process in chunks
+                let mut all_rows = Vec::new();
+                for chunk in series_ids.chunks(effective_parallelism) {
+                    let results: Vec<Result<Vec<ResultRow>>> = chunk
+                        .par_iter()
+                        .map(|&series_id| {
+                            let points = self.storage.query(series_id, &query.time_range)?;
+                            let series_meta = self.series_index.get(series_id);
+                            let tags = series_meta.map(|m| m.tags).unwrap_or_default();
+
+                            let mut series_rows = Vec::with_capacity(points.len());
+                            for point in points {
+                                let fields =
+                                    self.filter_fields(&point.fields, &query.field_selection);
+                                series_rows.push(ResultRow {
+                                    timestamp: Some(point.timestamp),
+                                    series_id,
+                                    tags: tags.clone(),
+                                    fields,
+                                });
+                            }
+                            Ok(series_rows)
+                        })
+                        .collect();
+
+                    for result in results {
+                        all_rows.extend(result?);
                     }
-                    Ok(series_rows)
-                })
-                .collect();
-
-            // Collect and flatten results
-            let mut all_rows = Vec::new();
-            for result in results {
-                all_rows.extend(result?);
+                }
+                all_rows
             }
-            all_rows
         } else {
             // Sequential path (for cancellation support or small queries)
             let mut rows = Vec::new();
@@ -745,30 +808,65 @@ impl QueryExecutor {
         // Special case: COUNT(*) counts all rows, not a specific field
         let is_count_star = field == "*" && function == AggregateFunction::Count;
 
-        let aggregator = if series_ids.len() >= 4 && cancel.is_none() {
-            // Use parallel partition scanning for aggregations
-            let all_series_data = self
-                .storage
-                .query_measurement_parallel(series_ids, &query.time_range)?;
+        let aggregator = if self.parallel_config.should_parallelize_series(series_ids.len())
+            && cancel.is_none()
+        {
+            // Use parallel partition scanning for aggregations with configurable parallelism
+            let all_series_data = self.storage.query_measurement_parallel_with_config(
+                series_ids,
+                &query.time_range,
+                &self.parallel_config,
+            )?;
 
-            // Parallel aggregation across series
+            // Parallel aggregation across series with configurable limits
             let field_clone = field.to_string();
-            let partial_results: Vec<Aggregator> = all_series_data
-                .par_iter()
-                .map(|(_, points)| {
-                    let mut local_agg = Aggregator::new(function);
-                    for point in points {
-                        if is_count_star {
-                            local_agg.add(&FieldValue::Integer(1));
-                        } else if let Some((_, value)) =
-                            point.fields.iter().find(|(k, _)| k == &field_clone)
-                        {
-                            local_agg.add(value);
+            let effective_parallelism = self
+                .parallel_config
+                .effective_series_parallelism(all_series_data.len());
+
+            let partial_results: Vec<Aggregator> = if effective_parallelism >= all_series_data.len()
+            {
+                // Full parallelism
+                all_series_data
+                    .par_iter()
+                    .map(|(_, points)| {
+                        let mut local_agg = Aggregator::new(function);
+                        for point in points {
+                            if is_count_star {
+                                local_agg.add(&FieldValue::Integer(1));
+                            } else if let Some((_, value)) =
+                                point.fields.iter().find(|(k, _)| k == &field_clone)
+                            {
+                                local_agg.add(value);
+                            }
                         }
-                    }
-                    local_agg
-                })
-                .collect();
+                        local_agg
+                    })
+                    .collect()
+            } else {
+                // Limited parallelism - process in chunks
+                let mut results = Vec::new();
+                for chunk in all_series_data.chunks(effective_parallelism) {
+                    let chunk_results: Vec<Aggregator> = chunk
+                        .par_iter()
+                        .map(|(_, points)| {
+                            let mut local_agg = Aggregator::new(function);
+                            for point in points {
+                                if is_count_star {
+                                    local_agg.add(&FieldValue::Integer(1));
+                                } else if let Some((_, value)) =
+                                    point.fields.iter().find(|(k, _)| k == &field_clone)
+                                {
+                                    local_agg.add(value);
+                                }
+                            }
+                            local_agg
+                        })
+                        .collect();
+                    results.extend(chunk_results);
+                }
+                results
+            };
 
             // Merge all partial aggregators
             let mut final_agg = Aggregator::new(function);

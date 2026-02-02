@@ -7,7 +7,7 @@ use axum::{
     response::Json,
 };
 use parking_lot::RwLock;
-use rusts_core::TimeRange;
+use rusts_core::{ParallelConfig, TimeRange};
 use rusts_index::{SeriesIndex, TagIndex};
 use rusts_query::{AggregateFunction, Query, QueryExecutor};
 use rusts_sql::{SqlCommand, SqlParser, SqlTranslator};
@@ -90,6 +90,7 @@ pub struct AppState {
     pub query_semaphore: Arc<Semaphore>,
     pub query_timeout: Duration,
     pub startup_state: Arc<StartupState>,
+    pub parallel_config: ParallelConfig,
 }
 
 impl AppState {
@@ -100,14 +101,16 @@ impl AppState {
         tag_index: Arc<TagIndex>,
         query_timeout: Duration,
         max_concurrent_queries: usize,
+        parallel_config: ParallelConfig,
     ) -> Self {
         let startup_state = Arc::new(StartupState::new());
         startup_state.set_phase(StartupPhase::Ready);
 
-        let executor = Arc::new(QueryExecutor::new(
+        let executor = Arc::new(QueryExecutor::with_parallel_config(
             Arc::clone(&storage),
             Arc::clone(&series_index),
             Arc::clone(&tag_index),
+            parallel_config.clone(),
         ));
 
         Self {
@@ -118,6 +121,7 @@ impl AppState {
             query_semaphore: Arc::new(Semaphore::new(max_concurrent_queries)),
             query_timeout,
             startup_state,
+            parallel_config,
         }
     }
 
@@ -126,6 +130,7 @@ impl AppState {
         query_timeout: Duration,
         max_concurrent_queries: usize,
         startup_state: Arc<StartupState>,
+        parallel_config: ParallelConfig,
     ) -> Self {
         Self {
             storage: RwLock::new(None),
@@ -135,15 +140,17 @@ impl AppState {
             query_semaphore: Arc::new(Semaphore::new(max_concurrent_queries)),
             query_timeout,
             startup_state,
+            parallel_config,
         }
     }
 
     /// Set the storage engine once it's initialized
     pub fn set_storage(&self, storage: Arc<StorageEngine>) {
-        let executor = Arc::new(QueryExecutor::new(
+        let executor = Arc::new(QueryExecutor::with_parallel_config(
             Arc::clone(&storage),
             Arc::clone(&self.series_index),
             Arc::clone(&self.tag_index),
+            self.parallel_config.clone(),
         ));
         *self.storage.write() = Some(storage);
         *self.executor.write() = Some(executor);
@@ -727,6 +734,7 @@ mod tests {
             Duration::from_secs(30),
             100,
             Arc::clone(&startup_state),
+            ParallelConfig::default(),
         );
 
         // Storage should not be available
@@ -757,6 +765,7 @@ mod tests {
             tag_index,
             Duration::from_secs(30),
             100,
+            ParallelConfig::default(),
         );
 
         // Storage should be available
@@ -776,6 +785,7 @@ mod tests {
             Duration::from_secs(30),
             100,
             Arc::clone(&startup_state),
+            ParallelConfig::default(),
         );
 
         // Initially no storage
@@ -807,6 +817,7 @@ mod tests {
             Duration::from_secs(30),
             100,
             Arc::clone(&startup_state),
+            ParallelConfig::default(),
         );
 
         // Simulate startup phases

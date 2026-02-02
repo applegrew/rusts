@@ -8,9 +8,12 @@
 //! - `Field`: Named field with a value
 //! - `Point`: A single data point with timestamp, tags, and fields
 //! - `Series`: Metadata about a time series
+//! - `ParallelConfig`: Configuration for parallel query execution
 
 pub mod error;
+pub mod parallel;
 pub mod types;
 
 pub use error::{CoreError, Result};
+pub use parallel::ParallelConfig;
 pub use types::*;

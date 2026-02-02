@@ -13,6 +13,7 @@ thiserror = { workspace = true }
 fxhash = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
+num_cpus = "1.16"
 
 [dev-dependencies]
 rand = { workspace = true }

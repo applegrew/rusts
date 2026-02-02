@@ -11,6 +11,7 @@
 
 use rusts_api::auth::AuthConfig;
 use rusts_api::{create_router, handlers::AppState, StartupPhase, StartupState};
+use rusts_core::ParallelConfig;
 use rusts_storage::memtable::FlushTrigger;
 use rusts_storage::{StorageEngine, StorageEngineConfig, WalDurability};
 use serde::{Deserialize, Serialize};
@@ -33,6 +34,8 @@ pub struct ServerConfig {
     pub auth: AuthSettings,
     /// Logging configuration
     pub logging: LoggingSettings,
+    /// Parallel query execution configuration
+    pub parallel: ParallelSettings,
     /// Retention policies
     #[serde(default)]
     pub retention_policies: Vec<RetentionPolicyConfig>,
@@ -196,6 +199,34 @@ pub struct RetentionPolicyConfig {
     pub is_default: bool,
 }
 
+/// Parallel query execution settings
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ParallelSettings {
+    /// Minimum number of series to trigger parallel processing (default: 4)
+    pub series_threshold: usize,
+    /// Minimum number of partitions to trigger parallel scanning (default: 2)
+    pub partition_threshold: usize,
+    /// Maximum number of series to process in parallel (0 = unlimited)
+    pub max_parallel_series: usize,
+    /// Maximum number of partitions to scan in parallel (0 = unlimited)
+    pub max_parallel_partitions: usize,
+    /// Number of threads in the query thread pool (0 = number of CPU cores)
+    pub thread_pool_size: usize,
+}
+
+impl Default for ParallelSettings {
+    fn default() -> Self {
+        Self {
+            series_threshold: 4,
+            partition_threshold: 2,
+            max_parallel_series: 0,
+            max_parallel_partitions: 0,
+            thread_pool_size: 0,
+        }
+    }
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -203,6 +234,7 @@ impl Default for ServerConfig {
             storage: StorageSettings::default(),
             auth: AuthSettings::default(),
             logging: LoggingSettings::default(),
+            parallel: ParallelSettings::default(),
             retention_policies: Vec::new(),
         }
     }
@@ -268,6 +300,17 @@ impl ServerConfig {
             "warn" => Level::WARN,
             "error" => Level::ERROR,
             _ => Level::INFO,
+        }
+    }
+
+    /// Convert to ParallelConfig
+    pub fn to_parallel_config(&self) -> ParallelConfig {
+        ParallelConfig {
+            series_threshold: self.parallel.series_threshold,
+            partition_threshold: self.parallel.partition_threshold,
+            max_parallel_series: self.parallel.max_parallel_series,
+            max_parallel_partitions: self.parallel.max_parallel_partitions,
+            thread_pool_size: self.parallel.thread_pool_size,
         }
     }
 
@@ -470,8 +513,17 @@ async fn main() -> anyhow::Result<()> {
     // Query protection settings
     let query_timeout = std::time::Duration::from_secs(config.server.query_timeout_secs);
     let max_concurrent_queries = config.server.max_concurrent_queries;
+    let parallel_config = config.to_parallel_config();
     info!("Query timeout: {} seconds", config.server.query_timeout_secs);
     info!("Max concurrent queries: {}", max_concurrent_queries);
+    info!(
+        "Parallel query config: series_threshold={}, partition_threshold={}, max_series={}, max_partitions={}, threads={}",
+        parallel_config.series_threshold,
+        parallel_config.partition_threshold,
+        if parallel_config.max_parallel_series == 0 { "unlimited".to_string() } else { parallel_config.max_parallel_series.to_string() },
+        if parallel_config.max_parallel_partitions == 0 { "unlimited".to_string() } else { parallel_config.max_parallel_partitions.to_string() },
+        if parallel_config.thread_pool_size == 0 { "auto".to_string() } else { parallel_config.thread_pool_size.to_string() },
+    );
 
     // Create application state in initializing mode (no storage yet)
     // This allows health/ready endpoints to respond immediately
@@ -479,6 +531,7 @@ async fn main() -> anyhow::Result<()> {
         query_timeout,
         max_concurrent_queries,
         Arc::clone(&startup_state),
+        parallel_config,
     ));
 
     // Create router with request timeout

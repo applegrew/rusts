@@ -11,7 +11,7 @@ use crate::partition::PartitionManager;
 use crate::wal::{WalDurability, WalReader, WalWriter};
 use parking_lot::RwLock;
 use rusts_compression::CompressionLevel;
-use rusts_core::{Point, SeriesId, TimeRange};
+use rusts_core::{ParallelConfig, Point, SeriesId, TimeRange};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -223,6 +223,19 @@ impl StorageEngine {
         series_id: SeriesId,
         time_range: &TimeRange,
     ) -> Result<Vec<MemTablePoint>> {
+        self.query_parallel_with_config(series_id, time_range, &ParallelConfig::default())
+    }
+
+    /// Query points for a series using parallel partition scanning with custom config.
+    ///
+    /// Uses rayon to query multiple partitions in parallel, with configurable
+    /// thresholds and limits for parallelism.
+    pub fn query_parallel_with_config(
+        &self,
+        series_id: SeriesId,
+        time_range: &TimeRange,
+        config: &ParallelConfig,
+    ) -> Result<Vec<MemTablePoint>> {
         use rayon::prelude::*;
 
         let mut all_points = Vec::new();
@@ -239,20 +252,37 @@ impl StorageEngine {
             }
         }
 
-        // Query partitions in parallel if there are enough
+        // Query partitions in parallel if threshold is met
         let partitions = self.partitions.get_partitions_for_range(time_range);
-        if partitions.len() >= 2 {
-            // Parallel path using rayon
-            let partition_results: Vec<Result<Vec<MemTablePoint>>> = partitions
-                .par_iter()
-                .map(|partition| partition.query(series_id, time_range))
-                .collect();
+        if config.should_parallelize_partitions(partitions.len()) {
+            // Determine effective parallelism (may be limited by config)
+            let effective_parallelism = config.effective_partition_parallelism(partitions.len());
 
-            for result in partition_results {
-                all_points.extend(result?);
+            if effective_parallelism >= partitions.len() {
+                // Full parallelism - use par_iter directly
+                let partition_results: Vec<Result<Vec<MemTablePoint>>> = partitions
+                    .par_iter()
+                    .map(|partition| partition.query(series_id, time_range))
+                    .collect();
+
+                for result in partition_results {
+                    all_points.extend(result?);
+                }
+            } else {
+                // Limited parallelism - process in chunks
+                for chunk in partitions.chunks(effective_parallelism) {
+                    let chunk_results: Vec<Result<Vec<MemTablePoint>>> = chunk
+                        .par_iter()
+                        .map(|partition| partition.query(series_id, time_range))
+                        .collect();
+
+                    for result in chunk_results {
+                        all_points.extend(result?);
+                    }
+                }
             }
         } else {
-            // Sequential for single partition (no benefit from parallelism)
+            // Sequential for small partition counts (no benefit from parallelism)
             for partition in partitions {
                 all_points.extend(partition.query(series_id, time_range)?);
             }
@@ -273,7 +303,12 @@ impl StorageEngine {
         series_ids: &[SeriesId],
         time_range: &TimeRange,
     ) -> Result<Vec<(SeriesId, Vec<MemTablePoint>)>> {
-        self.query_measurement_parallel_with_fields(series_ids, time_range, None)
+        self.query_measurement_parallel_with_fields_and_config(
+            series_ids,
+            time_range,
+            None,
+            &ParallelConfig::default(),
+        )
     }
 
     /// Query all series with column pruning support.
@@ -286,6 +321,39 @@ impl StorageEngine {
         series_ids: &[SeriesId],
         time_range: &TimeRange,
         fields: Option<&[String]>,
+    ) -> Result<Vec<(SeriesId, Vec<MemTablePoint>)>> {
+        self.query_measurement_parallel_with_fields_and_config(
+            series_ids,
+            time_range,
+            fields,
+            &ParallelConfig::default(),
+        )
+    }
+
+    /// Query all series in a measurement with configurable parallelism.
+    ///
+    /// Optimized for aggregation queries that need to scan all data for multiple
+    /// series in a single measurement. Uses configurable parallelism limits.
+    pub fn query_measurement_parallel_with_config(
+        &self,
+        series_ids: &[SeriesId],
+        time_range: &TimeRange,
+        config: &ParallelConfig,
+    ) -> Result<Vec<(SeriesId, Vec<MemTablePoint>)>> {
+        self.query_measurement_parallel_with_fields_and_config(series_ids, time_range, None, config)
+    }
+
+    /// Query all series with column pruning and configurable parallelism.
+    ///
+    /// When `fields` is Some, only the specified fields are read from segments,
+    /// which can significantly reduce I/O for wide tables with many columns.
+    /// Pass `Some(&[])` for COUNT(*) to skip all field data (timestamp only).
+    pub fn query_measurement_parallel_with_fields_and_config(
+        &self,
+        series_ids: &[SeriesId],
+        time_range: &TimeRange,
+        fields: Option<&[String]>,
+        config: &ParallelConfig,
     ) -> Result<Vec<(SeriesId, Vec<MemTablePoint>)>> {
         use rayon::prelude::*;
         use std::collections::HashMap;
@@ -316,30 +384,60 @@ impl StorageEngine {
         // Query partitions in parallel with column pruning
         let partitions = self.partitions.get_partitions_for_range(time_range);
 
-        if partitions.len() >= 2 {
-            // Parallel: query all series from each partition
-            let partition_results: Vec<Result<Vec<(SeriesId, Vec<MemTablePoint>)>>> = partitions
-                .par_iter()
-                .map(|partition| {
-                    let mut partition_data = Vec::new();
-                    for &series_id in series_ids {
-                        let points = partition.query_with_fields(series_id, time_range, fields)?;
-                        if !points.is_empty() {
-                            partition_data.push((series_id, points));
+        if config.should_parallelize_partitions(partitions.len()) {
+            let effective_parallelism = config.effective_partition_parallelism(partitions.len());
+
+            if effective_parallelism >= partitions.len() {
+                // Full parallelism - use par_iter directly
+                let partition_results: Vec<Result<Vec<(SeriesId, Vec<MemTablePoint>)>>> = partitions
+                    .par_iter()
+                    .map(|partition| {
+                        let mut partition_data = Vec::new();
+                        for &series_id in series_ids {
+                            let points =
+                                partition.query_with_fields(series_id, time_range, fields)?;
+                            if !points.is_empty() {
+                                partition_data.push((series_id, points));
+                            }
+                        }
+                        Ok(partition_data)
+                    })
+                    .collect();
+
+                // Merge results
+                for result in partition_results {
+                    for (series_id, points) in result? {
+                        results.entry(series_id).or_default().extend(points);
+                    }
+                }
+            } else {
+                // Limited parallelism - process in chunks
+                for chunk in partitions.chunks(effective_parallelism) {
+                    let chunk_results: Vec<Result<Vec<(SeriesId, Vec<MemTablePoint>)>>> = chunk
+                        .par_iter()
+                        .map(|partition| {
+                            let mut partition_data = Vec::new();
+                            for &series_id in series_ids {
+                                let points =
+                                    partition.query_with_fields(series_id, time_range, fields)?;
+                                if !points.is_empty() {
+                                    partition_data.push((series_id, points));
+                                }
+                            }
+                            Ok(partition_data)
+                        })
+                        .collect();
+
+                    // Merge chunk results
+                    for result in chunk_results {
+                        for (series_id, points) in result? {
+                            results.entry(series_id).or_default().extend(points);
                         }
                     }
-                    Ok(partition_data)
-                })
-                .collect();
-
-            // Merge results
-            for result in partition_results {
-                for (series_id, points) in result? {
-                    results.entry(series_id).or_default().extend(points);
                 }
             }
         } else {
-            // Sequential for single partition
+            // Sequential for small partition counts
             for partition in partitions {
                 for &series_id in series_ids {
                     let points = partition.query_with_fields(series_id, time_range, fields)?;
