@@ -206,7 +206,8 @@ impl QueryExecutor {
         let result = self
             .client
             .post(&self.sql_url)
-            .json(&serde_json::json!({ "query": query }))
+            .header("Content-Type", "text/plain")
+            .body(query)
             .send()
             .await;
 

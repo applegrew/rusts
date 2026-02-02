@@ -570,18 +570,15 @@ RusTs supports SQL queries via the `/sql` endpoint. Queries are parsed using sql
 ```bash
 # Basic SELECT
 curl -X POST 'http://localhost:8086/sql' \
-  -H 'Content-Type: application/json' \
-  -d '{"query": "SELECT * FROM cpu WHERE host = '\''server01'\'' LIMIT 10"}'
+  -d "SELECT * FROM cpu WHERE host = 'server01' LIMIT 10"
 
 # Aggregation with GROUP BY
 curl -X POST 'http://localhost:8086/sql' \
-  -H 'Content-Type: application/json' \
-  -d '{"query": "SELECT AVG(usage), MAX(usage) FROM cpu GROUP BY host"}'
+  -d "SELECT AVG(usage), MAX(usage) FROM cpu GROUP BY host"
 
 # Time range filtering
 curl -X POST 'http://localhost:8086/sql' \
-  -H 'Content-Type: application/json' \
-  -d '{"query": "SELECT * FROM cpu WHERE time >= '\''2024-01-01'\'' AND time < '\''2024-01-02'\''"}'
+  -d "SELECT * FROM cpu WHERE time >= '2024-01-01' AND time < '2024-01-02'"
 ```
 
 ### Supported SQL Features
@@ -610,9 +607,7 @@ curl -X POST 'http://localhost:8086/sql' \
 List all measurements (tables) in the database:
 
 ```bash
-curl -X POST 'http://localhost:8086/sql' \
-  -H 'Content-Type: application/json' \
-  -d '{"query": "SHOW TABLES"}'
+curl -X POST 'http://localhost:8086/sql' -d "SHOW TABLES"
 
 # Response:
 # {

@@ -258,8 +258,8 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/sql")
-                    .header("Content-Type", "application/json")
-                    .body(Body::from(r#"{"query":"SELECT * FROM cpu"}"#))
+                    .header("Content-Type", "text/plain")
+                    .body(Body::from("SELECT * FROM cpu"))
                     .unwrap(),
             )
             .await

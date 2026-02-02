@@ -52,13 +52,12 @@ def run_query(url: str, query: str) -> Tuple[dict, int]:
     start = time.time()
 
     try:
-        # API expects JSON with {"query": "..."}
-        payload = json.dumps({"query": query})
-        data = payload.encode('utf-8')
+        # API accepts plain text SQL
+        data = query.encode('utf-8')
         req = urllib.request.Request(
             f"{url}/sql",
             data=data,
-            headers={'Content-Type': 'application/json'},
+            headers={'Content-Type': 'text/plain'},
             method='POST'
         )
         with urllib.request.urlopen(req, timeout=300) as resp:
