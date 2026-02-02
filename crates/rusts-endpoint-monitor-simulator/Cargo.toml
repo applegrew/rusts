@@ -1,0 +1,42 @@
+[package]
+name = "rusts-endpoint-monitor-simulator"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Endpoint monitoring workload simulator for RusTs benchmarking"
+
+[[bin]]
+name = "rusts-endpoint-monitor-simulator"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { workspace = true }
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json"] }
+
+# CLI
+clap = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Random number generation
+rand = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Time handling
+chrono = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Statistics
+hdrhistogram = "7.5"

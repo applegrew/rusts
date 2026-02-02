@@ -13,6 +13,7 @@ members = [
     "crates/rusts-sql",
     "crates/rusts-server",
     "crates/rusts-importer",
+    "crates/rusts-endpoint-monitor-simulator",
 ]
 
 [workspace.package]
