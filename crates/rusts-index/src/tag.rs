@@ -211,6 +211,27 @@ impl TagIndex {
         self.series_to_internal.get(&series_id).map(|v| *v)
     }
 
+    /// Get the cardinality (number of matching series) for a tag key-value pair.
+    ///
+    /// Used for filter ordering by selectivity - filters with lower cardinality
+    /// should be applied first to shrink bitmaps faster.
+    ///
+    /// Returns None if the tag doesn't exist.
+    pub fn get_cardinality(&self, key: &str, value: &str) -> Option<usize> {
+        self.find_by_tag_bitmap(key, value)
+            .map(|bitmap| bitmap.len() as usize)
+    }
+
+    /// Get the total cardinality for multiple tag values (for IN filters).
+    ///
+    /// Returns the sum of cardinalities for all matching values.
+    pub fn get_cardinality_in(&self, key: &str, values: &[String]) -> usize {
+        values
+            .iter()
+            .filter_map(|v| self.get_cardinality(key, v))
+            .sum()
+    }
+
     /// Convert a slice of series IDs to a bitmap of internal IDs
     pub fn series_to_bitmap(&self, series_ids: &[SeriesId]) -> RoaringBitmap {
         let mut bitmap = RoaringBitmap::new();
@@ -492,6 +513,40 @@ mod tests {
         // Non-existent tag
         assert!(index.find_by_tag("nonexistent", "value").is_empty());
         assert!(index.find_by_tags_all(&[Tag::new("nonexistent", "value")]).is_empty());
+    }
+
+    #[test]
+    fn test_tag_index_cardinality() {
+        let index = TagIndex::new();
+
+        // Index series with varying tag cardinalities
+        // region has 2 values: us-west (3 series), us-east (1 series)
+        // host has 4 values: one each
+        index.index_series(1, &[Tag::new("host", "server01"), Tag::new("region", "us-west")]);
+        index.index_series(2, &[Tag::new("host", "server02"), Tag::new("region", "us-west")]);
+        index.index_series(3, &[Tag::new("host", "server03"), Tag::new("region", "us-west")]);
+        index.index_series(4, &[Tag::new("host", "server04"), Tag::new("region", "us-east")]);
+
+        // Test get_cardinality
+        assert_eq!(index.get_cardinality("region", "us-west"), Some(3));
+        assert_eq!(index.get_cardinality("region", "us-east"), Some(1));
+        assert_eq!(index.get_cardinality("host", "server01"), Some(1));
+        assert_eq!(index.get_cardinality("host", "server02"), Some(1));
+        assert_eq!(index.get_cardinality("nonexistent", "value"), None);
+
+        // Test get_cardinality_in
+        assert_eq!(
+            index.get_cardinality_in("host", &["server01".to_string(), "server02".to_string()]),
+            2
+        );
+        assert_eq!(
+            index.get_cardinality_in("region", &["us-west".to_string(), "us-east".to_string()]),
+            4
+        );
+        assert_eq!(
+            index.get_cardinality_in("nonexistent", &["value".to_string()]),
+            0
+        );
     }
 
     #[test]

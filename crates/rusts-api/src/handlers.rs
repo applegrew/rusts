@@ -9,7 +9,7 @@ use axum::{
 use parking_lot::RwLock;
 use rusts_core::{ParallelConfig, TimeRange};
 use rusts_index::{SeriesIndex, TagIndex};
-use rusts_query::{AggregateFunction, Query, QueryExecutor};
+use rusts_query::{AggregateFunction, Query, QueryExecutor, QueryPlanner};
 use rusts_sql::{SqlCommand, SqlParser, SqlTranslator};
 use rusts_storage::StorageEngine;
 use serde::{Deserialize, Serialize};
@@ -540,11 +540,61 @@ pub struct SqlQueryRequest {
     pub query: String,
 }
 
+/// EXPLAIN query response
+#[derive(Serialize)]
+pub struct ExplainResponse {
+    /// Measurement being queried
+    pub measurement: String,
+    /// Time range of the query
+    pub time_range: TimeRangeResponse,
+    /// List of optimizations applied
+    pub optimizations: Vec<String>,
+    /// Filter order with cardinalities
+    pub filter_order: Vec<FilterOrderEntry>,
+    /// Number of partitions to scan
+    pub partitions_to_scan: usize,
+    /// Estimated series count
+    pub estimated_series: usize,
+    /// Estimated point count
+    pub estimated_points: u64,
+    /// Execution hints
+    pub hints: ExecutionHintsResponse,
+}
+
+#[derive(Serialize)]
+pub struct TimeRangeResponse {
+    pub start: i64,
+    pub end: i64,
+}
+
+#[derive(Serialize)]
+pub struct FilterOrderEntry {
+    pub filter: String,
+    pub cardinality: usize,
+}
+
+#[derive(Serialize)]
+pub struct ExecutionHintsResponse {
+    pub memtable_only: bool,
+    pub use_segment_stats: bool,
+    pub filters_reordered: bool,
+}
+
+/// SQL query response - can be either query results or explain output
+#[derive(Serialize)]
+#[serde(untagged)]
+pub enum SqlQueryResponse {
+    /// Normal query results
+    QueryResult(QueryResponse),
+    /// EXPLAIN output
+    Explain(ExplainResponse),
+}
+
 /// Execute a SQL query
 pub async fn sql_query(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SqlQueryRequest>,
-) -> std::result::Result<Json<QueryResponse>, ApiError> {
+) -> std::result::Result<Json<SqlQueryResponse>, ApiError> {
     let start = Instant::now();
 
     // Parse SQL
@@ -571,12 +621,47 @@ pub async fn sql_query(
                 .collect();
 
             let total_rows = results.len();
-            Ok(Json(QueryResponse {
+            Ok(Json(SqlQueryResponse::QueryResult(QueryResponse {
                 measurement: "_tables".to_string(),
                 results,
                 total_rows,
                 execution_time_ms: start.elapsed().as_secs_f64() * 1000.0,
-            }))
+            })))
+        }
+        SqlCommand::Explain(query) => {
+            // Generate query plan without executing
+            let planner = QueryPlanner::new();
+
+            // Create plan
+            let plan = planner.plan(query.clone()).map_err(|e| ApiError::Query(e.to_string()))?;
+            let explain = plan.explain();
+
+            // Check if memtable can serve this query
+            let memtable_only = if let Some(storage) = state.get_storage() {
+                storage.can_serve_from_memtable(&query.time_range)
+            } else {
+                false
+            };
+
+            Ok(Json(SqlQueryResponse::Explain(ExplainResponse {
+                measurement: explain.measurement,
+                time_range: TimeRangeResponse {
+                    start: explain.time_range.start,
+                    end: explain.time_range.end,
+                },
+                optimizations: explain.optimizations,
+                filter_order: explain.filter_order.into_iter()
+                    .map(|(filter, cardinality)| FilterOrderEntry { filter, cardinality })
+                    .collect(),
+                partitions_to_scan: explain.partitions_to_scan,
+                estimated_series: explain.estimated_series,
+                estimated_points: explain.estimated_points,
+                hints: ExecutionHintsResponse {
+                    memtable_only,
+                    use_segment_stats: plan.hints.use_segment_stats,
+                    filters_reordered: plan.hints.filters_reordered,
+                },
+            })))
         }
         SqlCommand::Query(query) => {
             // Check if storage/executor is ready
@@ -653,12 +738,12 @@ pub async fn sql_query(
                 })
                 .collect();
 
-            Ok(Json(QueryResponse {
+            Ok(Json(SqlQueryResponse::QueryResult(QueryResponse {
                 measurement: result.measurement,
                 results,
                 total_rows: result.total_rows,
                 execution_time_ms: start.elapsed().as_secs_f64() * 1000.0,
-            }))
+            })))
         }
     }
 }

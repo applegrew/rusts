@@ -327,6 +327,85 @@ impl Partition {
         result
     }
 
+    /// Get aggregated field statistics for specified series within a time range.
+    ///
+    /// Returns aggregated FieldStats (min, max, sum, count) across all segments
+    /// that overlap with the time range. This enables aggregation pushdown where
+    /// COUNT/MIN/MAX/SUM can be computed without reading point data.
+    ///
+    /// Returns None if no segments have stats for the requested field.
+    pub fn get_field_stats(
+        &self,
+        series_ids: &[SeriesId],
+        time_range: &TimeRange,
+        field_name: &str,
+    ) -> Option<crate::segment::FieldStats> {
+        let segments = self.segments.read();
+        let mut total_min = f64::INFINITY;
+        let mut total_max = f64::NEG_INFINITY;
+        let mut total_sum = 0.0;
+        let mut total_count = 0u64;
+        let mut found_any = false;
+
+        for series_id in series_ids {
+            if let Some(series_segments) = segments.get(series_id) {
+                for segment in series_segments {
+                    // Check if segment overlaps with time range
+                    if !segment.overlaps(time_range) {
+                        continue;
+                    }
+
+                    // Get field stats from segment metadata
+                    if let Some(stats) = segment.meta().field_stats.get(field_name) {
+                        if let (Some(min), Some(max), Some(sum)) = (stats.min, stats.max, stats.sum) {
+                            found_any = true;
+                            total_min = total_min.min(min);
+                            total_max = total_max.max(max);
+                            total_sum += sum;
+                            total_count += stats.count;
+                        }
+                    }
+                }
+            }
+        }
+
+        if found_any {
+            Some(crate::segment::FieldStats {
+                min: Some(total_min),
+                max: Some(total_max),
+                sum: Some(total_sum),
+                count: total_count,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Get total point count for specified series within a time range.
+    ///
+    /// This is used for COUNT(*) optimization - counts points from segment
+    /// metadata without reading actual data.
+    pub fn get_point_count_for_series(
+        &self,
+        series_ids: &[SeriesId],
+        time_range: &TimeRange,
+    ) -> u64 {
+        let segments = self.segments.read();
+        let mut total = 0u64;
+
+        for series_id in series_ids {
+            if let Some(series_segments) = segments.get(series_id) {
+                for segment in series_segments {
+                    if segment.overlaps(time_range) {
+                        total += segment.meta().point_count as u64;
+                    }
+                }
+            }
+        }
+
+        total
+    }
+
     /// Get metadata
     pub fn meta(&self) -> PartitionMeta {
         PartitionMeta {

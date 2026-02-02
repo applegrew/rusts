@@ -1,8 +1,56 @@
-//! Query planner with partition pruning
+//! Query planner with partition pruning and time-series specific optimizations
 
 use crate::error::Result;
 use crate::model::{Query, TagFilter};
 use rusts_core::{SeriesId, TimeRange};
+use serde::Serialize;
+
+/// Execution hints for time-series specific optimizations.
+///
+/// These hints are computed during planning and used by the executor
+/// to choose optimal execution paths without complex cost models.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ExecutionHints {
+    /// Query can be served from memtable alone (hot data routing)
+    pub memtable_only: bool,
+    /// Aggregation can use segment statistics (no data decompression)
+    pub use_segment_stats: bool,
+    /// Tag filters were reordered by cardinality for optimal bitmap shrinking
+    pub filters_reordered: bool,
+    /// Filter order with cardinalities: (filter description, cardinality)
+    /// For EXPLAIN output to show which filters are applied first
+    pub filter_order: Vec<(String, usize)>,
+    /// Number of partitions to scan
+    pub partition_count: usize,
+    /// Estimated number of series matching filters
+    pub estimated_series: usize,
+    /// Estimated number of points to scan
+    pub estimated_points: u64,
+}
+
+impl ExecutionHints {
+    /// Create new hints with default values
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Create hints indicating memtable-only query
+    pub fn memtable_only() -> Self {
+        Self {
+            memtable_only: true,
+            partition_count: 0,
+            ..Default::default()
+        }
+    }
+
+    /// Create hints indicating segment stats can be used
+    pub fn with_segment_stats() -> Self {
+        Self {
+            use_segment_stats: true,
+            ..Default::default()
+        }
+    }
+}
 
 /// Query plan describing how to execute a query
 #[derive(Debug, Clone)]
@@ -15,6 +63,54 @@ pub struct QueryPlan {
     pub series_ids: Option<Vec<SeriesId>>,
     /// Estimated cost (lower is better)
     pub estimated_cost: f64,
+    /// Execution hints for time-series specific optimizations
+    pub hints: ExecutionHints,
+}
+
+impl QueryPlan {
+    /// Format the query plan for EXPLAIN output
+    pub fn explain(&self) -> ExplainOutput {
+        let mut optimizations = Vec::new();
+
+        if self.hints.memtable_only {
+            optimizations.push("memtable_only: true (query within memtable time range)".to_string());
+        }
+        if self.hints.use_segment_stats {
+            optimizations.push("segment_stats_pushdown: true (aggregation uses segment statistics)".to_string());
+        }
+        if self.hints.filters_reordered {
+            optimizations.push("filter_reordering: true (filters ordered by cardinality)".to_string());
+        }
+
+        ExplainOutput {
+            measurement: self.query.measurement.clone(),
+            time_range: self.query.time_range,
+            optimizations,
+            filter_order: self.hints.filter_order.clone(),
+            partitions_to_scan: self.hints.partition_count,
+            estimated_series: self.hints.estimated_series,
+            estimated_points: self.hints.estimated_points,
+        }
+    }
+}
+
+/// Structured EXPLAIN output for JSON serialization
+#[derive(Debug, Clone, Serialize)]
+pub struct ExplainOutput {
+    /// Measurement being queried
+    pub measurement: String,
+    /// Time range of the query
+    pub time_range: TimeRange,
+    /// List of optimizations applied
+    pub optimizations: Vec<String>,
+    /// Filter order with cardinalities
+    pub filter_order: Vec<(String, usize)>,
+    /// Number of partitions to scan
+    pub partitions_to_scan: usize,
+    /// Estimated series count
+    pub estimated_series: usize,
+    /// Estimated point count
+    pub estimated_points: u64,
 }
 
 /// Query planner for optimizing query execution
@@ -54,11 +150,18 @@ impl QueryPlanner {
 
         let estimated_cost = (base_cost + time_cost) * filter_discount;
 
+        // Initialize hints with partition count
+        let hints = ExecutionHints {
+            partition_count: partition_ranges.len(),
+            ..Default::default()
+        };
+
         Ok(QueryPlan {
             query,
             partition_ranges,
             series_ids: None, // Will be resolved during execution
             estimated_cost,
+            hints,
         })
     }
 
@@ -68,6 +171,7 @@ impl QueryPlanner {
 
         // Reduce cost estimate based on number of series
         plan.estimated_cost *= series_ids.len() as f64 / 1000.0;
+        plan.hints.estimated_series = series_ids.len();
         plan.series_ids = Some(series_ids);
 
         Ok(plan)
@@ -270,5 +374,72 @@ mod tests {
         // Cost should be finite and positive
         assert!(plan.estimated_cost.is_finite());
         assert!(plan.estimated_cost >= 0.0);
+    }
+
+    #[test]
+    fn test_execution_hints_default() {
+        let hints = ExecutionHints::default();
+        assert!(!hints.memtable_only);
+        assert!(!hints.use_segment_stats);
+        assert!(!hints.filters_reordered);
+        assert!(hints.filter_order.is_empty());
+        assert_eq!(hints.partition_count, 0);
+        assert_eq!(hints.estimated_series, 0);
+        assert_eq!(hints.estimated_points, 0);
+    }
+
+    #[test]
+    fn test_execution_hints_memtable_only() {
+        let hints = ExecutionHints::memtable_only();
+        assert!(hints.memtable_only);
+        assert_eq!(hints.partition_count, 0);
+    }
+
+    #[test]
+    fn test_execution_hints_with_segment_stats() {
+        let hints = ExecutionHints::with_segment_stats();
+        assert!(hints.use_segment_stats);
+    }
+
+    #[test]
+    fn test_plan_includes_hints() {
+        let mut planner = QueryPlanner::new();
+        planner.set_partitions(vec![
+            TimeRange::new(0, 1000),
+            TimeRange::new(1000, 2000),
+        ]);
+
+        let query = Query::builder("cpu")
+            .time_range(0, 1500)
+            .build()
+            .unwrap();
+
+        let plan = planner.plan(query).unwrap();
+
+        // Should have hints with partition count
+        assert_eq!(plan.hints.partition_count, 2);
+    }
+
+    #[test]
+    fn test_plan_explain() {
+        let mut planner = QueryPlanner::new();
+        planner.set_partitions(vec![TimeRange::new(0, 1000)]);
+
+        let query = Query::builder("cpu")
+            .time_range(0, 500)
+            .build()
+            .unwrap();
+
+        let mut plan = planner.plan(query).unwrap();
+        plan.hints.memtable_only = true;
+        plan.hints.estimated_series = 5;
+        plan.hints.estimated_points = 1000;
+
+        let explain = plan.explain();
+        assert_eq!(explain.measurement, "cpu");
+        assert_eq!(explain.partitions_to_scan, 1);
+        assert_eq!(explain.estimated_series, 5);
+        assert_eq!(explain.estimated_points, 1000);
+        assert!(explain.optimizations.iter().any(|o| o.contains("memtable_only")));
     }
 }

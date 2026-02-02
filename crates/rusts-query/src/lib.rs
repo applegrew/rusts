@@ -16,7 +16,7 @@ pub use aggregation::{AggregateFunction, Aggregator};
 pub use error::{QueryError, Result};
 pub use executor::QueryExecutor;
 pub use model::{FieldSelection, Query, QueryBuilder, QueryResult, TagFilter};
-pub use planner::QueryPlanner;
+pub use planner::{ExecutionHints, ExplainOutput, QueryPlan, QueryPlanner};
 
 // Re-export from rusts-core
 pub use rusts_core::ParallelConfig;

@@ -243,6 +243,14 @@ impl QueryExecutor {
         self.parallel_config = config;
     }
 
+    /// Check if query can use hot data routing (memtable-only path).
+    ///
+    /// Returns true if the query's time range is fully contained within the memtable's
+    /// time range, meaning no partition scans are needed.
+    fn can_use_hot_data_routing(&self, query: &Query) -> bool {
+        self.storage.can_serve_from_memtable(&query.time_range)
+    }
+
     /// Execute a query
     pub fn execute(&self, query: Query) -> Result<QueryResult> {
         let start = Instant::now();
@@ -257,13 +265,18 @@ impl QueryExecutor {
         // Resolve series IDs from filters
         let series_ids = self.resolve_series_ids(&query, None)?;
 
-        // Check if optimized LIMIT path is used (to avoid double limit application)
+        // Check if optimized paths can be used
         let uses_optimized_limit = self.can_use_optimized_limit(&query);
+        let uses_hot_data = self.can_use_hot_data_routing(&query);
 
         // Execute based on field selection
         let result = match &query.field_selection {
             FieldSelection::All | FieldSelection::Fields(_) => {
-                self.execute_select(&query, &series_ids, None)?
+                if uses_hot_data {
+                    self.execute_select_memtable_only(&query, &series_ids)?
+                } else {
+                    self.execute_select(&query, &series_ids, None)?
+                }
             }
             FieldSelection::Aggregate { field, function, alias } => {
                 self.execute_aggregate(&query, &series_ids, field, *function, alias.clone(), None)?
@@ -271,7 +284,7 @@ impl QueryExecutor {
         };
 
         // Apply limit and offset (skip for optimized path - already applied)
-        let result = if uses_optimized_limit {
+        let result = if uses_optimized_limit && !uses_hot_data {
             result
         } else {
             self.apply_limit_offset(result, query.limit, query.offset)
@@ -339,12 +352,54 @@ impl QueryExecutor {
         Ok(result)
     }
 
+    /// Order filters by cardinality (most selective first).
+    ///
+    /// High-selectivity filters (low cardinality) should be applied first
+    /// to shrink bitmaps quickly. For example, device_id=X (cardinality ~1)
+    /// should come before region=Y (cardinality ~1000).
+    fn order_filters_by_cardinality(&self, filters: &[TagFilter]) -> Vec<(TagFilter, usize)> {
+        let mut with_cardinality: Vec<(TagFilter, usize)> = filters
+            .iter()
+            .map(|f| {
+                let cardinality = match f {
+                    TagFilter::Equals { key, value } => {
+                        self.tag_index.get_cardinality(key, value).unwrap_or(1000)
+                    }
+                    TagFilter::In { key, values } => {
+                        // Sum of cardinalities for all values in IN clause
+                        values
+                            .iter()
+                            .filter_map(|v| self.tag_index.get_cardinality(key, v))
+                            .sum::<usize>()
+                            .max(1)
+                    }
+                    TagFilter::NotEquals { .. } => {
+                        // NotEquals is less selective, give high cardinality
+                        10000
+                    }
+                    TagFilter::Regex { .. } | TagFilter::Exists { .. } => {
+                        // Default for complex filters - apply last
+                        10000
+                    }
+                };
+                (f.clone(), cardinality)
+            })
+            .collect();
+
+        // Sort by cardinality ascending (most selective first)
+        with_cardinality.sort_by_key(|(_, c)| *c);
+        with_cardinality
+    }
+
     /// Resolve series IDs matching the query filters
     ///
     /// Uses bitmap operations for efficient filtering when possible:
     /// - Equals filters use bitmap AND operations
     /// - NotEquals filters use bitmap AND NOT operations
     /// - In filters use bitmap OR followed by AND
+    ///
+    /// Filters are ordered by cardinality (most selective first) to shrink
+    /// bitmaps faster and reduce intermediate work.
     fn resolve_series_ids(
         &self,
         query: &Query,
@@ -364,10 +419,13 @@ impl QueryExecutor {
         // Convert measurement series to bitmap for efficient filtering
         let mut result_bitmap = self.tag_index.series_to_bitmap(&measurement_series);
 
+        // Order filters by cardinality (most selective first)
+        let ordered_filters = self.order_filters_by_cardinality(&query.tag_filters);
+
         // Track whether we need to fall back to per-series filtering for some filters
         let mut needs_per_series_filter = Vec::new();
 
-        for filter in &query.tag_filters {
+        for (filter, _cardinality) in &ordered_filters {
             // Check cancellation before each filter
             if let Some(cancel) = cancel {
                 if cancel.is_cancelled() {
@@ -473,6 +531,47 @@ impl QueryExecutor {
             Some((field, _)) if field == "time" => true,         // Explicit time order
             Some(_) => false,                                    // Custom field order - can't optimize
         }
+    }
+
+    /// Execute a SELECT query using memtable-only path (hot data routing).
+    ///
+    /// This is an optimized path for queries where the time range is fully
+    /// contained within the memtable, skipping all partition scans.
+    fn execute_select_memtable_only(
+        &self,
+        query: &Query,
+        series_ids: &[SeriesId],
+    ) -> Result<QueryResult> {
+        // Use batch query for efficiency
+        let series_data = self.storage.query_memtable_only_multi(series_ids, &query.time_range);
+
+        let mut rows = Vec::new();
+        for (series_id, points) in series_data {
+            let series_meta = self.series_index.get(series_id);
+            let tags = series_meta.map(|m| m.tags).unwrap_or_default();
+
+            for point in points {
+                let fields = self.filter_fields(&point.fields, &query.field_selection);
+                rows.push(ResultRow {
+                    timestamp: Some(point.timestamp),
+                    series_id,
+                    tags: tags.clone(),
+                    fields,
+                });
+            }
+        }
+
+        // Sort by timestamp
+        rows.sort_by_key(|r| r.timestamp);
+
+        let total_rows = rows.len();
+
+        Ok(QueryResult {
+            measurement: query.measurement.clone(),
+            rows,
+            total_rows,
+            execution_time_ns: 0,
+        })
     }
 
     /// Execute a SELECT query (raw data) with parallel series processing
@@ -778,6 +877,94 @@ impl QueryExecutor {
         }
     }
 
+    /// Check if the query can use segment statistics for aggregation.
+    ///
+    /// Segment stats can be used when:
+    /// - Aggregation is COUNT/SUM/MIN/MAX (not AVG/FIRST/LAST)
+    /// - No GROUP BY clause
+    /// - No GROUP BY TIME clause
+    /// - All segments have stats for the field (or field is "*" for COUNT)
+    /// - No data in memtable for the query range (memtable doesn't have stats)
+    fn can_use_segment_stats(&self, query: &Query, series_ids: &[SeriesId], field: &str, function: AggregateFunction) -> bool {
+        // Must be a simple aggregation without GROUP BY
+        if !query.group_by.is_empty() || query.group_by_time.is_some() {
+            return false;
+        }
+
+        // Only certain aggregation functions can use segment stats
+        if !matches!(function, AggregateFunction::Count | AggregateFunction::Sum | AggregateFunction::Min | AggregateFunction::Max) {
+            return false;
+        }
+
+        // For COUNT(*), we just need segment metadata (point_count)
+        if field == "*" && function == AggregateFunction::Count {
+            // Check if memtable has data - if so, we can't use stats alone
+            let (_, has_memtable_data) = self.storage.get_segment_point_count(series_ids, &query.time_range);
+            return !has_memtable_data;
+        }
+
+        // For field-specific aggregations, verify segment stats are complete
+        // Check if memtable has data - if so, we can't use stats alone
+        let (_, has_memtable_data) = self.storage.get_segment_point_count(series_ids, &query.time_range);
+        if has_memtable_data {
+            return false;
+        }
+
+        // Check if all segments have stats for this field
+        self.storage.has_complete_segment_stats(series_ids, &query.time_range, field)
+    }
+
+    /// Execute aggregation using segment statistics only (no data decompression).
+    ///
+    /// This is a fast path for simple aggregations that can use pre-computed
+    /// statistics from segment metadata.
+    fn execute_with_segment_stats(
+        &self,
+        query: &Query,
+        series_ids: &[SeriesId],
+        field: &str,
+        function: AggregateFunction,
+        field_name: &str,
+    ) -> Result<QueryResult> {
+        let mut fields = HashMap::new();
+
+        // For COUNT(*), use point count from segment metadata
+        if field == "*" && function == AggregateFunction::Count {
+            let (count, _) = self.storage.get_segment_point_count(series_ids, &query.time_range);
+            fields.insert(field_name.to_string(), FieldValue::Integer(count as i64));
+        } else {
+            // Get aggregated field stats
+            if let Some(stats) = self.storage.get_aggregated_field_stats(series_ids, &query.time_range, field) {
+                let value = match function {
+                    AggregateFunction::Count => FieldValue::Integer(stats.count as i64),
+                    AggregateFunction::Sum => FieldValue::Float(stats.sum.unwrap_or(0.0)),
+                    AggregateFunction::Min => FieldValue::Float(stats.min.unwrap_or(f64::NAN)),
+                    AggregateFunction::Max => FieldValue::Float(stats.max.unwrap_or(f64::NAN)),
+                    _ => unreachable!("Only Count/Sum/Min/Max can use segment stats"),
+                };
+                fields.insert(field_name.to_string(), value);
+            }
+        }
+
+        let (rows, total_rows) = if fields.is_empty() {
+            (Vec::new(), 0)
+        } else {
+            (vec![ResultRow {
+                timestamp: None,
+                series_id: 0,
+                tags: Vec::new(),
+                fields,
+            }], 1)
+        };
+
+        Ok(QueryResult {
+            measurement: query.measurement.clone(),
+            rows,
+            total_rows,
+            execution_time_ns: 0,
+        })
+    }
+
     /// Execute an aggregate query with parallel series and partition processing
     fn execute_aggregate(
         &self,
@@ -802,6 +989,11 @@ impl QueryExecutor {
             return self.execute_aggregate_grouped(
                 query, series_ids, field, function, &field_name, cancel,
             );
+        }
+
+        // Try segment stats optimization for simple aggregations
+        if self.can_use_segment_stats(query, series_ids, field, function) {
+            return self.execute_with_segment_stats(query, series_ids, field, function, &field_name);
         }
 
         // Simple aggregation over all data
@@ -1900,6 +2092,165 @@ mod tests {
         assert!(server01_count > 0, "Should have some server01 rows");
         assert!(server02_count > 0, "Should have some server02 rows");
         assert_eq!(server01_count + server02_count, 10);
+
+        storage.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_filter_ordering_by_cardinality() {
+        // Test that filters are applied in cardinality order
+        // This doesn't test correctness of results (already tested), but
+        // ensures the ordering logic doesn't break queries
+        let (storage, series_index, tag_index, _dir) = setup_test_env();
+
+        // Create data with varying cardinalities:
+        // - region has 2 values: us-west (5 series), us-east (5 series)
+        // - device_id has 10 values: device-0..9 (1 series each)
+        for i in 0..10 {
+            let region = if i < 5 { "us-west" } else { "us-east" };
+            let device_id = format!("device-{}", i);
+
+            let point = Point::builder("metrics")
+                .timestamp(i * 1000)
+                .tag("region", region)
+                .tag("device_id", &device_id)
+                .field("value", i as f64)
+                .build()
+                .unwrap();
+
+            storage.write(&point).unwrap();
+            series_index.upsert(point.series_id(), "metrics", &point.tags, point.timestamp);
+            tag_index.index_series(point.series_id(), &point.tags);
+        }
+
+        let executor = QueryExecutor::new(
+            Arc::clone(&storage),
+            Arc::clone(&series_index),
+            Arc::clone(&tag_index),
+        );
+
+        // Query with both filters - device_id filter (cardinality 1) should be
+        // applied before region filter (cardinality 5) for optimal bitmap shrinking
+        let query = Query::builder("metrics")
+            .time_range(0, 100000)
+            .where_tag("region", "us-west")
+            .where_tag("device_id", "device-2")
+            .build()
+            .unwrap();
+
+        let result = executor.execute(query).unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert!(result.rows[0].tags.iter().any(|t| t.key == "device_id" && t.value == "device-2"));
+        assert!(result.rows[0].tags.iter().any(|t| t.key == "region" && t.value == "us-west"));
+
+        storage.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_segment_stats_aggregation_pushdown() {
+        // Test that segment stats can be used for COUNT/MIN/MAX/SUM
+        // when data is in segments (not memtable)
+        use rusts_storage::memtable::FlushTrigger;
+
+        let dir = TempDir::new().unwrap();
+        let config = StorageEngineConfig {
+            data_dir: dir.path().to_path_buf(),
+            wal_durability: WalDurability::None,
+            flush_trigger: FlushTrigger {
+                max_size: 1, // Force immediate flush
+                max_points: 1,
+                max_age_nanos: 0,
+                out_of_order_lag_ms: 0,
+            },
+            ..Default::default()
+        };
+
+        let storage = Arc::new(StorageEngine::new(config).unwrap());
+        let series_index = Arc::new(SeriesIndex::new());
+        let tag_index = Arc::new(TagIndex::new());
+
+        // Write data - should flush to segments
+        for i in 0..100 {
+            let point = create_test_point("server01", (i + 1) * 1000000, (i + 1) as f64);
+            storage.write(&point).unwrap();
+
+            let series_id = point.series_id();
+            series_index.upsert(series_id, "cpu", &point.tags, point.timestamp);
+            tag_index.index_series(series_id, &point.tags);
+        }
+
+        // Force flush to ensure data is in segments
+        storage.flush().ok();
+
+        // Wait briefly for flush to complete
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let executor = QueryExecutor::new(
+            Arc::clone(&storage),
+            Arc::clone(&series_index),
+            Arc::clone(&tag_index),
+        );
+
+        // Test COUNT aggregation
+        let count_query = Query::builder("cpu")
+            .time_range(0, 1000000000)
+            .select_aggregate("value", AggregateFunction::Count, Some("count".to_string()))
+            .build()
+            .unwrap();
+
+        let result = executor.execute(count_query).unwrap();
+        assert_eq!(result.rows.len(), 1);
+        if let Some(FieldValue::Integer(count)) = result.rows[0].fields.get("count") {
+            assert_eq!(*count, 100, "COUNT should return 100");
+        } else {
+            panic!("Expected count field");
+        }
+
+        // Test MIN aggregation
+        let min_query = Query::builder("cpu")
+            .time_range(0, 1000000000)
+            .select_aggregate("value", AggregateFunction::Min, Some("min_value".to_string()))
+            .build()
+            .unwrap();
+
+        let result = executor.execute(min_query).unwrap();
+        assert_eq!(result.rows.len(), 1);
+        if let Some(FieldValue::Float(min)) = result.rows[0].fields.get("min_value") {
+            assert!((min - 1.0).abs() < 0.01, "MIN should be 1.0, got {}", min);
+        } else {
+            panic!("Expected min_value field");
+        }
+
+        // Test MAX aggregation
+        let max_query = Query::builder("cpu")
+            .time_range(0, 1000000000)
+            .select_aggregate("value", AggregateFunction::Max, Some("max_value".to_string()))
+            .build()
+            .unwrap();
+
+        let result = executor.execute(max_query).unwrap();
+        assert_eq!(result.rows.len(), 1);
+        if let Some(FieldValue::Float(max)) = result.rows[0].fields.get("max_value") {
+            assert!((max - 100.0).abs() < 0.01, "MAX should be 100.0, got {}", max);
+        } else {
+            panic!("Expected max_value field");
+        }
+
+        // Test SUM aggregation
+        let sum_query = Query::builder("cpu")
+            .time_range(0, 1000000000)
+            .select_aggregate("value", AggregateFunction::Sum, Some("sum_value".to_string()))
+            .build()
+            .unwrap();
+
+        let result = executor.execute(sum_query).unwrap();
+        assert_eq!(result.rows.len(), 1);
+        if let Some(FieldValue::Float(sum)) = result.rows[0].fields.get("sum_value") {
+            // Sum of 1..100 = 100*101/2 = 5050
+            assert!((sum - 5050.0).abs() < 0.01, "SUM should be 5050.0, got {}", sum);
+        } else {
+            panic!("Expected sum_value field");
+        }
 
         storage.shutdown().unwrap();
     }

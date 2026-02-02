@@ -20,6 +20,8 @@ pub enum SqlCommand {
     Query(Query),
     /// SHOW TABLES command - returns list of measurements
     ShowTables,
+    /// EXPLAIN query - returns query plan without execution
+    Explain(Query),
 }
 
 /// SQL to Query translator
@@ -36,7 +38,7 @@ impl SqlTranslator {
         }
     }
 
-    /// Translate a SQL statement into a SqlCommand (Query or ShowTables)
+    /// Translate a SQL statement into a SqlCommand (Query, ShowTables, or Explain)
     pub fn translate_command(stmt: &Statement) -> Result<SqlCommand> {
         match stmt {
             Statement::Query(query) => {
@@ -44,6 +46,28 @@ impl SqlTranslator {
                 Ok(SqlCommand::Query(q))
             }
             Statement::ShowTables { .. } => Ok(SqlCommand::ShowTables),
+            Statement::Explain {
+                statement,
+                analyze,
+                ..
+            } => {
+                // EXPLAIN ANALYZE is not supported
+                if *analyze {
+                    return Err(SqlError::UnsupportedFeature(
+                        "EXPLAIN ANALYZE not supported".to_string(),
+                    ));
+                }
+                // Extract the inner query from the EXPLAIN statement
+                match statement.as_ref() {
+                    Statement::Query(query) => {
+                        let q = Self::translate_query(query)?;
+                        Ok(SqlCommand::Explain(q))
+                    }
+                    _ => Err(SqlError::UnsupportedFeature(
+                        "EXPLAIN only supports SELECT statements".to_string(),
+                    )),
+                }
+            }
             _ => Err(SqlError::UnsupportedFeature(format!(
                 "Unsupported statement type: {:?}",
                 stmt
@@ -877,5 +901,31 @@ mod tests {
         let stmt = SqlParser::parse("SHOW TABLES").unwrap();
         let cmd = SqlTranslator::translate_command(&stmt).unwrap();
         assert!(matches!(cmd, SqlCommand::ShowTables));
+    }
+
+    #[test]
+    fn test_explain_query() {
+        let stmt = SqlParser::parse("EXPLAIN SELECT * FROM cpu WHERE host = 'server01'").unwrap();
+        let cmd = SqlTranslator::translate_command(&stmt).unwrap();
+        match cmd {
+            SqlCommand::Explain(query) => {
+                assert_eq!(query.measurement, "cpu");
+                assert_eq!(query.tag_filters.len(), 1);
+            }
+            _ => panic!("Expected Explain command"),
+        }
+    }
+
+    #[test]
+    fn test_explain_aggregation() {
+        let stmt = SqlParser::parse("EXPLAIN SELECT COUNT(*) FROM cpu").unwrap();
+        let cmd = SqlTranslator::translate_command(&stmt).unwrap();
+        match cmd {
+            SqlCommand::Explain(query) => {
+                assert_eq!(query.measurement, "cpu");
+                assert!(matches!(query.field_selection, FieldSelection::Aggregate { .. }));
+            }
+            _ => panic!("Expected Explain command"),
+        }
     }
 }
