@@ -94,28 +94,44 @@ pub struct TagIndex {
 
 ### Key Methods
 
-| Method | Line | Purpose |
-|--------|------|---------|
-| `new()` | 44-51 | Create new tag index |
-| `index_series()` | 54-72 | Index tags for a series |
-| `find_by_tag()` | 75-82 | Single tag lookup |
-| `find_by_tags_all()` | 85-109 | AND operation - series matching ALL tags |
-| `find_by_tags_any()` | 112-128 | OR operation - series matching ANY tag |
-| `find_by_tag_not()` | 131-140 | Negation - series NOT matching tag |
-| `get_tag_values()` | 143-153 | Get unique values for tag key |
-| `remove_series()` | 161-168 | Remove series from all bitmaps |
-| `to_bytes()` | 181-216 | Serialize to bincode |
-| `from_bytes()` | 219-255 | Deserialize and reconstruct mappings |
+| Method | Purpose |
+|--------|---------|
+| `new()` | Create new tag index |
+| `index_series()` | Index tags for a series |
+| `find_by_tag()` | Single tag lookup |
+| `find_by_tags_all()` | AND operation - series matching ALL tags |
+| `find_by_tags_any()` | OR operation - series matching ANY tag |
+| `find_by_tag_not()` | Negation - series NOT matching tag |
+| `get_tag_values()` | Get unique values for tag key |
+| `get_cardinality()` | Get count of series matching tag (for filter ordering) |
+| `remove_series()` | Remove series from all bitmaps |
+| `to_bytes()` | Serialize to bincode |
+| `from_bytes()` | Deserialize and reconstruct mappings |
 
 ### Bitmap Operations
 
 ```rust
-// AND operation (line 97)
+// AND operation
 result = result & bitmap.value();
 
-// OR operation (line 123)
+// OR operation
 result |= bitmap.value();
 ```
+
+### Cardinality-Based Filter Ordering
+
+The query planner uses `get_cardinality()` to order filters by selectivity:
+
+```rust
+// Lower cardinality = more selective = apply first
+let cardinality = tag_index.get_cardinality("device_id", "device-0001");
+// Returns: Some(1) - very selective, apply first
+
+let cardinality = tag_index.get_cardinality("region", "us-west");
+// Returns: Some(1000) - less selective, apply later
+```
+
+Applying high-selectivity filters first shrinks bitmaps faster, improving query performance.
 
 ## Bloom Filter (bloom.rs)
 

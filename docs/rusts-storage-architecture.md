@@ -139,9 +139,46 @@ query(series_id, time_range)
 
 Returns `Vec<MemTablePoint>` sorted by timestamp with duplicates removed.
 
-### query_measurement() (engine.rs:202-240)
+### query_measurement() (engine.rs)
 
 Queries by measurement name, returns `Vec<(SeriesId, Vec<MemTablePoint>)>`.
+
+### Query Optimization Methods
+
+**Hot Data Routing:**
+```rust
+// Check if query can be served from memtable alone
+pub fn can_serve_from_memtable(&self, time_range: &TimeRange) -> bool;
+
+// Get memtable's current time range
+pub fn get_memtable_time_range(&self) -> Option<TimeRange>;
+```
+
+**Segment Statistics:**
+```rust
+// Get aggregated field stats from segments (for COUNT/MIN/MAX/SUM pushdown)
+pub fn get_aggregated_field_stats(
+    &self,
+    series_ids: &[SeriesId],
+    time_range: &TimeRange,
+    field_name: &str,
+) -> Option<FieldStats>;
+
+// Get point count from segment metadata
+pub fn get_segment_point_count(
+    &self,
+    series_ids: &[SeriesId],
+    time_range: &TimeRange,
+) -> (u64, bool);  // (count, is_complete)
+
+// Check if all segments have complete stats
+pub fn has_complete_segment_stats(
+    &self,
+    series_ids: &[SeriesId],
+    time_range: &TimeRange,
+    field_name: &str,
+) -> bool;
+```
 
 ## WAL (Write-Ahead Log)
 
@@ -267,7 +304,7 @@ For each field:
   [field_len: u32][compressed_field_data]
 ```
 
-### SegmentMeta (segment.rs:28-47)
+### SegmentMeta (segment.rs)
 
 ```rust
 pub struct SegmentMeta {
@@ -278,10 +315,26 @@ pub struct SegmentMeta {
     pub time_range: TimeRange,
     pub point_count: usize,
     pub fields: Vec<(String, FieldType)>,
+    pub field_stats: HashMap<String, FieldStats>,  // Pre-computed stats
     pub compressed_size: usize,
     pub uncompressed_size: usize,
 }
 ```
+
+### FieldStats (segment.rs)
+
+Pre-computed statistics per field for aggregation pushdown:
+
+```rust
+pub struct FieldStats {
+    pub count: u64,
+    pub sum: f64,
+    pub min: f64,
+    pub max: f64,
+}
+```
+
+Enables COUNT/SUM/MIN/MAX queries without decompressing data.
 
 ### Compression by Field Type
 

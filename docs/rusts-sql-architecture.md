@@ -77,6 +77,7 @@ impl SqlTranslator {
 pub enum SqlCommand {
     Query(Query),
     ShowTables,
+    Explain(Query),  // Returns query plan without executing
 }
 ```
 
@@ -201,6 +202,31 @@ SHOW TABLES
 
 Returns list of measurements.
 
+### EXPLAIN
+
+```sql
+EXPLAIN SELECT COUNT(*) FROM cpu WHERE host = 'server01'
+```
+
+Returns query plan with optimization hints:
+
+```json
+{
+  "measurement": "cpu",
+  "time_range": {"start": 0, "end": 9223372036854775807},
+  "optimizations": ["segment_stats_pushdown", "filter_reordering"],
+  "filter_order": [{"filter": "host = 'server01'", "cardinality": 50}],
+  "partitions_to_scan": 3,
+  "estimated_series": 50,
+  "estimated_points": 5000,
+  "hints": {
+    "memtable_only": false,
+    "use_segment_stats": true,
+    "filters_reordered": true
+  }
+}
+```
+
 ## Time Expression Parsing
 
 ### Timestamp Formats (functions.rs:143-184)
@@ -313,12 +339,21 @@ let result = executor.execute(query)?;
 
 ## API Endpoint
 
-The `/sql` endpoint in rusts-api uses this crate:
+The `/sql` endpoint accepts plain text SQL (preferred) or JSON:
 
 ```bash
+# Plain text (preferred)
 curl -X POST http://localhost:8086/sql \
-  -H "Content-Type: text/plain" \
   -d "SELECT AVG(trip_distance) FROM trips WHERE vendor_id = '1' GROUP BY time_bucket('1h', time)"
+
+# JSON (backward compatible)
+curl -X POST http://localhost:8086/sql \
+  -H "Content-Type: application/json" \
+  -d '{"query": "SELECT * FROM cpu"}'
+
+# EXPLAIN query
+curl -X POST http://localhost:8086/sql \
+  -d "EXPLAIN SELECT COUNT(*) FROM cpu WHERE host = 'server01'"
 ```
 
 ## Limitations

@@ -27,6 +27,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/ready", get(handlers::ready))
         .route("/write", post(handlers::write))
         .route("/query", post(handlers::query))
+        .route("/sql", post(handlers::sql_query))
         .route("/stats", get(handlers::stats))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::new().allow_origin(Any))
@@ -54,13 +55,14 @@ pub struct AppState {
 
 ### Handler Functions
 
-| Handler | Lines | Route | Purpose |
-|---------|-------|-------|---------|
-| `health` | 55-60 | GET /health | Health check, returns version |
-| `ready` | 71-80 | GET /ready | Readiness check |
-| `write` | 91-121 | POST /write | Write data via line protocol |
-| `query` | 167-260 | POST /query | Query data with filters/aggregation |
-| `stats` | 332-351 | GET /stats | Database statistics |
+| Handler | Route | Purpose |
+|---------|-------|---------|
+| `health` | GET /health | Health check, returns version |
+| `ready` | GET /ready | Readiness check |
+| `write` | POST /write | Write data via line protocol |
+| `query` | POST /query | Query data with filters/aggregation (JSON) |
+| `sql_query` | POST /sql | Query data via SQL (plain text or JSON) |
+| `stats` | GET /stats | Database statistics |
 
 ### Query Request (handlers.rs:124-135)
 
@@ -88,7 +90,30 @@ pub struct WriteResponse {
 }
 ```
 
-### Duration Parsing (handlers.rs:263-305)
+### SQL Query Endpoint (handlers.rs)
+
+The `/sql` endpoint accepts both plain text and JSON:
+
+```bash
+# Plain text (preferred)
+curl -X POST http://localhost:8086/sql -d "SELECT * FROM cpu"
+
+# JSON (backward compatible)
+curl -X POST http://localhost:8086/sql \
+  -H "Content-Type: application/json" \
+  -d '{"query": "SELECT * FROM cpu"}'
+```
+
+Content-Type handling:
+- `application/json`: Parse body as `{"query": "..."}`
+- `text/plain` or omitted: Treat body as raw SQL string
+
+Supports EXPLAIN queries for query plan inspection:
+```bash
+curl -X POST http://localhost:8086/sql -d "EXPLAIN SELECT COUNT(*) FROM cpu"
+```
+
+### Duration Parsing (handlers.rs)
 
 Supports: `ns`, `us`, `ms`, `s`, `m`, `h`, `d`, `w` units.
 

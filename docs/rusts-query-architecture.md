@@ -105,13 +105,46 @@ pub struct QueryResult {
 
 ## Query Planning (planner.rs)
 
-### QueryPlan (planner.rs:8-18)
+### QueryPlan
 
 ```rust
 pub struct QueryPlan {
     pub query: Query,
     pub partition_ranges: Vec<TimeRange>,
-    pub estimated_cost: f64,
+    pub series_ids: Option<Vec<SeriesId>>,
+    pub hints: ExecutionHints,
+}
+```
+
+### ExecutionHints
+
+Tracks which time-series optimizations can be applied:
+
+```rust
+pub struct ExecutionHints {
+    pub memtable_only: bool,       // Query can be served from memtable alone
+    pub use_segment_stats: bool,   // Aggregation can use segment statistics
+    pub filters_reordered: bool,   // Filters reordered by selectivity
+    pub filter_order: Vec<(String, usize)>,  // Filter descriptions with cardinalities
+    pub partition_count: usize,
+    pub estimated_series: usize,
+    pub estimated_points: u64,
+}
+```
+
+### EXPLAIN Output
+
+`QueryPlan::explain()` returns a human-readable plan:
+
+```rust
+pub struct ExplainOutput {
+    pub measurement: String,
+    pub time_range: TimeRange,
+    pub optimizations: Vec<String>,
+    pub filter_order: Vec<(String, usize)>,
+    pub partitions_to_scan: usize,
+    pub estimated_series: usize,
+    pub estimated_points: u64,
 }
 ```
 
@@ -129,7 +162,7 @@ filter_discount = 0.5 if filters exist, else 1.0
 final_cost = (base_cost + time_cost) × filter_discount
 ```
 
-**Selectivity Estimation (lines 84-102):**
+**Selectivity Estimation:**
 
 | Filter Type | Selectivity Factor |
 |-------------|-------------------|
@@ -138,6 +171,44 @@ final_cost = (base_cost + time_cost) × filter_discount
 | Regex | 0.3× |
 | In | min(values.len() × 0.1, 0.5)× |
 | Exists | 0.7× |
+
+## Time-Series Optimizations
+
+### Filter Ordering by Cardinality
+
+Filters are reordered to apply most selective (lowest cardinality) first, shrinking bitmaps quickly:
+
+```sql
+-- Query: WHERE region='us-west' AND device_id='device-0001'
+-- Cardinality: region=5, device_id=1000
+-- Optimal: device_id first (shrinks to ~1 series), then region
+```
+
+### Hot Data Routing
+
+Recent queries can skip partition scans if data is in memtable:
+
+```rust
+if storage.can_serve_from_memtable(&query.time_range) {
+    // Fast path: memtable only, no disk I/O
+}
+```
+
+### Segment Statistics Pushdown
+
+Simple aggregations (COUNT, MIN, MAX, SUM) can use pre-computed segment statistics without decompressing data:
+
+```sql
+SELECT COUNT(*), MIN(value), MAX(value) FROM cpu
+-- Returns sum(segment.count), min(segment.min), max(segment.max)
+-- Zero data decompression needed
+```
+
+Conditions for segment stats pushdown:
+- Simple aggregate function (COUNT, SUM, MIN, MAX)
+- No GROUP BY tags
+- No GROUP BY time
+- Query covers complete segments
 
 ## Query Execution (executor.rs)
 
