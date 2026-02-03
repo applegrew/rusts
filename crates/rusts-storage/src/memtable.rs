@@ -818,4 +818,305 @@ mod tests {
         assert_eq!(memtable.point_count(), 4000);
         assert_eq!(memtable.series_count(), 4);
     }
+
+    #[test]
+    fn test_memtable_sorted_insert_out_of_order() {
+        // Test that out-of-order inserts result in sorted output
+        let memtable = MemTable::new();
+
+        let point = create_test_point("cpu", "server01", 1000, 64.5);
+        let series_id = point.series_id();
+
+        // Insert points out of order: 5, 1, 3, 2, 4
+        let timestamps = [5000, 1000, 3000, 2000, 4000];
+        for ts in timestamps {
+            let p = create_test_point("cpu", "server01", ts, ts as f64);
+            memtable.insert(&p).unwrap();
+        }
+
+        let range = TimeRange::new(0, 10000);
+        let results = memtable.query(series_id, &range);
+
+        assert_eq!(results.len(), 5);
+        // Verify sorted order
+        for i in 1..results.len() {
+            assert!(
+                results[i - 1].timestamp <= results[i].timestamp,
+                "Points should be sorted by timestamp"
+            );
+        }
+        // Verify exact order
+        assert_eq!(results[0].timestamp, 1000);
+        assert_eq!(results[1].timestamp, 2000);
+        assert_eq!(results[2].timestamp, 3000);
+        assert_eq!(results[3].timestamp, 4000);
+        assert_eq!(results[4].timestamp, 5000);
+    }
+
+    #[test]
+    fn test_memtable_batch_insert_sorted() {
+        // Test that batch insert maintains sorted order
+        let memtable = MemTable::new();
+
+        let p1 = create_test_point("cpu", "server01", 1000, 1.0);
+        let series_id = p1.series_id();
+
+        // Create batch with out-of-order timestamps
+        let points: Vec<Point> = vec![
+            create_test_point("cpu", "server01", 5000, 5.0),
+            create_test_point("cpu", "server01", 2000, 2.0),
+            create_test_point("cpu", "server01", 4000, 4.0),
+            create_test_point("cpu", "server01", 1000, 1.0),
+            create_test_point("cpu", "server01", 3000, 3.0),
+        ];
+
+        memtable.insert_batch(&points).unwrap();
+
+        let range = TimeRange::new(0, 10000);
+        let results = memtable.query(series_id, &range);
+
+        assert_eq!(results.len(), 5);
+        // Verify sorted order
+        assert_eq!(results[0].timestamp, 1000);
+        assert_eq!(results[1].timestamp, 2000);
+        assert_eq!(results[2].timestamp, 3000);
+        assert_eq!(results[3].timestamp, 4000);
+        assert_eq!(results[4].timestamp, 5000);
+    }
+
+    #[test]
+    fn test_memtable_batch_insert_merge_with_existing() {
+        // Test batch insert merges correctly with existing sorted data
+        let memtable = MemTable::new();
+
+        let p1 = create_test_point("cpu", "server01", 1000, 1.0);
+        let series_id = p1.series_id();
+
+        // Insert initial points
+        for ts in [2000, 4000, 6000] {
+            let p = create_test_point("cpu", "server01", ts, ts as f64);
+            memtable.insert(&p).unwrap();
+        }
+
+        // Batch insert points that interleave with existing
+        let batch: Vec<Point> = vec![
+            create_test_point("cpu", "server01", 1000, 1.0),
+            create_test_point("cpu", "server01", 3000, 3.0),
+            create_test_point("cpu", "server01", 5000, 5.0),
+            create_test_point("cpu", "server01", 7000, 7.0),
+        ];
+
+        memtable.insert_batch(&batch).unwrap();
+
+        let range = TimeRange::new(0, 10000);
+        let results = memtable.query(series_id, &range);
+
+        assert_eq!(results.len(), 7);
+        // Verify merged sorted order
+        let expected_timestamps = [1000, 2000, 3000, 4000, 5000, 6000, 7000];
+        for (i, expected_ts) in expected_timestamps.iter().enumerate() {
+            assert_eq!(results[i].timestamp, *expected_ts);
+        }
+    }
+
+    #[test]
+    fn test_memtable_query_with_limit_ascending() {
+        let memtable = MemTable::new();
+
+        let point = create_test_point("cpu", "server01", 1000, 64.5);
+        let series_id = point.series_id();
+
+        // Insert 100 points
+        for i in 0..100 {
+            let p = create_test_point("cpu", "server01", i * 1000, i as f64);
+            memtable.insert(&p).unwrap();
+        }
+
+        let range = TimeRange::new(0, 100000);
+        let (results, total_count) = memtable.query_with_limit(series_id, &range, 10, true);
+
+        assert_eq!(total_count, 100);
+        assert_eq!(results.len(), 10);
+        // Ascending: should get smallest timestamps first
+        for (i, point) in results.iter().enumerate() {
+            assert_eq!(point.timestamp, i as i64 * 1000);
+        }
+    }
+
+    #[test]
+    fn test_memtable_query_with_limit_descending() {
+        let memtable = MemTable::new();
+
+        let point = create_test_point("cpu", "server01", 1000, 64.5);
+        let series_id = point.series_id();
+
+        // Insert 100 points
+        for i in 0..100 {
+            let p = create_test_point("cpu", "server01", i * 1000, i as f64);
+            memtable.insert(&p).unwrap();
+        }
+
+        let range = TimeRange::new(0, 100000);
+        let (results, total_count) = memtable.query_with_limit(series_id, &range, 10, false);
+
+        assert_eq!(total_count, 100);
+        assert_eq!(results.len(), 10);
+        // Descending: should get largest timestamps first
+        for (i, point) in results.iter().enumerate() {
+            assert_eq!(point.timestamp, (99 - i as i64) * 1000);
+        }
+    }
+
+    #[test]
+    fn test_memtable_query_with_limit_within_range() {
+        // Test limit query respects time range boundaries
+        let memtable = MemTable::new();
+
+        let point = create_test_point("cpu", "server01", 1000, 64.5);
+        let series_id = point.series_id();
+
+        // Insert 100 points: 0, 1000, 2000, ... 99000
+        for i in 0..100 {
+            let p = create_test_point("cpu", "server01", i * 1000, i as f64);
+            memtable.insert(&p).unwrap();
+        }
+
+        // Query range 25000-75000 (exclusive end), limit 5
+        let range = TimeRange::new(25000, 75000);
+        let (results, total_count) = memtable.query_with_limit(series_id, &range, 5, true);
+
+        // Total in range: 25, 26, ..., 74 = 50 points
+        assert_eq!(total_count, 50);
+        assert_eq!(results.len(), 5);
+        // Should get first 5 from range
+        assert_eq!(results[0].timestamp, 25000);
+        assert_eq!(results[4].timestamp, 29000);
+    }
+
+    #[test]
+    fn test_memtable_time_range_boundary_exact() {
+        // Test exact boundary conditions: start is inclusive, end is exclusive
+        let memtable = MemTable::new();
+
+        let point = create_test_point("cpu", "server01", 1000, 64.5);
+        let series_id = point.series_id();
+
+        // Insert points at exact boundaries
+        for ts in [1000, 2000, 3000, 4000, 5000] {
+            let p = create_test_point("cpu", "server01", ts, ts as f64);
+            memtable.insert(&p).unwrap();
+        }
+
+        // Query with start=2000 (inclusive), end=4000 (exclusive)
+        let range = TimeRange::new(2000, 4000);
+        let results = memtable.query(series_id, &range);
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].timestamp, 2000); // Start is inclusive
+        assert_eq!(results[1].timestamp, 3000);
+        // 4000 should NOT be included (end is exclusive)
+    }
+
+    #[test]
+    fn test_memtable_time_range_boundary_start_only() {
+        // Test that point at start boundary is included
+        let memtable = MemTable::new();
+
+        let point = create_test_point("cpu", "server01", 1000, 64.5);
+        let series_id = point.series_id();
+
+        let p = create_test_point("cpu", "server01", 1000, 1.0);
+        memtable.insert(&p).unwrap();
+
+        // Query where start exactly matches
+        let range = TimeRange::new(1000, 2000);
+        let results = memtable.query(series_id, &range);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].timestamp, 1000);
+    }
+
+    #[test]
+    fn test_memtable_time_range_boundary_end_excluded() {
+        // Test that point at end boundary is excluded
+        let memtable = MemTable::new();
+
+        let point = create_test_point("cpu", "server01", 1000, 64.5);
+        let series_id = point.series_id();
+
+        let p = create_test_point("cpu", "server01", 2000, 2.0);
+        memtable.insert(&p).unwrap();
+
+        // Query where end exactly matches - should NOT include point
+        let range = TimeRange::new(1000, 2000);
+        let results = memtable.query(series_id, &range);
+
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn test_memtable_query_measurement_sorted() {
+        // Test that query_measurement returns sorted results
+        let memtable = MemTable::new();
+
+        // Insert points for same measurement but different series, out of order
+        let timestamps = [5000, 1000, 3000, 2000, 4000];
+        for (i, &ts) in timestamps.iter().enumerate() {
+            let p = create_test_point("cpu", &format!("server{:02}", i), ts, ts as f64);
+            memtable.insert(&p).unwrap();
+        }
+
+        let range = TimeRange::new(0, 10000);
+        let results = memtable.query_measurement("cpu", &range);
+
+        // Should have 5 series, each with 1 point
+        assert_eq!(results.len(), 5);
+        for (_, points) in &results {
+            assert_eq!(points.len(), 1);
+        }
+    }
+
+    #[test]
+    fn test_memtable_query_empty_range() {
+        let memtable = MemTable::new();
+
+        let point = create_test_point("cpu", "server01", 1000, 64.5);
+        let series_id = point.series_id();
+
+        // Insert points
+        for ts in [1000, 2000, 3000] {
+            let p = create_test_point("cpu", "server01", ts, ts as f64);
+            memtable.insert(&p).unwrap();
+        }
+
+        // Query range that doesn't contain any points
+        let range = TimeRange::new(5000, 6000);
+        let results = memtable.query(series_id, &range);
+        assert_eq!(results.len(), 0);
+
+        let (limited_results, total) = memtable.query_with_limit(series_id, &range, 10, true);
+        assert_eq!(limited_results.len(), 0);
+        assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn test_memtable_query_with_limit_larger_than_available() {
+        let memtable = MemTable::new();
+
+        let point = create_test_point("cpu", "server01", 1000, 64.5);
+        let series_id = point.series_id();
+
+        // Insert only 5 points
+        for i in 0..5 {
+            let p = create_test_point("cpu", "server01", i * 1000, i as f64);
+            memtable.insert(&p).unwrap();
+        }
+
+        let range = TimeRange::new(0, 10000);
+        // Request limit of 100, but only 5 available
+        let (results, total_count) = memtable.query_with_limit(series_id, &range, 100, true);
+
+        assert_eq!(total_count, 5);
+        assert_eq!(results.len(), 5);
+    }
 }
