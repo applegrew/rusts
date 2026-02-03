@@ -782,6 +782,40 @@ pub async fn sql_query(
                 execution_time_ms: start.elapsed().as_secs_f64() * 1000.0,
             })))
         }
+        SqlCommand::SetVariable(_, _) | SqlCommand::Empty => {
+            // SET commands - return empty success response
+            Ok(Json(SqlQueryResponse::QueryResult(QueryResponse {
+                measurement: "_set".to_string(),
+                results: vec![],
+                total_rows: 0,
+                execution_time_ms: start.elapsed().as_secs_f64() * 1000.0,
+            })))
+        }
+        SqlCommand::SystemQuery { column, value } => {
+            // System query - return single value
+            let mut fields = HashMap::new();
+            fields.insert(column, serde_json::json!(value));
+            let results = vec![ResultRowResponse {
+                time: None,
+                tags: HashMap::new(),
+                fields,
+            }];
+            Ok(Json(SqlQueryResponse::QueryResult(QueryResponse {
+                measurement: "_system".to_string(),
+                results,
+                total_rows: 1,
+                execution_time_ms: start.elapsed().as_secs_f64() * 1000.0,
+            })))
+        }
+        SqlCommand::PgCatalogQuery { table } => {
+            // pg_catalog query - return empty or mock response
+            Ok(Json(SqlQueryResponse::QueryResult(QueryResponse {
+                measurement: format!("pg_catalog.{}", table),
+                results: vec![],
+                total_rows: 0,
+                execution_time_ms: start.elapsed().as_secs_f64() * 1000.0,
+            })))
+        }
     }
 }
 

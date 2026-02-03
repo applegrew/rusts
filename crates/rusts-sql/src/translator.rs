@@ -22,6 +22,22 @@ pub enum SqlCommand {
     ShowTables,
     /// EXPLAIN query - returns query plan without execution
     Explain(Query),
+    /// SET variable command - acknowledged but ignored
+    SetVariable(String, String),
+    /// System query returning a single value (e.g., SELECT version())
+    SystemQuery {
+        /// Column name for the result
+        column: String,
+        /// Value to return
+        value: String,
+    },
+    /// Empty/no-op command
+    Empty,
+    /// Query against pg_catalog (return mock data)
+    PgCatalogQuery {
+        /// The catalog table being queried
+        table: String,
+    },
 }
 
 /// SQL to Query translator
@@ -42,6 +58,14 @@ impl SqlTranslator {
     pub fn translate_command(stmt: &Statement) -> Result<SqlCommand> {
         match stmt {
             Statement::Query(query) => {
+                // Check if this is a system query (e.g., SELECT version())
+                if let Some(cmd) = Self::try_system_query(query) {
+                    return Ok(cmd);
+                }
+                // Check if this is a pg_catalog query
+                if let Some(cmd) = Self::try_pg_catalog_query(query) {
+                    return Ok(cmd);
+                }
                 let q = Self::translate_query(query)?;
                 Ok(SqlCommand::Query(q))
             }
@@ -68,10 +92,173 @@ impl SqlTranslator {
                     )),
                 }
             }
+            // Handle SET commands - acknowledge but ignore
+            Statement::Set(_) => {
+                Ok(SqlCommand::Empty)
+            }
+            // Handle SHOW commands for PostgreSQL compatibility
+            Statement::ShowVariable { variable } => {
+                let var_name = variable.iter().map(|i| i.value.as_str()).collect::<Vec<_>>().join(".");
+                Self::handle_show_variable(&var_name)
+            }
             _ => Err(SqlError::UnsupportedFeature(format!(
                 "Unsupported statement type: {:?}",
                 stmt
             ))),
+        }
+    }
+
+    /// Try to parse a system query like SELECT version(), SELECT current_database()
+    fn try_system_query(query: &SqlQuery) -> Option<SqlCommand> {
+        let select = match query.body.as_ref() {
+            SetExpr::Select(select) => select,
+            _ => return None,
+        };
+
+        // System queries have no FROM clause
+        if !select.from.is_empty() {
+            return None;
+        }
+
+        // Check for single projection with a function call or literal
+        if select.projection.len() != 1 {
+            return None;
+        }
+
+        match &select.projection[0] {
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                Self::try_system_expr(expr)
+            }
+            _ => None,
+        }
+    }
+
+    /// Try to handle a system expression
+    fn try_system_expr(expr: &Expr) -> Option<SqlCommand> {
+        match expr {
+            Expr::Function(func) => {
+                let func_name = func.name.to_string().to_lowercase();
+                match func_name.as_str() {
+                    "version" => Some(SqlCommand::SystemQuery {
+                        column: "version".to_string(),
+                        value: "RusTs 0.1.0, compatible with PostgreSQL 15.0".to_string(),
+                    }),
+                    "current_database" | "current_catalog" => Some(SqlCommand::SystemQuery {
+                        column: "current_database".to_string(),
+                        value: "rusts".to_string(),
+                    }),
+                    "current_schema" => Some(SqlCommand::SystemQuery {
+                        column: "current_schema".to_string(),
+                        value: "public".to_string(),
+                    }),
+                    "current_user" | "session_user" | "user" => Some(SqlCommand::SystemQuery {
+                        column: "current_user".to_string(),
+                        value: "rusts".to_string(),
+                    }),
+                    "pg_backend_pid" => Some(SqlCommand::SystemQuery {
+                        column: "pg_backend_pid".to_string(),
+                        value: "1".to_string(),
+                    }),
+                    "inet_server_addr" => Some(SqlCommand::SystemQuery {
+                        column: "inet_server_addr".to_string(),
+                        value: "127.0.0.1".to_string(),
+                    }),
+                    "inet_server_port" => Some(SqlCommand::SystemQuery {
+                        column: "inet_server_port".to_string(),
+                        value: "5432".to_string(),
+                    }),
+                    _ => None,
+                }
+            }
+            Expr::Value(val_with_span) => {
+                match &val_with_span.value {
+                    Value::Number(n, _) => Some(SqlCommand::SystemQuery {
+                        column: "?column?".to_string(),
+                        value: n.clone(),
+                    }),
+                    Value::SingleQuotedString(s) => Some(SqlCommand::SystemQuery {
+                        column: "?column?".to_string(),
+                        value: s.clone(),
+                    }),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Try to detect queries against pg_catalog tables
+    fn try_pg_catalog_query(query: &SqlQuery) -> Option<SqlCommand> {
+        let select = match query.body.as_ref() {
+            SetExpr::Select(select) => select,
+            _ => return None,
+        };
+
+        // Check if FROM clause references pg_catalog
+        for table_with_joins in &select.from {
+            if let TableFactor::Table { name, .. } = &table_with_joins.relation {
+                let full_name = name.to_string().to_lowercase();
+                if full_name.starts_with("pg_catalog.") || full_name.starts_with("pg_") {
+                    let table = full_name
+                        .strip_prefix("pg_catalog.")
+                        .unwrap_or(&full_name)
+                        .to_string();
+                    return Some(SqlCommand::PgCatalogQuery { table });
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Handle SHOW variable commands
+    fn handle_show_variable(var_name: &str) -> Result<SqlCommand> {
+        let var_lower = var_name.to_lowercase();
+        match var_lower.as_str() {
+            "server_version" | "server_version_num" => Ok(SqlCommand::SystemQuery {
+                column: var_name.to_string(),
+                value: "150000".to_string(),
+            }),
+            "server_encoding" | "client_encoding" => Ok(SqlCommand::SystemQuery {
+                column: var_name.to_string(),
+                value: "UTF8".to_string(),
+            }),
+            "standard_conforming_strings" => Ok(SqlCommand::SystemQuery {
+                column: var_name.to_string(),
+                value: "on".to_string(),
+            }),
+            "transaction_isolation" | "default_transaction_isolation" => Ok(SqlCommand::SystemQuery {
+                column: var_name.to_string(),
+                value: "read committed".to_string(),
+            }),
+            "timezone" | "time zone" => Ok(SqlCommand::SystemQuery {
+                column: var_name.to_string(),
+                value: "UTC".to_string(),
+            }),
+            "datestyle" => Ok(SqlCommand::SystemQuery {
+                column: var_name.to_string(),
+                value: "ISO, MDY".to_string(),
+            }),
+            "integer_datetimes" => Ok(SqlCommand::SystemQuery {
+                column: var_name.to_string(),
+                value: "on".to_string(),
+            }),
+            "intervalstyle" => Ok(SqlCommand::SystemQuery {
+                column: var_name.to_string(),
+                value: "postgres".to_string(),
+            }),
+            "is_superuser" => Ok(SqlCommand::SystemQuery {
+                column: var_name.to_string(),
+                value: "on".to_string(),
+            }),
+            "session_authorization" => Ok(SqlCommand::SystemQuery {
+                column: var_name.to_string(),
+                value: "rusts".to_string(),
+            }),
+            _ => Ok(SqlCommand::SystemQuery {
+                column: var_name.to_string(),
+                value: "".to_string(),
+            }),
         }
     }
 

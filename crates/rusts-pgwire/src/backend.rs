@@ -1,6 +1,6 @@
 //! PostgreSQL wire protocol backend implementation
 
-use crate::encoder::{build_tables_schema, query_result_to_response, tables_to_response};
+use crate::encoder::{build_tables_schema, pg_catalog_response, pg_catalog_schema, query_result_to_response, single_value_response, tables_to_response};
 use crate::error::PgError;
 use async_trait::async_trait;
 use futures::Sink;
@@ -19,7 +19,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Parsed SQL statement for extended query protocol
 #[derive(Debug, Clone)]
@@ -85,6 +85,23 @@ impl PgWireBackend {
                 Err(PgError::SqlParse(rusts_sql::SqlError::UnsupportedFeature(
                     "EXPLAIN not yet supported via PostgreSQL protocol".to_string(),
                 )))
+            }
+            SqlCommand::SetVariable(_, _) | SqlCommand::Empty => {
+                // SET commands and empty commands - return execution response
+                Ok(Response::Execution(pgwire::api::results::Tag::new("SET")))
+            }
+            SqlCommand::SystemQuery { column, value } => {
+                // Return a single-value response
+                let response = single_value_response(column, value)
+                    .map_err(|e| PgError::Internal(e.to_string()))?;
+                Ok(response)
+            }
+            SqlCommand::PgCatalogQuery { table } => {
+                // Return pg_catalog response with real data where available
+                let measurements = self.app_state.series_index.measurements();
+                let response = pg_catalog_response(table, &measurements)
+                    .map_err(|e| PgError::Internal(e.to_string()))?;
+                Ok(response)
             }
             SqlCommand::Query(query) => {
                 // Check if storage/executor is ready
@@ -157,6 +174,24 @@ impl PgWireBackend {
                 // Single column: name (TEXT)
                 (*build_tables_schema()).clone()
             }
+            SqlCommand::SystemQuery { column, .. } => {
+                // Single column with the given name
+                vec![FieldInfo::new(
+                    column.clone(),
+                    None,
+                    None,
+                    Type::TEXT,
+                    pgwire::api::results::FieldFormat::Text,
+                )]
+            }
+            SqlCommand::SetVariable(_, _) | SqlCommand::Empty => {
+                // No result columns
+                Vec::new()
+            }
+            SqlCommand::PgCatalogQuery { table } => {
+                // Return proper schema for pg_catalog tables
+                pg_catalog_schema(table)
+            }
             SqlCommand::Explain(_) | SqlCommand::Query(_) => {
                 // For queries, we don't know the schema until execution
                 // Return empty schema - client will get actual schema on execute
@@ -182,7 +217,7 @@ impl SimpleQueryHandler for PgWireBackend {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        debug!("Executing simple query: {}", query);
+        info!("Simple query received: {}", query);
 
         match self.execute_sql(query).await {
             Ok(responses) => Ok(responses),
@@ -213,10 +248,17 @@ impl ExtendedQueryHandler for PgWireBackend {
         C: ClientInfo + Unpin + Send + Sync,
     {
         let statement = &portal.statement;
-        debug!("Executing extended query: {}", statement.statement.sql);
+        info!("Extended query received: {}", statement.statement.sql);
 
-        // Check for parameters - we don't support parameterized queries yet
+        // For pg_catalog queries with parameters, return empty results
+        // (DBeaver and other clients send these during connection setup)
         if !portal.parameters.is_empty() {
+            if let SqlCommand::PgCatalogQuery { table } = &statement.statement.command {
+                // Return empty result for parameterized pg_catalog queries
+                let measurements = self.app_state.series_index.measurements();
+                return pg_catalog_response(table, &measurements)
+                    .map_err(|e| PgError::Internal(e.to_string()).into());
+            }
             return Err(PgError::SqlParse(rusts_sql::SqlError::UnsupportedFeature(
                 "Parameterized queries are not yet supported".to_string(),
             ))

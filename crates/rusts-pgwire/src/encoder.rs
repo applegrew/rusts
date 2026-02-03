@@ -218,6 +218,258 @@ pub fn tables_to_response(tables: Vec<String>) -> PgWireResult<Response<'static>
     Ok(Response::Query(response))
 }
 
+/// Build the schema for pg_database table
+pub fn build_pg_database_schema() -> Vec<FieldInfo> {
+    vec![
+        FieldInfo::new("oid".to_string(), None, None, Type::INT4, default_field_format()),
+        FieldInfo::new("datname".to_string(), None, None, Type::TEXT, default_field_format()),
+        FieldInfo::new("datdba".to_string(), None, None, Type::INT4, default_field_format()),
+        FieldInfo::new("encoding".to_string(), None, None, Type::INT4, default_field_format()),
+        FieldInfo::new("datcollate".to_string(), None, None, Type::TEXT, default_field_format()),
+        FieldInfo::new("datctype".to_string(), None, None, Type::TEXT, default_field_format()),
+        FieldInfo::new("datistemplate".to_string(), None, None, Type::BOOL, default_field_format()),
+        FieldInfo::new("datallowconn".to_string(), None, None, Type::BOOL, default_field_format()),
+        FieldInfo::new("datconnlimit".to_string(), None, None, Type::INT4, default_field_format()),
+        FieldInfo::new("datlastsysoid".to_string(), None, None, Type::INT4, default_field_format()),
+        FieldInfo::new("datfrozenxid".to_string(), None, None, Type::INT4, default_field_format()),
+        FieldInfo::new("datminmxid".to_string(), None, None, Type::INT4, default_field_format()),
+        FieldInfo::new("dattablespace".to_string(), None, None, Type::INT4, default_field_format()),
+        FieldInfo::new("datacl".to_string(), None, None, Type::TEXT, default_field_format()),
+    ]
+}
+
+/// Build schema for pg_settings table
+fn build_pg_settings_schema() -> Vec<FieldInfo> {
+    vec![
+        FieldInfo::new("name".to_string(), None, None, Type::TEXT, default_field_format()),
+        FieldInfo::new("setting".to_string(), None, None, Type::TEXT, default_field_format()),
+        FieldInfo::new("unit".to_string(), None, None, Type::TEXT, default_field_format()),
+        FieldInfo::new("category".to_string(), None, None, Type::TEXT, default_field_format()),
+        FieldInfo::new("short_desc".to_string(), None, None, Type::TEXT, default_field_format()),
+        FieldInfo::new("extra_desc".to_string(), None, None, Type::TEXT, default_field_format()),
+        FieldInfo::new("context".to_string(), None, None, Type::TEXT, default_field_format()),
+        FieldInfo::new("vartype".to_string(), None, None, Type::TEXT, default_field_format()),
+        FieldInfo::new("source".to_string(), None, None, Type::TEXT, default_field_format()),
+        FieldInfo::new("min_val".to_string(), None, None, Type::TEXT, default_field_format()),
+        FieldInfo::new("max_val".to_string(), None, None, Type::TEXT, default_field_format()),
+        FieldInfo::new("enumvals".to_string(), None, None, Type::TEXT, default_field_format()),
+        FieldInfo::new("boot_val".to_string(), None, None, Type::TEXT, default_field_format()),
+        FieldInfo::new("reset_val".to_string(), None, None, Type::TEXT, default_field_format()),
+        FieldInfo::new("sourcefile".to_string(), None, None, Type::TEXT, default_field_format()),
+        FieldInfo::new("sourceline".to_string(), None, None, Type::INT4, default_field_format()),
+        FieldInfo::new("pending_restart".to_string(), None, None, Type::BOOL, default_field_format()),
+    ]
+}
+
+/// Build schema for pg_class table
+fn build_pg_class_schema() -> Vec<FieldInfo> {
+    vec![
+        FieldInfo::new("oid".to_string(), None, None, Type::INT4, default_field_format()),
+        FieldInfo::new("relname".to_string(), None, None, Type::TEXT, default_field_format()),
+        FieldInfo::new("relnamespace".to_string(), None, None, Type::INT4, default_field_format()),
+        FieldInfo::new("reltype".to_string(), None, None, Type::INT4, default_field_format()),
+        FieldInfo::new("reloftype".to_string(), None, None, Type::INT4, default_field_format()),
+        FieldInfo::new("relowner".to_string(), None, None, Type::INT4, default_field_format()),
+        FieldInfo::new("relkind".to_string(), None, None, Type::CHAR, default_field_format()),
+    ]
+}
+
+/// Build schema for pg_type table
+fn build_pg_type_schema() -> Vec<FieldInfo> {
+    vec![
+        FieldInfo::new("oid".to_string(), None, None, Type::INT4, default_field_format()),
+        FieldInfo::new("typname".to_string(), None, None, Type::TEXT, default_field_format()),
+        FieldInfo::new("typnamespace".to_string(), None, None, Type::INT4, default_field_format()),
+        FieldInfo::new("typowner".to_string(), None, None, Type::INT4, default_field_format()),
+        FieldInfo::new("typlen".to_string(), None, None, Type::INT2, default_field_format()),
+        FieldInfo::new("typbyval".to_string(), None, None, Type::BOOL, default_field_format()),
+        FieldInfo::new("typtype".to_string(), None, None, Type::CHAR, default_field_format()),
+        FieldInfo::new("typcategory".to_string(), None, None, Type::CHAR, default_field_format()),
+        FieldInfo::new("typispreferred".to_string(), None, None, Type::BOOL, default_field_format()),
+        FieldInfo::new("typisdefined".to_string(), None, None, Type::BOOL, default_field_format()),
+        FieldInfo::new("typdelim".to_string(), None, None, Type::CHAR, default_field_format()),
+        FieldInfo::new("typrelid".to_string(), None, None, Type::INT4, default_field_format()),
+        FieldInfo::new("typelem".to_string(), None, None, Type::INT4, default_field_format()),
+        FieldInfo::new("typarray".to_string(), None, None, Type::INT4, default_field_format()),
+        FieldInfo::new("relkind".to_string(), None, None, Type::CHAR, default_field_format()),
+        FieldInfo::new("base_type_name".to_string(), None, None, Type::TEXT, default_field_format()),
+        FieldInfo::new("description".to_string(), None, None, Type::TEXT, default_field_format()),
+    ]
+}
+
+/// Get schema for a pg_catalog table (used by describe in extended query protocol)
+pub fn pg_catalog_schema(table: &str) -> Vec<FieldInfo> {
+    match table {
+        "pg_database" => build_pg_database_schema(),
+        "pg_settings" => build_pg_settings_schema(),
+        "pg_class" => build_pg_class_schema(),
+        "pg_type" => build_pg_type_schema(),
+        "pg_namespace" => build_pg_namespace_schema(),
+        _ => Vec::new(),
+    }
+}
+
+/// Build schema for pg_namespace table
+fn build_pg_namespace_schema() -> Vec<FieldInfo> {
+    vec![
+        FieldInfo::new("oid".to_string(), None, None, Type::INT4, default_field_format()),
+        FieldInfo::new("nspname".to_string(), None, None, Type::TEXT, default_field_format()),
+        FieldInfo::new("nspowner".to_string(), None, None, Type::INT4, default_field_format()),
+        FieldInfo::new("nspacl".to_string(), None, None, Type::TEXT, default_field_format()),
+        FieldInfo::new("description".to_string(), None, None, Type::TEXT, default_field_format()),
+    ]
+}
+
+/// Encode a pg_catalog response with real data where available
+pub fn pg_catalog_response(table: &str, measurements: &[String]) -> PgWireResult<Response<'static>> {
+    match table {
+        "pg_database" => {
+            // Return a single database "rusts"
+            let schema = Arc::new(build_pg_database_schema());
+
+            let mut encoder = DataRowEncoder::new(schema.clone());
+            encoder.encode_field_with_type_and_format(&"16384".to_string(), &Type::INT4, FieldFormat::Text)?;  // oid
+            encoder.encode_field_with_type_and_format(&"rusts".to_string(), &Type::TEXT, FieldFormat::Text)?;  // datname
+            encoder.encode_field_with_type_and_format(&"10".to_string(), &Type::INT4, FieldFormat::Text)?;     // datdba
+            encoder.encode_field_with_type_and_format(&"6".to_string(), &Type::INT4, FieldFormat::Text)?;      // encoding (UTF8)
+            encoder.encode_field_with_type_and_format(&"en_US.UTF-8".to_string(), &Type::TEXT, FieldFormat::Text)?;  // datcollate
+            encoder.encode_field_with_type_and_format(&"en_US.UTF-8".to_string(), &Type::TEXT, FieldFormat::Text)?;  // datctype
+            encoder.encode_field_with_type_and_format(&"f".to_string(), &Type::BOOL, FieldFormat::Text)?;      // datistemplate
+            encoder.encode_field_with_type_and_format(&"t".to_string(), &Type::BOOL, FieldFormat::Text)?;      // datallowconn
+            encoder.encode_field_with_type_and_format(&"-1".to_string(), &Type::INT4, FieldFormat::Text)?;     // datconnlimit
+            encoder.encode_field_with_type_and_format(&"12000".to_string(), &Type::INT4, FieldFormat::Text)?;  // datlastsysoid
+            encoder.encode_field_with_type_and_format(&"722".to_string(), &Type::INT4, FieldFormat::Text)?;    // datfrozenxid
+            encoder.encode_field_with_type_and_format(&"1".to_string(), &Type::INT4, FieldFormat::Text)?;      // datminmxid
+            encoder.encode_field_with_type_and_format(&"1663".to_string(), &Type::INT4, FieldFormat::Text)?;   // dattablespace
+            encoder.encode_field_with_type_and_format(&None::<String>, &Type::TEXT, FieldFormat::Text)?;       // datacl
+
+            let data_row = encoder.finish()?;
+            let stream = futures::stream::iter(vec![Ok(data_row)]);
+            let mut response = QueryResponse::new(schema, stream);
+            response.set_command_tag("SELECT 1");
+            Ok(Response::Query(response))
+        }
+        "pg_namespace" => {
+            // Return public schema
+            let schema = Arc::new(build_pg_namespace_schema());
+            let mut encoder = DataRowEncoder::new(schema.clone());
+            encoder.encode_field_with_type_and_format(&"2200".to_string(), &Type::INT4, FieldFormat::Text)?;  // oid
+            encoder.encode_field_with_type_and_format(&"public".to_string(), &Type::TEXT, FieldFormat::Text)?;  // nspname
+            encoder.encode_field_with_type_and_format(&"10".to_string(), &Type::INT4, FieldFormat::Text)?;  // nspowner
+            encoder.encode_field_with_type_and_format(&None::<String>, &Type::TEXT, FieldFormat::Text)?;  // nspacl
+            encoder.encode_field_with_type_and_format(&"Standard public schema".to_string(), &Type::TEXT, FieldFormat::Text)?;  // description
+
+            let data_row = encoder.finish()?;
+            let stream = futures::stream::iter(vec![Ok(data_row)]);
+            let mut response = QueryResponse::new(schema, stream);
+            response.set_command_tag("SELECT 1");
+            Ok(Response::Query(response))
+        }
+        "pg_class" => {
+            // Return measurements as tables
+            let schema = Arc::new(build_pg_class_schema());
+            let mut data_rows = Vec::with_capacity(measurements.len());
+
+            for (i, measurement) in measurements.iter().enumerate() {
+                let mut encoder = DataRowEncoder::new(schema.clone());
+                let oid = 20000 + i as i32;
+                encoder.encode_field_with_type_and_format(&oid.to_string(), &Type::INT4, FieldFormat::Text)?;  // oid
+                encoder.encode_field_with_type_and_format(measurement, &Type::TEXT, FieldFormat::Text)?;  // relname
+                encoder.encode_field_with_type_and_format(&"2200".to_string(), &Type::INT4, FieldFormat::Text)?;  // relnamespace (public)
+                encoder.encode_field_with_type_and_format(&"0".to_string(), &Type::INT4, FieldFormat::Text)?;  // reltype
+                encoder.encode_field_with_type_and_format(&"0".to_string(), &Type::INT4, FieldFormat::Text)?;  // reloftype
+                encoder.encode_field_with_type_and_format(&"10".to_string(), &Type::INT4, FieldFormat::Text)?;  // relowner
+                encoder.encode_field_with_type_and_format(&"r".to_string(), &Type::CHAR, FieldFormat::Text)?;  // relkind (r = ordinary table)
+                data_rows.push(encoder.finish()?);
+            }
+
+            let row_count = data_rows.len();
+            let stream = futures::stream::iter(data_rows.into_iter().map(Ok));
+            let mut response = QueryResponse::new(schema, stream);
+            response.set_command_tag(&format!("SELECT {}", row_count));
+            Ok(Response::Query(response))
+        }
+        "pg_settings" => {
+            // Return basic settings
+            let schema = Arc::new(build_pg_settings_schema());
+            let settings = vec![
+                ("server_version", "15.0 (RusTs 0.1.0)", "", "Version", "Server version", "string", "default"),
+                ("server_encoding", "UTF8", "", "Preset Options", "Server encoding", "string", "default"),
+                ("client_encoding", "UTF8", "", "Client Connection Defaults", "Client encoding", "string", "default"),
+                ("is_superuser", "on", "", "Preset Options", "Is superuser", "bool", "default"),
+                ("TimeZone", "UTC", "", "Client Connection Defaults / Locale", "Time zone", "string", "default"),
+            ];
+
+            let mut data_rows = Vec::with_capacity(settings.len());
+            for (name, setting, unit, category, desc, vartype, source) in settings {
+                let mut encoder = DataRowEncoder::new(schema.clone());
+                encoder.encode_field_with_type_and_format(&name.to_string(), &Type::TEXT, FieldFormat::Text)?;
+                encoder.encode_field_with_type_and_format(&setting.to_string(), &Type::TEXT, FieldFormat::Text)?;
+                encoder.encode_field_with_type_and_format(&unit.to_string(), &Type::TEXT, FieldFormat::Text)?;
+                encoder.encode_field_with_type_and_format(&category.to_string(), &Type::TEXT, FieldFormat::Text)?;
+                encoder.encode_field_with_type_and_format(&desc.to_string(), &Type::TEXT, FieldFormat::Text)?;
+                encoder.encode_field_with_type_and_format(&None::<String>, &Type::TEXT, FieldFormat::Text)?;  // extra_desc
+                encoder.encode_field_with_type_and_format(&"user".to_string(), &Type::TEXT, FieldFormat::Text)?;  // context
+                encoder.encode_field_with_type_and_format(&vartype.to_string(), &Type::TEXT, FieldFormat::Text)?;
+                encoder.encode_field_with_type_and_format(&source.to_string(), &Type::TEXT, FieldFormat::Text)?;
+                encoder.encode_field_with_type_and_format(&None::<String>, &Type::TEXT, FieldFormat::Text)?;  // min_val
+                encoder.encode_field_with_type_and_format(&None::<String>, &Type::TEXT, FieldFormat::Text)?;  // max_val
+                encoder.encode_field_with_type_and_format(&None::<String>, &Type::TEXT, FieldFormat::Text)?;  // enumvals
+                encoder.encode_field_with_type_and_format(&setting.to_string(), &Type::TEXT, FieldFormat::Text)?;  // boot_val
+                encoder.encode_field_with_type_and_format(&setting.to_string(), &Type::TEXT, FieldFormat::Text)?;  // reset_val
+                encoder.encode_field_with_type_and_format(&None::<String>, &Type::TEXT, FieldFormat::Text)?;  // sourcefile
+                encoder.encode_field_with_type_and_format(&None::<i32>, &Type::INT4, FieldFormat::Text)?;  // sourceline
+                encoder.encode_field_with_type_and_format(&"f".to_string(), &Type::BOOL, FieldFormat::Text)?;  // pending_restart
+                data_rows.push(encoder.finish()?);
+            }
+
+            let row_count = data_rows.len();
+            let stream = futures::stream::iter(data_rows.into_iter().map(Ok));
+            let mut response = QueryResponse::new(schema, stream);
+            response.set_command_tag(&format!("SELECT {}", row_count));
+            Ok(Response::Query(response))
+        }
+        "pg_type" => {
+            // Return empty result with proper schema
+            let schema = Arc::new(pg_catalog_schema(table));
+            let stream = futures::stream::iter(vec![]);
+            let mut response = QueryResponse::new(schema, stream);
+            response.set_command_tag("SELECT 0");
+            Ok(Response::Query(response))
+        }
+        _ => {
+            // Return empty result for other pg_catalog tables
+            let schema = Arc::new(vec![]);
+            let stream = futures::stream::iter(vec![]);
+            let mut response = QueryResponse::new(schema, stream);
+            response.set_command_tag("SELECT 0");
+            Ok(Response::Query(response))
+        }
+    }
+}
+
+/// Encode a single value as a PostgreSQL response (for system queries like SELECT version())
+pub fn single_value_response(column_name: &str, value: &str) -> PgWireResult<Response<'static>> {
+    let schema = Arc::new(vec![FieldInfo::new(
+        column_name.to_string(),
+        None,
+        None,
+        Type::TEXT,
+        default_field_format(),
+    )]);
+
+    let mut encoder = DataRowEncoder::new(schema.clone());
+    encoder.encode_field_with_type_and_format(&value.to_string(), &Type::TEXT, FieldFormat::Text)?;
+    let data_row = encoder.finish()?;
+
+    let stream = futures::stream::iter(vec![Ok(data_row)]);
+
+    let mut response = QueryResponse::new(schema, stream);
+    response.set_command_tag("SELECT 1");
+
+    Ok(Response::Query(response))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
