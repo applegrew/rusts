@@ -1,6 +1,6 @@
 //! PostgreSQL wire protocol backend implementation
 
-use crate::encoder::{build_tables_schema, pg_catalog_response, pg_catalog_schema, query_result_to_response, single_value_response, tables_to_response};
+use crate::encoder::{build_tables_schema, information_schema_columns_response, information_schema_columns_schema, information_schema_tables_response, information_schema_tables_schema, pg_catalog_response, pg_catalog_schema, query_result_to_response, single_value_response, tables_to_response, MeasurementColumns};
 use crate::error::PgError;
 use async_trait::async_trait;
 use futures::Sink;
@@ -19,7 +19,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 /// Parsed SQL statement for extended query protocol
 #[derive(Debug, Clone)]
@@ -69,6 +69,18 @@ impl PgWireBackend {
         }
     }
 
+    /// Build MeasurementColumns for all measurements (shared by pg_catalog and information_schema)
+    fn build_measurement_columns(&self) -> Vec<MeasurementColumns> {
+        let measurements = self.app_state.series_index.measurements();
+        measurements
+            .iter()
+            .map(|m| MeasurementColumns {
+                measurement: m.clone(),
+                tag_keys: self.app_state.series_index.get_tag_keys_for_measurement(m),
+            })
+            .collect()
+    }
+
     /// Execute a SQL command and return the PostgreSQL response
     async fn execute_command(&self, command: &SqlCommand) -> Result<Response<'static>, PgError> {
         match command {
@@ -98,8 +110,26 @@ impl PgWireBackend {
             }
             SqlCommand::PgCatalogQuery { table } => {
                 // Return pg_catalog response with real data where available
+                let measurement_columns = self.build_measurement_columns();
+                let response = pg_catalog_response(table, &measurement_columns)
+                    .map_err(|e| PgError::Internal(e.to_string()))?;
+                Ok(response)
+            }
+            SqlCommand::InformationSchemaEmpty { .. } | SqlCommand::InformationSchemaViews => {
+                // Return empty result for information_schema tables we don't support
+                Ok(Response::EmptyQuery)
+            }
+            SqlCommand::InformationSchemaTables => {
+                // Return list of measurements as tables
                 let measurements = self.app_state.series_index.measurements();
-                let response = pg_catalog_response(table, &measurements)
+                let response = information_schema_tables_response(&measurements)
+                    .map_err(|e| PgError::Internal(e.to_string()))?;
+                Ok(response)
+            }
+            SqlCommand::InformationSchemaColumns => {
+                // Return columns for all measurements with actual tag keys
+                let measurement_columns = self.build_measurement_columns();
+                let response = information_schema_columns_response(&measurement_columns)
                     .map_err(|e| PgError::Internal(e.to_string()))?;
                 Ok(response)
             }
@@ -192,6 +222,18 @@ impl PgWireBackend {
                 // Return proper schema for pg_catalog tables
                 pg_catalog_schema(table)
             }
+            SqlCommand::InformationSchemaEmpty { .. } | SqlCommand::InformationSchemaViews => {
+                // Empty result set - no columns
+                Vec::new()
+            }
+            SqlCommand::InformationSchemaTables => {
+                // Schema for information_schema.tables
+                information_schema_tables_schema()
+            }
+            SqlCommand::InformationSchemaColumns => {
+                // Schema for information_schema.columns
+                information_schema_columns_schema()
+            }
             SqlCommand::Explain(_) | SqlCommand::Query(_) => {
                 // For queries, we don't know the schema until execution
                 // Return empty schema - client will get actual schema on execute
@@ -250,19 +292,39 @@ impl ExtendedQueryHandler for PgWireBackend {
         let statement = &portal.statement;
         info!("Extended query received: {}", statement.statement.sql);
 
-        // For pg_catalog queries with parameters, return empty results
+        // For pg_catalog/information_schema queries with parameters, return appropriate results
         // (DBeaver and other clients send these during connection setup)
         if !portal.parameters.is_empty() {
-            if let SqlCommand::PgCatalogQuery { table } = &statement.statement.command {
-                // Return empty result for parameterized pg_catalog queries
-                let measurements = self.app_state.series_index.measurements();
-                return pg_catalog_response(table, &measurements)
-                    .map_err(|e| PgError::Internal(e.to_string()).into());
+            match &statement.statement.command {
+                SqlCommand::PgCatalogQuery { table } => {
+                    // Return result for parameterized pg_catalog queries
+                    let measurement_columns = self.build_measurement_columns();
+                    return pg_catalog_response(table, &measurement_columns)
+                        .map_err(|e| PgError::Internal(e.to_string()).into());
+                }
+                SqlCommand::InformationSchemaEmpty { .. } | SqlCommand::InformationSchemaViews => {
+                    // Return empty result
+                    return Ok(Response::EmptyQuery);
+                }
+                SqlCommand::InformationSchemaTables => {
+                    // Return tables
+                    let measurements = self.app_state.series_index.measurements();
+                    return information_schema_tables_response(&measurements)
+                        .map_err(|e| PgError::Internal(e.to_string()).into());
+                }
+                SqlCommand::InformationSchemaColumns => {
+                    // Return columns with actual tag keys
+                    let measurement_columns = self.build_measurement_columns();
+                    return information_schema_columns_response(&measurement_columns)
+                        .map_err(|e| PgError::Internal(e.to_string()).into());
+                }
+                _ => {
+                    return Err(PgError::SqlParse(rusts_sql::SqlError::UnsupportedFeature(
+                        "Parameterized queries are not yet supported".to_string(),
+                    ))
+                    .into());
+                }
             }
-            return Err(PgError::SqlParse(rusts_sql::SqlError::UnsupportedFeature(
-                "Parameterized queries are not yet supported".to_string(),
-            ))
-            .into());
         }
 
         match self.execute_command(&statement.statement.command).await {

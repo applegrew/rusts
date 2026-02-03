@@ -349,7 +349,7 @@ fn build_pg_namespace_schema() -> Vec<FieldInfo> {
 }
 
 /// Encode a pg_catalog response with real data where available
-pub fn pg_catalog_response(table: &str, measurements: &[String]) -> PgWireResult<Response<'static>> {
+pub fn pg_catalog_response(table: &str, measurement_columns: &[MeasurementColumns]) -> PgWireResult<Response<'static>> {
     match table {
         "pg_database" => {
             // Return a single database "rusts"
@@ -396,13 +396,13 @@ pub fn pg_catalog_response(table: &str, measurements: &[String]) -> PgWireResult
         "pg_class" => {
             // Return measurements as tables
             let schema = Arc::new(build_pg_class_schema());
-            let mut data_rows = Vec::with_capacity(measurements.len());
+            let mut data_rows = Vec::with_capacity(measurement_columns.len());
 
-            for (i, measurement) in measurements.iter().enumerate() {
+            for (i, mc) in measurement_columns.iter().enumerate() {
                 let mut encoder = DataRowEncoder::new(schema.clone());
                 let oid = 20000 + i as i32;
                 encoder.encode_field_with_type_and_format(&oid.to_string(), &Type::INT4, FieldFormat::Text)?;  // oid
-                encoder.encode_field_with_type_and_format(measurement, &Type::TEXT, FieldFormat::Text)?;  // relname
+                encoder.encode_field_with_type_and_format(&mc.measurement, &Type::TEXT, FieldFormat::Text)?;  // relname
                 encoder.encode_field_with_type_and_format(&"2200".to_string(), &Type::INT4, FieldFormat::Text)?;  // relnamespace (public)
                 encoder.encode_field_with_type_and_format(&"0".to_string(), &Type::INT4, FieldFormat::Text)?;  // reltype
                 encoder.encode_field_with_type_and_format(&"0".to_string(), &Type::INT4, FieldFormat::Text)?;  // reloftype
@@ -458,27 +458,27 @@ pub fn pg_catalog_response(table: &str, measurements: &[String]) -> PgWireResult
             Ok(Response::Query(response))
         }
         "pg_attribute" => {
-            // Return columns for each measurement
-            // Each measurement has at least: time (timestamptz), plus we indicate it has more columns
+            // Return columns for each measurement using actual tag keys
             let schema = Arc::new(build_pg_attribute_schema());
             let mut data_rows = Vec::new();
 
             // PostgreSQL type OIDs
             const TIMESTAMPTZ_OID: i32 = 1184;
             const TEXT_OID: i32 = 25;
-            const FLOAT8_OID: i32 = 701;
+            const JSONB_OID: i32 = 3802;
 
-            for (i, measurement) in measurements.iter().enumerate() {
+            for (i, mc) in measurement_columns.iter().enumerate() {
                 let table_oid = 20000 + i as i32;
+                let mut attnum = 1i16;
 
-                // Column 1: time (timestamptz)
+                // Column: time (timestamptz) - always first
                 let mut encoder = DataRowEncoder::new(schema.clone());
-                encoder.encode_field_with_type_and_format(measurement, &Type::TEXT, FieldFormat::Text)?;  // relname
+                encoder.encode_field_with_type_and_format(&mc.measurement, &Type::TEXT, FieldFormat::Text)?;  // relname
                 encoder.encode_field_with_type_and_format(&table_oid.to_string(), &Type::INT4, FieldFormat::Text)?;  // attrelid
                 encoder.encode_field_with_type_and_format(&"time".to_string(), &Type::TEXT, FieldFormat::Text)?;  // attname
                 encoder.encode_field_with_type_and_format(&TIMESTAMPTZ_OID.to_string(), &Type::INT4, FieldFormat::Text)?;  // atttypid
                 encoder.encode_field_with_type_and_format(&"8".to_string(), &Type::INT2, FieldFormat::Text)?;  // attlen
-                encoder.encode_field_with_type_and_format(&"1".to_string(), &Type::INT2, FieldFormat::Text)?;  // attnum
+                encoder.encode_field_with_type_and_format(&attnum.to_string(), &Type::INT2, FieldFormat::Text)?;  // attnum
                 encoder.encode_field_with_type_and_format(&"0".to_string(), &Type::INT4, FieldFormat::Text)?;  // attndims
                 encoder.encode_field_with_type_and_format(&"t".to_string(), &Type::BOOL, FieldFormat::Text)?;  // attnotnull
                 encoder.encode_field_with_type_and_format(&"f".to_string(), &Type::BOOL, FieldFormat::Text)?;  // atthasdef
@@ -495,15 +495,44 @@ pub fn pg_catalog_response(table: &str, measurements: &[String]) -> PgWireResult
                 encoder.encode_field_with_type_and_format(&"Timestamp".to_string(), &Type::TEXT, FieldFormat::Text)?;  // description
                 encoder.encode_field_with_type_and_format(&None::<i32>, &Type::INT4, FieldFormat::Text)?;  // objoid
                 data_rows.push(encoder.finish()?);
+                attnum += 1;
 
-                // Column 2: tags (text) - generic tag column
+                // Tag columns (actual tag keys)
+                for tag_key in &mc.tag_keys {
+                    let mut encoder = DataRowEncoder::new(schema.clone());
+                    encoder.encode_field_with_type_and_format(&mc.measurement, &Type::TEXT, FieldFormat::Text)?;
+                    encoder.encode_field_with_type_and_format(&table_oid.to_string(), &Type::INT4, FieldFormat::Text)?;
+                    encoder.encode_field_with_type_and_format(tag_key, &Type::TEXT, FieldFormat::Text)?;
+                    encoder.encode_field_with_type_and_format(&TEXT_OID.to_string(), &Type::INT4, FieldFormat::Text)?;
+                    encoder.encode_field_with_type_and_format(&"-1".to_string(), &Type::INT2, FieldFormat::Text)?;
+                    encoder.encode_field_with_type_and_format(&attnum.to_string(), &Type::INT2, FieldFormat::Text)?;
+                    encoder.encode_field_with_type_and_format(&"0".to_string(), &Type::INT4, FieldFormat::Text)?;
+                    encoder.encode_field_with_type_and_format(&"f".to_string(), &Type::BOOL, FieldFormat::Text)?;
+                    encoder.encode_field_with_type_and_format(&"f".to_string(), &Type::BOOL, FieldFormat::Text)?;
+                    encoder.encode_field_with_type_and_format(&"f".to_string(), &Type::BOOL, FieldFormat::Text)?;
+                    encoder.encode_field_with_type_and_format(&"".to_string(), &Type::CHAR, FieldFormat::Text)?;
+                    encoder.encode_field_with_type_and_format(&"".to_string(), &Type::CHAR, FieldFormat::Text)?;
+                    encoder.encode_field_with_type_and_format(&"f".to_string(), &Type::BOOL, FieldFormat::Text)?;
+                    encoder.encode_field_with_type_and_format(&"t".to_string(), &Type::BOOL, FieldFormat::Text)?;
+                    encoder.encode_field_with_type_and_format(&"0".to_string(), &Type::INT4, FieldFormat::Text)?;
+                    encoder.encode_field_with_type_and_format(&"-1".to_string(), &Type::INT4, FieldFormat::Text)?;
+                    encoder.encode_field_with_type_and_format(&"-1".to_string(), &Type::INT4, FieldFormat::Text)?;
+                    encoder.encode_field_with_type_and_format(&"0".to_string(), &Type::INT4, FieldFormat::Text)?;
+                    encoder.encode_field_with_type_and_format(&None::<String>, &Type::TEXT, FieldFormat::Text)?;
+                    encoder.encode_field_with_type_and_format(&format!("Tag: {}", tag_key), &Type::TEXT, FieldFormat::Text)?;
+                    encoder.encode_field_with_type_and_format(&None::<i32>, &Type::INT4, FieldFormat::Text)?;
+                    data_rows.push(encoder.finish()?);
+                    attnum += 1;
+                }
+
+                // fields column (dynamic) - jsonb type
                 let mut encoder = DataRowEncoder::new(schema.clone());
-                encoder.encode_field_with_type_and_format(measurement, &Type::TEXT, FieldFormat::Text)?;
+                encoder.encode_field_with_type_and_format(&mc.measurement, &Type::TEXT, FieldFormat::Text)?;
                 encoder.encode_field_with_type_and_format(&table_oid.to_string(), &Type::INT4, FieldFormat::Text)?;
-                encoder.encode_field_with_type_and_format(&"tags".to_string(), &Type::TEXT, FieldFormat::Text)?;
-                encoder.encode_field_with_type_and_format(&TEXT_OID.to_string(), &Type::INT4, FieldFormat::Text)?;
+                encoder.encode_field_with_type_and_format(&"fields".to_string(), &Type::TEXT, FieldFormat::Text)?;
+                encoder.encode_field_with_type_and_format(&JSONB_OID.to_string(), &Type::INT4, FieldFormat::Text)?;
                 encoder.encode_field_with_type_and_format(&"-1".to_string(), &Type::INT2, FieldFormat::Text)?;
-                encoder.encode_field_with_type_and_format(&"2".to_string(), &Type::INT2, FieldFormat::Text)?;
+                encoder.encode_field_with_type_and_format(&attnum.to_string(), &Type::INT2, FieldFormat::Text)?;
                 encoder.encode_field_with_type_and_format(&"0".to_string(), &Type::INT4, FieldFormat::Text)?;
                 encoder.encode_field_with_type_and_format(&"f".to_string(), &Type::BOOL, FieldFormat::Text)?;
                 encoder.encode_field_with_type_and_format(&"f".to_string(), &Type::BOOL, FieldFormat::Text)?;
@@ -517,32 +546,7 @@ pub fn pg_catalog_response(table: &str, measurements: &[String]) -> PgWireResult
                 encoder.encode_field_with_type_and_format(&"-1".to_string(), &Type::INT4, FieldFormat::Text)?;
                 encoder.encode_field_with_type_and_format(&"0".to_string(), &Type::INT4, FieldFormat::Text)?;
                 encoder.encode_field_with_type_and_format(&None::<String>, &Type::TEXT, FieldFormat::Text)?;
-                encoder.encode_field_with_type_and_format(&"Tag values".to_string(), &Type::TEXT, FieldFormat::Text)?;
-                encoder.encode_field_with_type_and_format(&None::<i32>, &Type::INT4, FieldFormat::Text)?;
-                data_rows.push(encoder.finish()?);
-
-                // Column 3: value (float8) - generic field column
-                let mut encoder = DataRowEncoder::new(schema.clone());
-                encoder.encode_field_with_type_and_format(measurement, &Type::TEXT, FieldFormat::Text)?;
-                encoder.encode_field_with_type_and_format(&table_oid.to_string(), &Type::INT4, FieldFormat::Text)?;
-                encoder.encode_field_with_type_and_format(&"value".to_string(), &Type::TEXT, FieldFormat::Text)?;
-                encoder.encode_field_with_type_and_format(&FLOAT8_OID.to_string(), &Type::INT4, FieldFormat::Text)?;
-                encoder.encode_field_with_type_and_format(&"8".to_string(), &Type::INT2, FieldFormat::Text)?;
-                encoder.encode_field_with_type_and_format(&"3".to_string(), &Type::INT2, FieldFormat::Text)?;
-                encoder.encode_field_with_type_and_format(&"0".to_string(), &Type::INT4, FieldFormat::Text)?;
-                encoder.encode_field_with_type_and_format(&"f".to_string(), &Type::BOOL, FieldFormat::Text)?;
-                encoder.encode_field_with_type_and_format(&"f".to_string(), &Type::BOOL, FieldFormat::Text)?;
-                encoder.encode_field_with_type_and_format(&"f".to_string(), &Type::BOOL, FieldFormat::Text)?;
-                encoder.encode_field_with_type_and_format(&"".to_string(), &Type::CHAR, FieldFormat::Text)?;
-                encoder.encode_field_with_type_and_format(&"".to_string(), &Type::CHAR, FieldFormat::Text)?;
-                encoder.encode_field_with_type_and_format(&"f".to_string(), &Type::BOOL, FieldFormat::Text)?;
-                encoder.encode_field_with_type_and_format(&"t".to_string(), &Type::BOOL, FieldFormat::Text)?;
-                encoder.encode_field_with_type_and_format(&"0".to_string(), &Type::INT4, FieldFormat::Text)?;
-                encoder.encode_field_with_type_and_format(&"-1".to_string(), &Type::INT4, FieldFormat::Text)?;
-                encoder.encode_field_with_type_and_format(&"-1".to_string(), &Type::INT4, FieldFormat::Text)?;
-                encoder.encode_field_with_type_and_format(&"0".to_string(), &Type::INT4, FieldFormat::Text)?;
-                encoder.encode_field_with_type_and_format(&None::<String>, &Type::TEXT, FieldFormat::Text)?;
-                encoder.encode_field_with_type_and_format(&"Field value".to_string(), &Type::TEXT, FieldFormat::Text)?;
+                encoder.encode_field_with_type_and_format(&"Dynamic field values".to_string(), &Type::TEXT, FieldFormat::Text)?;
                 encoder.encode_field_with_type_and_format(&None::<i32>, &Type::INT4, FieldFormat::Text)?;
                 data_rows.push(encoder.finish()?);
             }
@@ -629,6 +633,122 @@ pub fn single_value_response(column_name: &str, value: &str) -> PgWireResult<Res
     let mut response = QueryResponse::new(schema, stream);
     response.set_command_tag("SELECT 1");
 
+    Ok(Response::Query(response))
+}
+
+/// Build schema for information_schema.tables query
+pub fn information_schema_tables_schema() -> Vec<FieldInfo> {
+    vec![
+        FieldInfo::new("schema".to_string(), None, None, Type::TEXT, default_field_format()),
+        FieldInfo::new("name".to_string(), None, None, Type::TEXT, default_field_format()),
+        FieldInfo::new("tabletype".to_string(), None, None, Type::CHAR, default_field_format()),
+        FieldInfo::new("parenttype".to_string(), None, None, Type::CHAR, default_field_format()),
+    ]
+}
+
+/// Encode information_schema.tables response with list of measurements
+pub fn information_schema_tables_response(measurements: &[String]) -> PgWireResult<Response<'static>> {
+    let schema = Arc::new(information_schema_tables_schema());
+    let mut data_rows = Vec::with_capacity(measurements.len());
+
+    for measurement in measurements {
+        let mut encoder = DataRowEncoder::new(schema.clone());
+        encoder.encode_field_with_type_and_format(&"public".to_string(), &Type::TEXT, FieldFormat::Text)?;  // schema
+        encoder.encode_field_with_type_and_format(measurement, &Type::TEXT, FieldFormat::Text)?;  // name
+        encoder.encode_field_with_type_and_format(&"r".to_string(), &Type::CHAR, FieldFormat::Text)?;  // tabletype
+        encoder.encode_field_with_type_and_format(&"r".to_string(), &Type::CHAR, FieldFormat::Text)?;  // parenttype
+        data_rows.push(encoder.finish()?);
+    }
+
+    let row_count = data_rows.len();
+    let stream = futures::stream::iter(data_rows.into_iter().map(Ok));
+    let mut response = QueryResponse::new(schema, stream);
+    response.set_command_tag(&format!("SELECT {}", row_count));
+    Ok(Response::Query(response))
+}
+
+/// Build schema for information_schema.columns query
+pub fn information_schema_columns_schema() -> Vec<FieldInfo> {
+    vec![
+        FieldInfo::new("table_schema".to_string(), None, None, Type::TEXT, default_field_format()),
+        FieldInfo::new("table_name".to_string(), None, None, Type::TEXT, default_field_format()),
+        FieldInfo::new("column_name".to_string(), None, None, Type::TEXT, default_field_format()),
+        FieldInfo::new("ordinal_position".to_string(), None, None, Type::INT4, default_field_format()),
+        FieldInfo::new("column_default".to_string(), None, None, Type::TEXT, default_field_format()),
+        FieldInfo::new("is_nullable".to_string(), None, None, Type::TEXT, default_field_format()),
+        FieldInfo::new("data_type".to_string(), None, None, Type::TEXT, default_field_format()),
+        FieldInfo::new("character_maximum_length".to_string(), None, None, Type::INT4, default_field_format()),
+        FieldInfo::new("numeric_precision".to_string(), None, None, Type::INT4, default_field_format()),
+        FieldInfo::new("numeric_scale".to_string(), None, None, Type::INT4, default_field_format()),
+    ]
+}
+
+/// Column info for a measurement
+pub struct MeasurementColumns {
+    pub measurement: String,
+    pub tag_keys: Vec<String>,
+}
+
+/// Encode information_schema.columns response with columns for all measurements
+pub fn information_schema_columns_response(measurement_columns: &[MeasurementColumns]) -> PgWireResult<Response<'static>> {
+    let schema = Arc::new(information_schema_columns_schema());
+    let mut data_rows = Vec::new();
+
+    for mc in measurement_columns {
+        let mut ordinal = 1;
+
+        // Column: time (timestamp) - always first
+        let mut encoder = DataRowEncoder::new(schema.clone());
+        encoder.encode_field_with_type_and_format(&"public".to_string(), &Type::TEXT, FieldFormat::Text)?;
+        encoder.encode_field_with_type_and_format(&mc.measurement, &Type::TEXT, FieldFormat::Text)?;
+        encoder.encode_field_with_type_and_format(&"time".to_string(), &Type::TEXT, FieldFormat::Text)?;
+        encoder.encode_field_with_type_and_format(&ordinal.to_string(), &Type::INT4, FieldFormat::Text)?;
+        encoder.encode_field_with_type_and_format(&None::<String>, &Type::TEXT, FieldFormat::Text)?;
+        encoder.encode_field_with_type_and_format(&"NO".to_string(), &Type::TEXT, FieldFormat::Text)?;
+        encoder.encode_field_with_type_and_format(&"timestamp with time zone".to_string(), &Type::TEXT, FieldFormat::Text)?;
+        encoder.encode_field_with_type_and_format(&None::<i32>, &Type::INT4, FieldFormat::Text)?;
+        encoder.encode_field_with_type_and_format(&None::<i32>, &Type::INT4, FieldFormat::Text)?;
+        encoder.encode_field_with_type_and_format(&None::<i32>, &Type::INT4, FieldFormat::Text)?;
+        data_rows.push(encoder.finish()?);
+        ordinal += 1;
+
+        // Tag columns
+        for tag_key in &mc.tag_keys {
+            let mut encoder = DataRowEncoder::new(schema.clone());
+            encoder.encode_field_with_type_and_format(&"public".to_string(), &Type::TEXT, FieldFormat::Text)?;
+            encoder.encode_field_with_type_and_format(&mc.measurement, &Type::TEXT, FieldFormat::Text)?;
+            encoder.encode_field_with_type_and_format(tag_key, &Type::TEXT, FieldFormat::Text)?;
+            encoder.encode_field_with_type_and_format(&ordinal.to_string(), &Type::INT4, FieldFormat::Text)?;
+            encoder.encode_field_with_type_and_format(&None::<String>, &Type::TEXT, FieldFormat::Text)?;
+            encoder.encode_field_with_type_and_format(&"YES".to_string(), &Type::TEXT, FieldFormat::Text)?;
+            encoder.encode_field_with_type_and_format(&"text".to_string(), &Type::TEXT, FieldFormat::Text)?;
+            encoder.encode_field_with_type_and_format(&None::<i32>, &Type::INT4, FieldFormat::Text)?;
+            encoder.encode_field_with_type_and_format(&None::<i32>, &Type::INT4, FieldFormat::Text)?;
+            encoder.encode_field_with_type_and_format(&None::<i32>, &Type::INT4, FieldFormat::Text)?;
+            data_rows.push(encoder.finish()?);
+            ordinal += 1;
+        }
+
+        // Generic "fields" column to indicate dynamic fields
+        // (In RusTs/InfluxDB model, fields are dynamic per series)
+        let mut encoder = DataRowEncoder::new(schema.clone());
+        encoder.encode_field_with_type_and_format(&"public".to_string(), &Type::TEXT, FieldFormat::Text)?;
+        encoder.encode_field_with_type_and_format(&mc.measurement, &Type::TEXT, FieldFormat::Text)?;
+        encoder.encode_field_with_type_and_format(&"fields".to_string(), &Type::TEXT, FieldFormat::Text)?;
+        encoder.encode_field_with_type_and_format(&ordinal.to_string(), &Type::INT4, FieldFormat::Text)?;
+        encoder.encode_field_with_type_and_format(&None::<String>, &Type::TEXT, FieldFormat::Text)?;
+        encoder.encode_field_with_type_and_format(&"YES".to_string(), &Type::TEXT, FieldFormat::Text)?;
+        encoder.encode_field_with_type_and_format(&"jsonb".to_string(), &Type::TEXT, FieldFormat::Text)?;
+        encoder.encode_field_with_type_and_format(&None::<i32>, &Type::INT4, FieldFormat::Text)?;
+        encoder.encode_field_with_type_and_format(&None::<i32>, &Type::INT4, FieldFormat::Text)?;
+        encoder.encode_field_with_type_and_format(&None::<i32>, &Type::INT4, FieldFormat::Text)?;
+        data_rows.push(encoder.finish()?);
+    }
+
+    let row_count = data_rows.len();
+    let stream = futures::stream::iter(data_rows.into_iter().map(Ok));
+    let mut response = QueryResponse::new(schema, stream);
+    response.set_command_tag(&format!("SELECT {}", row_count));
     Ok(Response::Query(response))
 }
 

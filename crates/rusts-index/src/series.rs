@@ -168,6 +168,24 @@ impl SeriesIndex {
         self.measurement_index.clear();
         self.count.store(0, Ordering::Relaxed);
     }
+
+    /// Get all unique tag keys for a specific measurement
+    pub fn get_tag_keys_for_measurement(&self, measurement: &str) -> Vec<String> {
+        let series_ids = self.get_by_measurement(measurement);
+        let mut tag_keys = std::collections::HashSet::new();
+
+        for id in series_ids {
+            if let Some(meta) = self.get(id) {
+                for tag in meta.tags {
+                    tag_keys.insert(tag.key);
+                }
+            }
+        }
+
+        let mut keys: Vec<String> = tag_keys.into_iter().collect();
+        keys.sort();
+        keys
+    }
 }
 
 impl Default for SeriesIndex {

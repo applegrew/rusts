@@ -17,6 +17,8 @@ pub enum TagFilter {
     Regex { key: String, pattern: String },
     /// Any of values: tag IN (v1, v2, ...)
     In { key: String, values: Vec<String> },
+    /// None of values: tag NOT IN (v1, v2, ...)
+    NotIn { key: String, values: Vec<String> },
     /// Tag exists
     Exists { key: String },
 }
@@ -40,6 +42,11 @@ impl TagFilter {
             }
             TagFilter::In { key, values } => {
                 tags.iter().any(|t| &t.key == key && values.contains(&t.value))
+            }
+            TagFilter::NotIn { key, values } => {
+                // If tag doesn't exist, it matches NOT IN
+                // If tag exists, its value must not be in the list
+                !tags.iter().any(|t| &t.key == key && values.contains(&t.value))
             }
             TagFilter::Exists { key } => tags.iter().any(|t| &t.key == key),
         }
@@ -188,6 +195,15 @@ impl QueryBuilder {
     /// Add tag in filter
     pub fn where_tag_in(mut self, key: impl Into<String>, values: Vec<String>) -> Self {
         self.tag_filters.push(TagFilter::In {
+            key: key.into(),
+            values,
+        });
+        self
+    }
+
+    /// Add tag not in filter
+    pub fn where_tag_not_in(mut self, key: impl Into<String>, values: Vec<String>) -> Self {
+        self.tag_filters.push(TagFilter::NotIn {
             key: key.into(),
             values,
         });

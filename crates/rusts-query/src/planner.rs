@@ -200,6 +200,7 @@ impl QueryPlanner {
                 TagFilter::NotEquals { .. } => selectivity *= 0.9,
                 TagFilter::Regex { .. } => selectivity *= 0.3,
                 TagFilter::In { values, .. } => selectivity *= (values.len() as f64 * 0.1).min(0.5),
+                TagFilter::NotIn { values, .. } => selectivity *= 1.0 - (values.len() as f64 * 0.1).min(0.5),
                 TagFilter::Exists { .. } => selectivity *= 0.7,
             }
         }

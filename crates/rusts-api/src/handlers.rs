@@ -816,6 +816,115 @@ pub async fn sql_query(
                 execution_time_ms: start.elapsed().as_secs_f64() * 1000.0,
             })))
         }
+        SqlCommand::InformationSchemaEmpty { table } => {
+            // information_schema query for unsupported tables - return empty response
+            Ok(Json(SqlQueryResponse::QueryResult(QueryResponse {
+                measurement: format!("information_schema.{}", table),
+                results: vec![],
+                total_rows: 0,
+                execution_time_ms: start.elapsed().as_secs_f64() * 1000.0,
+            })))
+        }
+        SqlCommand::InformationSchemaTables => {
+            // Return list of measurements as information_schema.tables
+            let measurements = state.series_index.measurements();
+            let results: Vec<ResultRowResponse> = measurements
+                .into_iter()
+                .map(|name| {
+                    let mut fields = HashMap::new();
+                    fields.insert("schema".to_string(), serde_json::json!("public"));
+                    fields.insert("name".to_string(), serde_json::json!(name));
+                    fields.insert("tabletype".to_string(), serde_json::json!("r"));
+                    fields.insert("parenttype".to_string(), serde_json::json!("r"));
+                    ResultRowResponse {
+                        time: None,
+                        tags: HashMap::new(),
+                        fields,
+                    }
+                })
+                .collect();
+
+            let total_rows = results.len();
+            Ok(Json(SqlQueryResponse::QueryResult(QueryResponse {
+                measurement: "information_schema.tables".to_string(),
+                results,
+                total_rows,
+                execution_time_ms: start.elapsed().as_secs_f64() * 1000.0,
+            })))
+        }
+        SqlCommand::InformationSchemaViews => {
+            // Return empty for views
+            Ok(Json(SqlQueryResponse::QueryResult(QueryResponse {
+                measurement: "information_schema.views".to_string(),
+                results: vec![],
+                total_rows: 0,
+                execution_time_ms: start.elapsed().as_secs_f64() * 1000.0,
+            })))
+        }
+        SqlCommand::InformationSchemaColumns => {
+            // Return columns for all measurements with actual tag keys
+            let measurements = state.series_index.measurements();
+            let mut results = Vec::new();
+
+            for measurement in &measurements {
+                let mut ordinal = 1;
+
+                // time column
+                let mut fields = HashMap::new();
+                fields.insert("table_schema".to_string(), serde_json::json!("public"));
+                fields.insert("table_name".to_string(), serde_json::json!(measurement));
+                fields.insert("column_name".to_string(), serde_json::json!("time"));
+                fields.insert("ordinal_position".to_string(), serde_json::json!(ordinal));
+                fields.insert("data_type".to_string(), serde_json::json!("timestamp with time zone"));
+                fields.insert("is_nullable".to_string(), serde_json::json!("NO"));
+                results.push(ResultRowResponse {
+                    time: None,
+                    tags: HashMap::new(),
+                    fields,
+                });
+                ordinal += 1;
+
+                // Tag columns (actual tag keys)
+                let tag_keys = state.series_index.get_tag_keys_for_measurement(measurement);
+                for tag_key in tag_keys {
+                    let mut fields = HashMap::new();
+                    fields.insert("table_schema".to_string(), serde_json::json!("public"));
+                    fields.insert("table_name".to_string(), serde_json::json!(measurement));
+                    fields.insert("column_name".to_string(), serde_json::json!(tag_key));
+                    fields.insert("ordinal_position".to_string(), serde_json::json!(ordinal));
+                    fields.insert("data_type".to_string(), serde_json::json!("text"));
+                    fields.insert("is_nullable".to_string(), serde_json::json!("YES"));
+                    results.push(ResultRowResponse {
+                        time: None,
+                        tags: HashMap::new(),
+                        fields,
+                    });
+                    ordinal += 1;
+                }
+
+                // fields column (dynamic)
+                let mut fields = HashMap::new();
+                fields.insert("table_schema".to_string(), serde_json::json!("public"));
+                fields.insert("table_name".to_string(), serde_json::json!(measurement));
+                fields.insert("column_name".to_string(), serde_json::json!("fields"));
+                fields.insert("ordinal_position".to_string(), serde_json::json!(ordinal));
+                fields.insert("data_type".to_string(), serde_json::json!("jsonb"));
+                fields.insert("is_nullable".to_string(), serde_json::json!("YES"));
+                results.push(ResultRowResponse {
+                    time: None,
+                    tags: HashMap::new(),
+                    fields,
+                });
+            }
+
+            let total_rows = results.len();
+            Ok(Json(SqlQueryResponse::QueryResult(QueryResponse {
+                measurement: "information_schema.columns".to_string(),
+                results,
+                total_rows,
+                execution_time_ms: start.elapsed().as_secs_f64() * 1000.0,
+            })))
+        }
     }
 }
 

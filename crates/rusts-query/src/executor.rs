@@ -373,8 +373,8 @@ impl QueryExecutor {
                             .sum::<usize>()
                             .max(1)
                     }
-                    TagFilter::NotEquals { .. } => {
-                        // NotEquals is less selective, give high cardinality
+                    TagFilter::NotEquals { .. } | TagFilter::NotIn { .. } => {
+                        // NotEquals/NotIn are less selective, give high cardinality
                         10000
                     }
                     TagFilter::Regex { .. } | TagFilter::Exists { .. } => {
@@ -458,6 +458,17 @@ impl QueryExecutor {
                         self.tag_index.union_with(key, value, &mut or_bitmap);
                     }
                     result_bitmap &= &or_bitmap;
+                    if result_bitmap.is_empty() {
+                        return Ok(Vec::new());
+                    }
+                }
+                TagFilter::NotIn { key, values } => {
+                    // Build OR bitmap of all matching values, then subtract from result
+                    let mut or_bitmap = roaring::RoaringBitmap::new();
+                    for value in values {
+                        self.tag_index.union_with(key, value, &mut or_bitmap);
+                    }
+                    result_bitmap -= &or_bitmap;
                     if result_bitmap.is_empty() {
                         return Ok(Vec::new());
                     }

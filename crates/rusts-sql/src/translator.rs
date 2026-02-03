@@ -38,6 +38,17 @@ pub enum SqlCommand {
         /// The catalog table being queried
         table: String,
     },
+    /// Query against information_schema that returns empty (routines, parameters, etc.)
+    InformationSchemaEmpty {
+        /// The catalog table being queried
+        table: String,
+    },
+    /// Query against information_schema.tables - returns list of measurements
+    InformationSchemaTables,
+    /// Query against information_schema.views - returns empty
+    InformationSchemaViews,
+    /// Query against information_schema.columns - returns columns for measurements
+    InformationSchemaColumns,
 }
 
 /// SQL to Query translator
@@ -212,16 +223,48 @@ impl SqlTranslator {
         None
     }
 
-    /// Check if a table factor references pg_catalog
+    /// Check if a table factor references pg_catalog or information_schema
     fn check_pg_catalog_table(table_factor: &TableFactor) -> Option<SqlCommand> {
         if let TableFactor::Table { name, .. } = table_factor {
             let full_name = name.to_string().to_lowercase();
+
+            // Check for pg_catalog tables
             if full_name.starts_with("pg_catalog.") || full_name.starts_with("pg_") {
                 let table = full_name
                     .strip_prefix("pg_catalog.")
                     .unwrap_or(&full_name)
                     .to_string();
                 return Some(SqlCommand::PgCatalogQuery { table });
+            }
+
+            // Check for information_schema tables
+            if full_name.starts_with("information_schema.") {
+                let table = full_name
+                    .strip_prefix("information_schema.")
+                    .unwrap_or(&full_name)
+                    .to_string();
+
+                match table.as_str() {
+                    // Tables query - return list of measurements
+                    "tables" => {
+                        return Some(SqlCommand::InformationSchemaTables);
+                    }
+                    // Views query - return empty (we don't have views)
+                    "views" => {
+                        return Some(SqlCommand::InformationSchemaViews);
+                    }
+                    // Columns query - return columns for measurements
+                    "columns" => {
+                        return Some(SqlCommand::InformationSchemaColumns);
+                    }
+                    // These tables should return empty results
+                    "routines" | "parameters" | "triggers" | "sequences"
+                    | "check_constraints" | "referential_constraints" | "table_constraints"
+                    | "key_column_usage" | "constraint_column_usage" | "constraint_table_usage" => {
+                        return Some(SqlCommand::InformationSchemaEmpty { table });
+                    }
+                    _ => {}
+                }
             }
         }
         None
@@ -315,6 +358,7 @@ impl SqlTranslator {
                     TagFilter::Equals { key, value } => builder.where_tag(key, value),
                     TagFilter::NotEquals { key, value } => builder.where_tag_not(key, value),
                     TagFilter::In { key, values } => builder.where_tag_in(key, values),
+                    TagFilter::NotIn { key, values } => builder.where_tag_not_in(key, values),
                     TagFilter::Regex { .. } | TagFilter::Exists { .. } => {
                         // These need direct manipulation, so we handle them after build
                         builder
@@ -465,24 +509,26 @@ impl SqlTranslator {
                 Self::process_comparison(left, op, right, time_start, time_end, tag_filters)?;
             }
 
-            // IN expressions: tag IN (value1, value2, ...)
+            // IN / NOT IN expressions: tag IN (value1, value2, ...)
             Expr::InList {
                 expr,
                 list,
                 negated,
             } => {
-                if *negated {
-                    return Err(SqlError::UnsupportedFeature(
-                        "NOT IN expressions not supported".to_string(),
-                    ));
-                }
                 if let Expr::Identifier(ident) = expr.as_ref() {
                     let values: Result<Vec<String>> =
                         list.iter().map(|e| Self::expr_to_string(e)).collect();
-                    tag_filters.push(TagFilter::In {
-                        key: ident.value.clone(),
-                        values: values?,
-                    });
+                    if *negated {
+                        tag_filters.push(TagFilter::NotIn {
+                            key: ident.value.clone(),
+                            values: values?,
+                        });
+                    } else {
+                        tag_filters.push(TagFilter::In {
+                            key: ident.value.clone(),
+                            values: values?,
+                        });
+                    }
                 }
             }
 
@@ -1014,6 +1060,21 @@ mod tests {
                 assert!(values.contains(&"us-east".to_string()));
             }
             _ => panic!("Expected In filter"),
+        }
+    }
+
+    #[test]
+    fn test_where_tag_not_in() {
+        let query =
+            translate("SELECT * FROM cpu WHERE region NOT IN ('us-west', 'us-east')").unwrap();
+        assert_eq!(query.tag_filters.len(), 1);
+        match &query.tag_filters[0] {
+            TagFilter::NotIn { key, values } => {
+                assert_eq!(key, "region");
+                assert!(values.contains(&"us-west".to_string()));
+                assert!(values.contains(&"us-east".to_string()));
+            }
+            _ => panic!("Expected NotIn filter"),
         }
     }
 
