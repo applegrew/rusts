@@ -194,20 +194,36 @@ impl SqlTranslator {
             _ => return None,
         };
 
-        // Check if FROM clause references pg_catalog
+        // Check if FROM clause references pg_catalog (including JOINs)
         for table_with_joins in &select.from {
-            if let TableFactor::Table { name, .. } = &table_with_joins.relation {
-                let full_name = name.to_string().to_lowercase();
-                if full_name.starts_with("pg_catalog.") || full_name.starts_with("pg_") {
-                    let table = full_name
-                        .strip_prefix("pg_catalog.")
-                        .unwrap_or(&full_name)
-                        .to_string();
-                    return Some(SqlCommand::PgCatalogQuery { table });
+            // Check main table
+            if let Some(cmd) = Self::check_pg_catalog_table(&table_with_joins.relation) {
+                return Some(cmd);
+            }
+
+            // Check joined tables
+            for join in &table_with_joins.joins {
+                if let Some(cmd) = Self::check_pg_catalog_table(&join.relation) {
+                    return Some(cmd);
                 }
             }
         }
 
+        None
+    }
+
+    /// Check if a table factor references pg_catalog
+    fn check_pg_catalog_table(table_factor: &TableFactor) -> Option<SqlCommand> {
+        if let TableFactor::Table { name, .. } = table_factor {
+            let full_name = name.to_string().to_lowercase();
+            if full_name.starts_with("pg_catalog.") || full_name.starts_with("pg_") {
+                let table = full_name
+                    .strip_prefix("pg_catalog.")
+                    .unwrap_or(&full_name)
+                    .to_string();
+                return Some(SqlCommand::PgCatalogQuery { table });
+            }
+        }
         None
     }
 

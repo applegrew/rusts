@@ -421,6 +421,10 @@ impl Partition {
     }
 
     /// Save partition metadata
+    ///
+    /// Note: If this file gets corrupted (e.g., process killed mid-write),
+    /// the partition will be skipped on restart and its data will be
+    /// recovered from WAL replay.
     fn save_meta(&self) -> Result<()> {
         let meta = self.meta();
         let meta_bytes = bincode::serialize(&meta)?;
@@ -451,27 +455,38 @@ pub struct PartitionManager {
 }
 
 impl PartitionManager {
-    /// Create a new partition manager
+    /// Create a new partition manager and load existing partitions
     pub fn new(data_dir: impl AsRef<Path>, partition_duration: i64, compression: CompressionLevel) -> Result<Self> {
+        let manager = Self::new_empty(data_dir, partition_duration, compression)?;
+        manager.load_partitions()?;
+        Ok(manager)
+    }
+
+    /// Create a new partition manager without loading existing partitions.
+    ///
+    /// Use this when you need to perform WAL recovery before loading partitions.
+    /// Call `load_partitions()` after WAL recovery is complete.
+    pub fn new_empty(data_dir: impl AsRef<Path>, partition_duration: i64, compression: CompressionLevel) -> Result<Self> {
         let data_dir = data_dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&data_dir)?;
 
-        let manager = Self {
+        Ok(Self {
             data_dir,
             partition_duration,
             partitions: RwLock::new(Vec::new()),
             compression,
             next_partition_id: AtomicU64::new(0),
-        };
-
-        // Load existing partitions
-        manager.load_partitions()?;
-
-        Ok(manager)
+        })
     }
 
-    /// Load existing partitions from disk
-    fn load_partitions(&self) -> Result<()> {
+    /// Load existing partitions from disk.
+    ///
+    /// Corrupted partitions are removed and will be recreated during the next
+    /// memtable flush. This should be called AFTER WAL recovery so that the
+    /// data from corrupted partitions is already in the memtable.
+    pub fn load_partitions(&self) -> Result<()> {
+        use tracing::warn;
+
         let mut max_id = 0u64;
 
         for entry in std::fs::read_dir(&self.data_dir)? {
@@ -481,9 +496,26 @@ impl PartitionManager {
             if path.is_dir() {
                 let meta_path = path.join("partition.meta");
                 if meta_path.exists() {
-                    let partition = Partition::open(&path)?;
-                    max_id = max_id.max(partition.id());
-                    self.partitions.write().push(partition);
+                    match Partition::open(&path) {
+                        Ok(partition) => {
+                            max_id = max_id.max(partition.id());
+                            self.partitions.write().push(partition);
+                        }
+                        Err(e) => {
+                            // Remove corrupted partition directory - data is already in memtable
+                            // from WAL recovery, so it will be recreated on next flush
+                            warn!(
+                                "Removing corrupted partition at {:?}: {}. Data will be recreated from memtable.",
+                                path, e
+                            );
+                            if let Err(remove_err) = std::fs::remove_dir_all(&path) {
+                                warn!(
+                                    "Failed to remove corrupted partition directory {:?}: {}",
+                                    path, remove_err
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }

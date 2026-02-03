@@ -107,8 +107,11 @@ impl StorageEngine {
 
         let wal = WalWriter::new(&wal_dir, config.wal_durability)?;
 
+        // Create partition manager without loading partitions yet
+        // We need to recover from WAL first so that corrupted partition data
+        // is already in memtable before we try to load partitions
         let partitions_dir = config.data_dir.join("partitions");
-        let partitions = PartitionManager::new(
+        let partitions = PartitionManager::new_empty(
             &partitions_dir,
             config.partition_duration,
             config.compression,
@@ -140,8 +143,13 @@ impl StorageEngine {
         // Start background flusher
         engine.start_flusher(flush_rx);
 
-        // Recover from WAL (pass checkpoint so we know whether to filter entries)
+        // Recover from WAL FIRST (pass checkpoint so we know whether to filter entries)
+        // This ensures corrupted partition data is in memtable before we load partitions
         engine.recover(checkpoint_sequence)?;
+
+        // Now load partitions - corrupted ones will be removed since their data
+        // is already in memtable from WAL recovery
+        engine.partitions.load_partitions()?;
 
         Ok(engine)
     }
@@ -1334,6 +1342,12 @@ impl StorageEngine {
 
     /// Load checkpoint from disk (returns None if no checkpoint exists)
     fn load_checkpoint(data_dir: &Path) -> Option<u64> {
+        // Clean up any leftover temp file from interrupted atomic write
+        let temp_path = data_dir.join(format!("{}.tmp", CHECKPOINT_FILE));
+        if temp_path.exists() {
+            let _ = fs::remove_file(&temp_path);
+        }
+
         let checkpoint_path = data_dir.join(CHECKPOINT_FILE);
         match fs::read_to_string(&checkpoint_path) {
             Ok(content) => content.trim().parse().ok(),
@@ -1341,12 +1355,23 @@ impl StorageEngine {
         }
     }
 
-    /// Save checkpoint to disk
+    /// Save checkpoint to disk atomically
+    ///
+    /// Uses write-to-temp-then-rename pattern to prevent corruption
+    /// if the process is killed during write.
     fn save_checkpoint(data_dir: &Path, sequence: u64) -> Result<()> {
         let checkpoint_path = data_dir.join(CHECKPOINT_FILE);
-        let mut file = fs::File::create(&checkpoint_path)?;
+        let temp_path = data_dir.join(format!("{}.tmp", CHECKPOINT_FILE));
+
+        // Write to temp file
+        let mut file = fs::File::create(&temp_path)?;
         writeln!(file, "{}", sequence)?;
         file.sync_all()?;
+        drop(file);
+
+        // Atomic rename
+        fs::rename(&temp_path, &checkpoint_path)?;
+
         Ok(())
     }
 
