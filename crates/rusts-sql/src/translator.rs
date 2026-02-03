@@ -373,11 +373,20 @@ impl SqlTranslator {
         }
 
         match &table.relation {
-            TableFactor::Table { name, .. } => Ok(Self::object_name_to_string(name)),
+            TableFactor::Table { name, .. } => Ok(Self::extract_table_name(name)),
             _ => Err(SqlError::UnsupportedFeature(
                 "Only simple table references are supported".to_string(),
             )),
         }
+    }
+
+    /// Extract table name from ObjectName (strips schema prefix like "public.")
+    fn extract_table_name(name: &ObjectName) -> String {
+        // Take the last part as the table name (handles public.trips -> trips)
+        name.0
+            .last()
+            .map(|part| part.to_string())
+            .unwrap_or_default()
     }
 
     /// Convert ObjectName to string (sqlparser 0.60 uses ObjectNamePart)
