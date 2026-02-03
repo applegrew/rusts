@@ -309,6 +309,211 @@ impl MemTable {
             .unwrap_or_default()
     }
 
+    /// Query points for a series with a limit, using parallel processing for large datasets.
+    /// Returns (points, total_count) where total_count is the number of matching points.
+    /// For ascending order, returns K smallest timestamps. For descending, K largest.
+    pub fn query_with_limit(
+        &self,
+        series_id: SeriesId,
+        time_range: &TimeRange,
+        limit: usize,
+        ascending: bool,
+    ) -> (Vec<MemTablePoint>, usize) {
+        use rayon::prelude::*;
+        use std::collections::BinaryHeap;
+
+        let Some(series) = self.series.get(&series_id) else {
+            return (Vec::new(), 0);
+        };
+
+        let points = series.points.read();
+
+        // For small datasets, use sequential processing
+        if points.len() < 10000 {
+            return self.query_with_limit_sequential(&points, time_range, limit, ascending);
+        }
+
+        // For large datasets, use parallel processing with rayon
+        // Split into chunks, find top K in each chunk, then merge
+        let chunk_size = (points.len() / rayon::current_num_threads()).max(1000);
+
+        if ascending {
+            // Find top K smallest timestamps in parallel
+            let chunk_results: Vec<(Vec<(i64, usize)>, usize)> = points
+                .par_chunks(chunk_size)
+                .enumerate()
+                .map(|(chunk_idx, chunk)| {
+                    let base_idx = chunk_idx * chunk_size;
+                    let mut heap: BinaryHeap<(i64, usize)> = BinaryHeap::with_capacity(limit + 1);
+                    let mut count = 0;
+
+                    for (i, point) in chunk.iter().enumerate() {
+                        if !time_range.contains(point.timestamp) {
+                            continue;
+                        }
+                        count += 1;
+                        let idx = base_idx + i;
+
+                        if heap.len() < limit {
+                            heap.push((point.timestamp, idx));
+                        } else if let Some(&(max_ts, _)) = heap.peek() {
+                            if point.timestamp < max_ts {
+                                heap.pop();
+                                heap.push((point.timestamp, idx));
+                            }
+                        }
+                    }
+                    (heap.into_vec(), count)
+                })
+                .collect();
+
+            // Merge results from all chunks
+            let mut total_count = 0;
+            let mut final_heap: BinaryHeap<(i64, usize)> = BinaryHeap::with_capacity(limit + 1);
+
+            for (chunk_heap, count) in chunk_results {
+                total_count += count;
+                for item in chunk_heap {
+                    if final_heap.len() < limit {
+                        final_heap.push(item);
+                    } else if let Some(&(max_ts, _)) = final_heap.peek() {
+                        if item.0 < max_ts {
+                            final_heap.pop();
+                            final_heap.push(item);
+                        }
+                    }
+                }
+            }
+
+            // Clone selected points
+            let mut indices: Vec<usize> = final_heap.into_iter().map(|(_, idx)| idx).collect();
+            indices.sort_unstable();
+
+            let mut result: Vec<MemTablePoint> = indices.iter().map(|&idx| points[idx].clone()).collect();
+            result.sort_by_key(|p| p.timestamp);
+            (result, total_count)
+        } else {
+            // Find top K largest timestamps in parallel
+            let chunk_results: Vec<(Vec<(std::cmp::Reverse<i64>, usize)>, usize)> = points
+                .par_chunks(chunk_size)
+                .enumerate()
+                .map(|(chunk_idx, chunk)| {
+                    let base_idx = chunk_idx * chunk_size;
+                    let mut heap: BinaryHeap<(std::cmp::Reverse<i64>, usize)> = BinaryHeap::with_capacity(limit + 1);
+                    let mut count = 0;
+
+                    for (i, point) in chunk.iter().enumerate() {
+                        if !time_range.contains(point.timestamp) {
+                            continue;
+                        }
+                        count += 1;
+                        let idx = base_idx + i;
+
+                        if heap.len() < limit {
+                            heap.push((std::cmp::Reverse(point.timestamp), idx));
+                        } else if let Some(&(std::cmp::Reverse(min_ts), _)) = heap.peek() {
+                            if point.timestamp > min_ts {
+                                heap.pop();
+                                heap.push((std::cmp::Reverse(point.timestamp), idx));
+                            }
+                        }
+                    }
+                    (heap.into_vec(), count)
+                })
+                .collect();
+
+            // Merge results
+            let mut total_count = 0;
+            let mut final_heap: BinaryHeap<(std::cmp::Reverse<i64>, usize)> = BinaryHeap::with_capacity(limit + 1);
+
+            for (chunk_heap, count) in chunk_results {
+                total_count += count;
+                for item in chunk_heap {
+                    if final_heap.len() < limit {
+                        final_heap.push(item);
+                    } else if let Some(&(std::cmp::Reverse(min_ts), _)) = final_heap.peek() {
+                        if item.0.0 > min_ts {
+                            final_heap.pop();
+                            final_heap.push(item);
+                        }
+                    }
+                }
+            }
+
+            let mut indices: Vec<usize> = final_heap.into_iter().map(|(_, idx)| idx).collect();
+            indices.sort_unstable();
+
+            let mut result: Vec<MemTablePoint> = indices.iter().map(|&idx| points[idx].clone()).collect();
+            result.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+            (result, total_count)
+        }
+    }
+
+    /// Sequential version for small datasets
+    fn query_with_limit_sequential(
+        &self,
+        points: &[MemTablePoint],
+        time_range: &TimeRange,
+        limit: usize,
+        ascending: bool,
+    ) -> (Vec<MemTablePoint>, usize) {
+        use std::collections::BinaryHeap;
+
+        let mut total_count = 0;
+
+        if ascending {
+            let mut heap: BinaryHeap<(i64, usize)> = BinaryHeap::with_capacity(limit + 1);
+
+            for (idx, point) in points.iter().enumerate() {
+                if !time_range.contains(point.timestamp) {
+                    continue;
+                }
+                total_count += 1;
+
+                if heap.len() < limit {
+                    heap.push((point.timestamp, idx));
+                } else if let Some(&(max_ts, _)) = heap.peek() {
+                    if point.timestamp < max_ts {
+                        heap.pop();
+                        heap.push((point.timestamp, idx));
+                    }
+                }
+            }
+
+            let mut indices: Vec<usize> = heap.into_iter().map(|(_, idx)| idx).collect();
+            indices.sort_unstable();
+
+            let mut result: Vec<MemTablePoint> = indices.iter().map(|&idx| points[idx].clone()).collect();
+            result.sort_by_key(|p| p.timestamp);
+            (result, total_count)
+        } else {
+            let mut heap: BinaryHeap<(std::cmp::Reverse<i64>, usize)> = BinaryHeap::with_capacity(limit + 1);
+
+            for (idx, point) in points.iter().enumerate() {
+                if !time_range.contains(point.timestamp) {
+                    continue;
+                }
+                total_count += 1;
+
+                if heap.len() < limit {
+                    heap.push((std::cmp::Reverse(point.timestamp), idx));
+                } else if let Some(&(std::cmp::Reverse(min_ts), _)) = heap.peek() {
+                    if point.timestamp > min_ts {
+                        heap.pop();
+                        heap.push((std::cmp::Reverse(point.timestamp), idx));
+                    }
+                }
+            }
+
+            let mut indices: Vec<usize> = heap.into_iter().map(|(_, idx)| idx).collect();
+            indices.sort_unstable();
+
+            let mut result: Vec<MemTablePoint> = indices.iter().map(|&idx| points[idx].clone()).collect();
+            result.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+            (result, total_count)
+        }
+    }
+
     /// Query points for all series matching a measurement
     pub fn query_measurement(
         &self,

@@ -486,19 +486,22 @@ impl StorageEngine {
     ) -> Result<(Vec<MemTablePoint>, usize)> {
         let mut total_scanned = 0;
 
-        // Collect all memtable points first (can't skip - might have any timestamps)
-        let mut memtable_points = Vec::new();
+        // Query memtables with limit - uses heap internally to avoid collecting all points
+        let mut memtable_points = Vec::with_capacity(limit);
         {
             let memtable = self.active_memtable.read();
-            memtable_points.extend(memtable.query(series_id, time_range));
+            let (points, count) = memtable.query_with_limit(series_id, time_range, limit, ascending);
+            total_scanned += count;
+            memtable_points.extend(points);
         }
         {
             let immutables = self.immutable_memtables.read();
             for memtable in immutables.iter() {
-                memtable_points.extend(memtable.query(series_id, time_range));
+                let (points, count) = memtable.query_with_limit(series_id, time_range, limit, ascending);
+                total_scanned += count;
+                memtable_points.extend(points);
             }
         }
-        total_scanned += memtable_points.len();
 
         // Get partitions in time order
         let mut partitions = self.partitions.get_partitions_for_range(time_range);
@@ -724,12 +727,15 @@ impl StorageEngine {
         use std::cmp::Ordering;
         use std::collections::BinaryHeap;
 
-        // Collect memtable points for all series first
+        // Collect memtable points for all series with limit per series
+        // This avoids scanning all points - each memtable uses a heap internally
         let mut memtable_points: HashMap<SeriesId, Vec<MemTablePoint>> = HashMap::new();
+        let mut total_scanned = 0;
         {
             let memtable = self.active_memtable.read();
             for &series_id in series_ids {
-                let points = memtable.query(series_id, time_range);
+                let (points, count) = memtable.query_with_limit(series_id, time_range, limit, ascending);
+                total_scanned += count;
                 if !points.is_empty() {
                     memtable_points.entry(series_id).or_default().extend(points);
                 }
@@ -739,15 +745,14 @@ impl StorageEngine {
             let immutables = self.immutable_memtables.read();
             for memtable in immutables.iter() {
                 for &series_id in series_ids {
-                    let points = memtable.query(series_id, time_range);
+                    let (points, count) = memtable.query_with_limit(series_id, time_range, limit, ascending);
+                    total_scanned += count;
                     if !points.is_empty() {
                         memtable_points.entry(series_id).or_default().extend(points);
                     }
                 }
             }
         }
-
-        let mut total_scanned: usize = memtable_points.values().map(|v| v.len()).sum();
 
         // Get partitions in time order
         let mut partitions = self.partitions.get_partitions_for_range(time_range);

@@ -96,6 +96,16 @@ impl TopKCollector {
     fn total_seen(&self) -> usize {
         self.total_seen
     }
+
+    /// Get the maximum timestamp in the collector (the one that would be evicted next)
+    fn peek_max_timestamp(&self) -> Option<i64> {
+        self.heap.peek().map(|tr| tr.timestamp)
+    }
+
+    /// Check if the collector is full
+    fn is_full(&self) -> bool {
+        self.heap.len() >= self.capacity
+    }
 }
 
 /// Wrapper for min-heap (descending order - keeps largest timestamps)
@@ -166,6 +176,16 @@ impl TopKCollectorDesc {
 
     fn total_seen(&self) -> usize {
         self.total_seen
+    }
+
+    /// Get the minimum timestamp in the collector (the one that would be evicted next)
+    fn peek_min_timestamp(&self) -> Option<i64> {
+        self.heap.peek().map(|tr| tr.0.timestamp)
+    }
+
+    /// Check if the collector is full
+    fn is_full(&self) -> bool {
+        self.heap.len() >= self.capacity
     }
 }
 
@@ -759,7 +779,7 @@ impl QueryExecutor {
     }
 
     /// Collect top K rows by ascending timestamp.
-    /// Uses storage-level early termination with partition-ordered queries.
+    /// Uses series metadata for smart ordering and batched queries.
     fn collect_top_k_asc(
         &self,
         query: &Query,
@@ -773,31 +793,8 @@ impl QueryExecutor {
             }
         }
 
-        if series_ids.len() == 1 {
-            // Single series: use original optimized path
-            let series_id = series_ids[0];
-            let series_meta = self.series_index.get(series_id);
-            let tags = series_meta.map(|m| m.tags).unwrap_or_default();
-
-            let (points, total_seen) = self
-                .storage
-                .query_with_limit(series_id, &query.time_range, k, true)?;
-
-            let mut collector = TopKCollector::new(k);
-            for point in points {
-                let fields = self.filter_fields(&point.fields, &query.field_selection);
-                collector.push(ResultRow {
-                    timestamp: Some(point.timestamp),
-                    series_id,
-                    tags: tags.clone(),
-                    fields,
-                });
-            }
-
-            let rows = collector.into_sorted_vec();
-            Ok((rows, total_seen))
-        } else {
-            // Multiple series: use partition-ordered query with early termination
+        // For small number of series, use original multi-series path
+        if series_ids.len() <= 100 {
             let (series_points, total_seen) = self
                 .storage
                 .query_multi_series_with_limit(series_ids, &query.time_range, k, true)?;
@@ -817,14 +814,55 @@ impl QueryExecutor {
                     });
                 }
             }
-
-            let rows = collector.into_sorted_vec();
-            Ok((rows, total_seen))
+            return Ok((collector.into_sorted_vec(), total_seen));
         }
+
+        // For many series, sort by first_seen and query a limited batch
+        // This avoids scanning all series when only a few are needed
+        let mut series_with_first_seen: Vec<(SeriesId, i64)> = series_ids
+            .iter()
+            .filter_map(|&id| {
+                self.series_index.get(id).map(|meta| (id, meta.first_seen))
+            })
+            .collect();
+
+        // Sort by first_seen ascending - series with earliest data first
+        series_with_first_seen.sort_by_key(|(_, first_seen)| *first_seen);
+
+        // Query only the first batch of series (those most likely to have earliest data)
+        // Use k * 10 or 500 series, whichever is smaller but at least 100
+        let batch_size = (k * 10).max(100).min(500).min(series_with_first_seen.len());
+        let batch_ids: Vec<SeriesId> = series_with_first_seen
+            .iter()
+            .take(batch_size)
+            .map(|(id, _)| *id)
+            .collect();
+
+        let (series_points, total_seen) = self
+            .storage
+            .query_multi_series_with_limit(&batch_ids, &query.time_range, k, true)?;
+
+        let mut collector = TopKCollector::new(k);
+        for (series_id, points) in series_points {
+            let series_meta = self.series_index.get(series_id);
+            let tags = series_meta.map(|m| m.tags).unwrap_or_default();
+
+            for point in points {
+                let fields = self.filter_fields(&point.fields, &query.field_selection);
+                collector.push(ResultRow {
+                    timestamp: Some(point.timestamp),
+                    series_id,
+                    tags: tags.clone(),
+                    fields,
+                });
+            }
+        }
+
+        Ok((collector.into_sorted_vec(), total_seen))
     }
 
     /// Collect top K rows by descending timestamp.
-    /// Uses storage-level early termination with partition-ordered queries.
+    /// Uses series metadata for smart ordering and batched queries.
     fn collect_top_k_desc(
         &self,
         query: &Query,
@@ -838,31 +876,8 @@ impl QueryExecutor {
             }
         }
 
-        if series_ids.len() == 1 {
-            // Single series: use original optimized path
-            let series_id = series_ids[0];
-            let series_meta = self.series_index.get(series_id);
-            let tags = series_meta.map(|m| m.tags).unwrap_or_default();
-
-            let (points, total_seen) = self
-                .storage
-                .query_with_limit(series_id, &query.time_range, k, false)?;
-
-            let mut collector = TopKCollectorDesc::new(k);
-            for point in points {
-                let fields = self.filter_fields(&point.fields, &query.field_selection);
-                collector.push(ResultRow {
-                    timestamp: Some(point.timestamp),
-                    series_id,
-                    tags: tags.clone(),
-                    fields,
-                });
-            }
-
-            let rows = collector.into_sorted_vec();
-            Ok((rows, total_seen))
-        } else {
-            // Multiple series: use partition-ordered query with early termination
+        // For small number of series, use original multi-series path
+        if series_ids.len() <= 100 {
             let (series_points, total_seen) = self
                 .storage
                 .query_multi_series_with_limit(series_ids, &query.time_range, k, false)?;
@@ -882,10 +897,49 @@ impl QueryExecutor {
                     });
                 }
             }
-
-            let rows = collector.into_sorted_vec();
-            Ok((rows, total_seen))
+            return Ok((collector.into_sorted_vec(), total_seen));
         }
+
+        // For many series, sort by last_seen and query a limited batch
+        let mut series_with_last_seen: Vec<(SeriesId, i64)> = series_ids
+            .iter()
+            .filter_map(|&id| {
+                self.series_index.get(id).map(|meta| (id, meta.last_seen))
+            })
+            .collect();
+
+        // Sort by last_seen descending - series with most recent data first
+        series_with_last_seen.sort_by_key(|(_, last_seen)| std::cmp::Reverse(*last_seen));
+
+        // Query only the first batch of series
+        let batch_size = (k * 10).max(100).min(500).min(series_with_last_seen.len());
+        let batch_ids: Vec<SeriesId> = series_with_last_seen
+            .iter()
+            .take(batch_size)
+            .map(|(id, _)| *id)
+            .collect();
+
+        let (series_points, total_seen) = self
+            .storage
+            .query_multi_series_with_limit(&batch_ids, &query.time_range, k, false)?;
+
+        let mut collector = TopKCollectorDesc::new(k);
+        for (series_id, points) in series_points {
+            let series_meta = self.series_index.get(series_id);
+            let tags = series_meta.map(|m| m.tags).unwrap_or_default();
+
+            for point in points {
+                let fields = self.filter_fields(&point.fields, &query.field_selection);
+                collector.push(ResultRow {
+                    timestamp: Some(point.timestamp),
+                    series_id,
+                    tags: tags.clone(),
+                    fields,
+                });
+            }
+        }
+
+        Ok((collector.into_sorted_vec(), total_seen))
     }
 
     /// Check if the query can use segment statistics for aggregation.
