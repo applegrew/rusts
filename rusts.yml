@@ -29,4 +29,9 @@ logging:
   show_target: true
   show_thread_ids: false
   show_location: false
+postgres:
+  enabled: true
+  host: 0.0.0.0
+  port: 5432
+  max_connections: 100
 retention_policies: []

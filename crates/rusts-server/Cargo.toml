@@ -20,8 +20,10 @@ rusts-cluster = { workspace = true }
 rusts-aggregation = { workspace = true }
 rusts-retention = { workspace = true }
 rusts-api = { workspace = true }
+rusts-pgwire = { workspace = true }
 
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 axum = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

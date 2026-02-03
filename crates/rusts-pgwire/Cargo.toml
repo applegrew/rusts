@@ -1,0 +1,25 @@
+[package]
+name = "rusts-pgwire"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "PostgreSQL wire protocol support for RusTs time series database"
+
+[dependencies]
+rusts-core = { workspace = true }
+rusts-query = { workspace = true }
+rusts-sql = { workspace = true }
+rusts-api = { workspace = true }
+
+pgwire = "0.28"
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+futures = "0.3"
+bytes = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

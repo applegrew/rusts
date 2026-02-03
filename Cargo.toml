@@ -11,6 +11,7 @@ members = [
     "crates/rusts-retention",
     "crates/rusts-api",
     "crates/rusts-sql",
+    "crates/rusts-pgwire",
     "crates/rusts-server",
     "crates/rusts-importer",
     "crates/rusts-endpoint-monitor-simulator",
@@ -36,6 +37,7 @@ rusts-aggregation = { path = "crates/rusts-aggregation" }
 rusts-retention = { path = "crates/rusts-retention" }
 rusts-api = { path = "crates/rusts-api" }
 rusts-sql = { path = "crates/rusts-sql" }
+rusts-pgwire = { path = "crates/rusts-pgwire" }
 
 # Async runtime
 tokio = { version = "1.44", features = ["full"] }

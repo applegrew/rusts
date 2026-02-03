@@ -19,6 +19,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
@@ -36,6 +37,8 @@ pub struct ServerConfig {
     pub logging: LoggingSettings,
     /// Parallel query execution configuration
     pub parallel: ParallelSettings,
+    /// PostgreSQL wire protocol configuration
+    pub postgres: PostgresSettings,
     /// Retention policies
     #[serde(default)]
     pub retention_policies: Vec<RetentionPolicyConfig>,
@@ -215,6 +218,31 @@ pub struct ParallelSettings {
     pub thread_pool_size: usize,
 }
 
+/// PostgreSQL wire protocol settings
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PostgresSettings {
+    /// Enable PostgreSQL wire protocol
+    pub enabled: bool,
+    /// Bind host for PostgreSQL connections
+    pub host: String,
+    /// Port for PostgreSQL connections (default: 5432)
+    pub port: u16,
+    /// Maximum concurrent connections (not currently enforced)
+    pub max_connections: usize,
+}
+
+impl Default for PostgresSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            host: "0.0.0.0".to_string(),
+            port: 5432,
+            max_connections: 100,
+        }
+    }
+}
+
 impl Default for ParallelSettings {
     fn default() -> Self {
         Self {
@@ -235,6 +263,7 @@ impl Default for ServerConfig {
             auth: AuthSettings::default(),
             logging: LoggingSettings::default(),
             parallel: ParallelSettings::default(),
+            postgres: PostgresSettings::default(),
             retention_policies: Vec::new(),
         }
     }
@@ -604,8 +633,34 @@ async fn main() -> anyhow::Result<()> {
         info!("Server is ready to accept requests");
     });
 
+    // Create shutdown token for coordinating graceful shutdown
+    let shutdown_token = CancellationToken::new();
+
+    // Start PostgreSQL wire protocol server if enabled
+    if config.postgres.enabled {
+        let pg_state = Arc::clone(&app_state);
+        let pg_shutdown = shutdown_token.clone();
+        let pg_host = config.postgres.host.clone();
+        let pg_port = config.postgres.port;
+
+        info!("Starting PostgreSQL wire protocol server on {}:{}", pg_host, pg_port);
+
+        tokio::spawn(async move {
+            if let Err(e) = rusts_pgwire::run_postgres_server(
+                pg_state,
+                query_timeout,
+                &pg_host,
+                pg_port,
+                pg_shutdown,
+            ).await {
+                tracing::error!("PostgreSQL server error: {}", e);
+            }
+        });
+    }
+
     // Handle shutdown gracefully (SIGINT and SIGTERM)
     let app_state_for_shutdown = Arc::clone(&app_state);
+    let shutdown_token_for_handler = shutdown_token.clone();
     tokio::spawn(async move {
         let ctrl_c = tokio::signal::ctrl_c();
 
@@ -628,6 +683,9 @@ async fn main() -> anyhow::Result<()> {
                 info!("SIGTERM received, shutting down gracefully...");
             }
         }
+
+        // Signal all servers to shut down
+        shutdown_token_for_handler.cancel();
 
         if let Some(storage) = app_state_for_shutdown.get_storage() {
             if let Err(e) = storage.shutdown() {
