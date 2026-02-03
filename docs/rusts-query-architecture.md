@@ -252,6 +252,37 @@ execute() [line 42-73]
 4. Sort by timestamp
 5. Return QueryResult
 
+### LIMIT Query Optimization
+
+For queries with LIMIT, the executor uses early termination to avoid scanning unnecessary data:
+
+**TopKCollector:**
+Maintains a bounded heap of points, sorted by timestamp:
+
+```rust
+// Ascending order (oldest first)
+struct TopKCollector {
+    heap: BinaryHeap<Reverse<(i64, ...)>>,  // min-heap behavior
+    k: usize,
+}
+
+// Descending order (newest first)
+struct TopKCollectorDesc {
+    heap: BinaryHeap<(i64, ...)>,  // max-heap behavior
+    k: usize,
+}
+```
+
+**Early Termination:**
+- Queries with LIMIT pass the limit to storage layer
+- Memtable returns only needed points using binary search
+- Segments use `read_range_with_limit()` for O(log n + k) reads
+- Partitions stop scanning when limit is reached
+
+**Performance Impact:**
+- `SELECT * FROM trips ORDER BY time DESC LIMIT 100` benefits most (newest data in memtable)
+- `SELECT * FROM trips ORDER BY time ASC LIMIT 100` still benefits from segment-level optimization
+
 **Simple Aggregate Path (lines 173-229):**
 1. Create Aggregator with function
 2. For each series_id, get points and add to aggregator

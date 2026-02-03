@@ -169,9 +169,10 @@ with engine.connect() as conn:
 
 ### Limitations
 
-- Simple query protocol only (no prepared statements with parameters)
+- No parameterized queries (prepared statements work, but `$1`, `$2` bind variables are not supported)
 - No authentication (trusts all connections)
 - No TLS/SSL support
+- No GSSAPI encryption (psql 12+ clients must set `PGGSSENCMODE=disable`)
 - No GSSAPI encryption (psql 12+ clients must set `PGGSSENCMODE=disable`)
 
 ## Cluster Configuration

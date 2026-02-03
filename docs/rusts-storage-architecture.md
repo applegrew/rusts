@@ -285,6 +285,47 @@ pub struct FlushTrigger {
 }
 ```
 
+### Sorted Insert Optimization
+
+MemTable maintains sorted order of points within each series for efficient queries:
+
+**Insert Algorithm:**
+- If new point timestamp ≥ last point timestamp: O(1) append
+- Otherwise: O(log n) binary search insertion to maintain sorted order
+
+This optimization benefits time series workloads where data typically arrives in chronological order.
+
+### Binary Search for Time Range Queries
+
+Time range queries use binary search to find boundaries efficiently:
+
+```rust
+// O(log n + k) instead of O(n) where k = points in range
+let start_idx = points.partition_point(|p| p.timestamp < time_range.start);
+let end_idx = points.partition_point(|p| p.timestamp < time_range.end);
+// Return points[start_idx..end_idx]
+```
+
+**Time Range Semantics:**
+- `start` is inclusive
+- `end` is exclusive
+
+### LIMIT Query Optimization
+
+MemTable supports efficient LIMIT queries without scanning all points:
+
+```rust
+pub fn query_with_limit(
+    &self,
+    series_id: SeriesId,
+    time_range: &TimeRange,
+    limit: usize,
+    ascending: bool,
+) -> Vec<MemTablePoint>
+```
+
+Uses binary search to find time range boundaries, then returns only the required number of points from the appropriate end (start for ascending, end for descending).
+
 ### Concurrency Model
 
 - `DashMap` for lock-free concurrent series access
@@ -361,6 +402,31 @@ Enables COUNT/SUM/MIN/MAX queries without decompressing data.
 3. Decompress timestamps on query
 4. Decompress requested fields
 5. Filter by time range during reconstruction
+
+### LIMIT Query Optimization (segment.rs)
+
+Segments support efficient LIMIT queries using binary search:
+
+```rust
+pub fn read_range_with_limit(
+    &self,
+    time_range: &TimeRange,
+    limit: usize,
+    ascending: bool,
+) -> Result<Vec<MemTablePoint>>
+```
+
+**Algorithm:**
+1. Binary search to find time range boundaries in timestamp array
+2. Calculate which indices to read based on limit and order direction
+3. Decompress only the required portion of each field column
+4. Build points from the limited range
+
+**Performance:** O(log n + k) where k = min(limit, points_in_range), instead of O(n) for full scan.
+
+This optimization is particularly effective for queries like:
+- `SELECT * FROM measurement ORDER BY time DESC LIMIT 100`
+- Most recent data queries benefit from early termination
 
 ## Partitions (partition.rs)
 

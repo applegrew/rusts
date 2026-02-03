@@ -93,13 +93,13 @@ SQL Query → SqlParser::parse()
 → Response::Query
 ```
 
-### PgWireHandlerFactory (backend.rs:142-182)
+### PgWireHandlerFactory (backend.rs:367-407)
 
 ```rust
 impl PgWireServerHandlers for PgWireHandlerFactory {
     type StartupHandler = PgWireBackend;
     type SimpleQueryHandler = PgWireBackend;
-    type ExtendedQueryHandler = PlaceholderExtendedQueryHandler;
+    type ExtendedQueryHandler = PgWireBackend;
     type CopyHandler = NoopCopyHandler;
     type ErrorHandler = NoopErrorHandler;
 }
@@ -108,7 +108,7 @@ impl PgWireServerHandlers for PgWireHandlerFactory {
 **Handler Types:**
 - `StartupHandler` - Connection startup/authentication
 - `SimpleQueryHandler` - Simple query protocol (text queries)
-- `ExtendedQueryHandler` - Placeholder (prepared statements not supported)
+- `ExtendedQueryHandler` - Extended query protocol (Parse/Bind/Execute, no bind parameters)
 - `CopyHandler` - No-op (COPY not supported)
 - `ErrorHandler` - No-op error handling
 
@@ -331,9 +331,10 @@ SQL Query received
 
 ## Limitations
 
-- **Simple Query Protocol Only**: Extended query protocol (prepared statements) not supported
+- **No Parameterized Queries**: Extended query protocol is supported, but bind variables (`$1`, `$2`) are not
 - **No Authentication**: All connections accepted (NoopStartupHandler)
 - **No TLS**: Plain TCP connections only
+- **No GSSAPI**: PostgreSQL 12+ clients must set `PGGSSENCMODE=disable`
 - **No Transactions**: Each query is auto-committed
 - **No COPY**: COPY protocol not implemented
 - **EXPLAIN**: Not yet supported via PostgreSQL protocol
@@ -342,10 +343,17 @@ SQL Query received
 
 ### psql
 
+PostgreSQL 12+ clients attempt GSSAPI encryption by default, which RusTs doesn't support. Disable it with `PGGSSENCMODE=disable`:
+
 ```bash
-psql -h localhost -p 5432 -c "SHOW TABLES"
-psql -h localhost -p 5432 -c "SELECT * FROM cpu LIMIT 10"
-psql -h localhost -p 5432 -c "SELECT COUNT(*) FROM trips GROUP BY hvfhs_license_num"
+# Single command
+PGGSSENCMODE=disable psql -h localhost -p 5432 -c "SHOW TABLES"
+PGGSSENCMODE=disable psql -h localhost -p 5432 -c "SELECT * FROM cpu LIMIT 10"
+PGGSSENCMODE=disable psql -h localhost -p 5432 -c "SELECT COUNT(*) FROM trips GROUP BY hvfhs_license_num"
+
+# Or set for session
+export PGGSSENCMODE=disable
+psql -h localhost -p 5432
 ```
 
 ### Python/SQLAlchemy
@@ -353,7 +361,8 @@ psql -h localhost -p 5432 -c "SELECT COUNT(*) FROM trips GROUP BY hvfhs_license_
 ```python
 from sqlalchemy import create_engine, text
 
-engine = create_engine('postgresql://localhost:5432/rusts')
+# Include gssencmode=disable in connection string for PostgreSQL 12+ clients
+engine = create_engine('postgresql://localhost:5432/rusts?gssencmode=disable')
 with engine.connect() as conn:
     result = conn.execute(text('SELECT * FROM trips LIMIT 5'))
     for row in result:

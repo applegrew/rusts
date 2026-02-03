@@ -194,6 +194,18 @@ SELECT * FROM cpu ORDER BY time ASC LIMIT 100
 SELECT * FROM cpu LIMIT 100 OFFSET 50
 ```
 
+**Default Sort Order:**
+
+When no `ORDER BY` is specified, SQL queries default to `ORDER BY time DESC`. This optimization improves performance for time series queries since the most recent data is typically in the memtable (fast access) while older data requires partition scans.
+
+```sql
+-- These are equivalent:
+SELECT * FROM cpu LIMIT 100
+SELECT * FROM cpu ORDER BY time DESC LIMIT 100
+```
+
+Note: The programmatic Query API (not SQL) defaults to ascending order for backward compatibility.
+
 ### SHOW TABLES
 
 ```sql
