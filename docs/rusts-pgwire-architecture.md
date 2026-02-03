@@ -9,7 +9,7 @@ The `rusts-pgwire` crate implements PostgreSQL wire protocol support for the Rus
 ```
 src/
 ├── lib.rs        # Public exports, run_postgres_server()
-├── backend.rs    # PgWireBackend (SimpleQueryHandler impl)
+├── backend.rs    # PgWireBackend (Simple + Extended QueryHandler impl)
 ├── encoder.rs    # QueryResult → DataRow encoding
 ├── types.rs      # FieldValue → PostgreSQL Type mapping
 └── error.rs      # Error types and SQLSTATE code mapping
@@ -46,20 +46,22 @@ Client → TcpListener::accept() → tokio::spawn
 
 ## Backend (backend.rs)
 
-### PgWireBackend (backend.rs:23-110)
+### PgWireBackend (backend.rs:56-71)
 
 ```rust
 pub struct PgWireBackend {
     app_state: Arc<AppState>,
     query_timeout: Duration,
+    query_parser: Arc<RustsQueryParser>,
 }
 ```
 
 **Implements:**
 - `NoopStartupHandler` - No-op authentication (accepts all connections)
-- `SimpleQueryHandler` - Processes SQL queries
+- `SimpleQueryHandler` - Simple query protocol (text queries)
+- `ExtendedQueryHandler` - Extended query protocol (Parse/Bind/Execute)
 
-### SimpleQueryHandler Implementation (backend.rs:116-140)
+### SimpleQueryHandler Implementation (backend.rs:250-271)
 
 ```rust
 #[async_trait]
@@ -75,7 +77,35 @@ impl SimpleQueryHandler for PgWireBackend {
 }
 ```
 
-### Command Execution (backend.rs:38-109)
+### ExtendedQueryHandler Implementation (backend.rs:274-365)
+
+The extended query protocol supports Parse/Bind/Execute flow used by JDBC drivers, DataGrip, DBeaver, and other clients.
+
+```rust
+#[async_trait]
+impl ExtendedQueryHandler for PgWireBackend {
+    type Statement = ParsedStatement;
+    type QueryParser = RustsQueryParser;
+
+    fn query_parser(&self) -> Arc<Self::QueryParser>;
+    async fn do_query(&self, client, portal, max_rows) -> PgWireResult<Response>;
+    async fn do_describe_statement(&self, client, statement) -> PgWireResult<DescribeStatementResponse>;
+    async fn do_describe_portal(&self, client, portal) -> PgWireResult<DescribePortalResponse>;
+}
+```
+
+**Key Components:**
+- `ParsedStatement` - Stores parsed SQL and translated `SqlCommand`
+- `RustsQueryParser` - Implements `QueryParser` trait for SQL parsing
+- `do_query` - Executes query from Portal (bound statement)
+- `do_describe_statement` - Returns parameter types and result schema
+- `do_describe_portal` - Returns result schema for bound portal
+
+**Supported pg_catalog/information_schema queries:**
+- Parameterized queries work for `pg_catalog.*` and `information_schema.*` tables
+- Used by JDBC drivers during connection setup
+
+### Command Execution (backend.rs:85-186)
 
 | Command | Handling |
 |---------|----------|
@@ -93,7 +123,7 @@ SQL Query → SqlParser::parse()
 → Response::Query
 ```
 
-### PgWireHandlerFactory (backend.rs:367-407)
+### PgWireHandlerFactory (backend.rs:368-407)
 
 ```rust
 impl PgWireServerHandlers for PgWireHandlerFactory {
@@ -301,6 +331,29 @@ Client → TCP Connection
 → RowDescription + DataRow* + CommandComplete
 → ReadyForQuery
 ```
+
+### Extended Query Protocol
+
+```
+Client → TCP Connection
+→ Startup handshake (NoopStartupHandler)
+→ Parse message (SQL + statement name)
+   → RustsQueryParser::parse_sql() → ParsedStatement
+   → ParseComplete
+→ Bind message (statement + portal + parameters)
+   → Portal created with bound parameters
+   → BindComplete
+→ Describe message (portal)
+   → PgWireBackend::do_describe_portal()
+   → RowDescription
+→ Execute message (portal + max_rows)
+   → PgWireBackend::do_query(portal)
+   → DataRow* + CommandComplete
+→ Sync
+   → ReadyForQuery
+```
+
+**Note:** While the extended query protocol is fully implemented, bind parameter substitution (`$1`, `$2`) for user queries is not yet supported. Parameterized queries work for `pg_catalog` and `information_schema` introspection queries used by JDBC clients.
 
 ### Query with Timeout
 
