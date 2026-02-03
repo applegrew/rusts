@@ -397,8 +397,13 @@ impl SqlTranslator {
         }
 
         // Process ORDER BY clause
+        // Default to ORDER BY time DESC for better performance with time series
+        // (most queries want recent data, and descending allows early termination from memtable)
         if let Some((order_field, ascending)) = Self::extract_order_by(&sql_query.order_by)? {
             builder = builder.order_by(order_field, ascending);
+        } else {
+            // No ORDER BY specified - default to time DESC for time series optimization
+            builder = builder.order_by("time", false);
         }
 
         // Process LIMIT and OFFSET from limit_clause

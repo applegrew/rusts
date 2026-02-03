@@ -746,7 +746,8 @@ impl QueryExecutor {
         let offset = query.offset.unwrap_or(0);
         let need = limit.saturating_add(offset); // Collect enough for offset + limit
 
-        // Determine sort order (default is ascending)
+        // Determine sort order (default is ascending for backward compatibility)
+        // SQL layer sets default to DESC for better performance with time series
         let descending = query
             .order_by
             .as_ref()

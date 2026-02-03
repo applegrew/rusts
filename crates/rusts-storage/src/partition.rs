@@ -253,19 +253,25 @@ impl Partition {
                 }
             }
 
-            // Read segment data (already sorted internally)
-            let points = segment.read_range(time_range)?;
+            // Calculate remaining limit needed from this segment
+            let remaining = limit.saturating_sub(collected_points.len());
+            if remaining == 0 {
+                break;
+            }
+
+            // Read segment data with limit (uses binary search internally)
+            let points = segment.read_range_with_limit(time_range, remaining, ascending)?;
             collected_points.extend(points);
         }
 
-        // Sort collected points
+        // Sort collected points (segments may overlap, so we need to merge)
         if ascending {
             collected_points.sort_by_key(|p| p.timestamp);
         } else {
             collected_points.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
         }
 
-        // Truncate to limit
+        // Truncate to limit (may have collected more due to overlapping segments)
         collected_points.truncate(limit);
 
         Ok((collected_points, total_estimate))

@@ -646,6 +646,21 @@ impl SegmentReader {
 
     /// Read points within a time range
     pub fn read_range(&self, time_range: &TimeRange) -> Result<Vec<MemTablePoint>> {
+        // Delegate to read_range_with_limit with no limit
+        self.read_range_with_limit(time_range, usize::MAX, true)
+    }
+
+    /// Read points within a time range with limit.
+    /// For ascending: returns first K points in range (oldest).
+    /// For descending: returns last K points in range (newest).
+    /// Since segment data is sorted by timestamp ascending, this uses binary search
+    /// to find range boundaries and only builds the needed points.
+    pub fn read_range_with_limit(
+        &self,
+        time_range: &TimeRange,
+        limit: usize,
+        ascending: bool,
+    ) -> Result<Vec<MemTablePoint>> {
         let file = File::open(&self.path)?;
         let mut reader = BufReader::new(file);
 
@@ -671,6 +686,26 @@ impl SegmentReader {
         let mut ts_decoder = TimestampDecoder::new(&ts_decompressed, self.meta.point_count);
         let timestamps = ts_decoder.decode_all()?;
 
+        // Binary search to find time range boundaries (timestamps are sorted)
+        let start_idx = timestamps.partition_point(|&ts| ts < time_range.start);
+        let end_idx = timestamps.partition_point(|&ts| ts < time_range.end);
+
+        let range_count = end_idx.saturating_sub(start_idx);
+        if range_count == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Determine which indices to read based on order and limit
+        let (read_start, read_end) = if ascending {
+            // Ascending: take first K from range
+            let take = limit.min(range_count);
+            (start_idx, start_idx + take)
+        } else {
+            // Descending: take last K from range
+            let take = limit.min(range_count);
+            (end_idx - take, end_idx)
+        };
+
         // Read field columns
         let mut field_values: Vec<Vec<FieldValue>> = Vec::new();
         for (_, field_type) in &self.meta.fields {
@@ -684,13 +719,9 @@ impl SegmentReader {
             field_values.push(values);
         }
 
-        // Build points, filtering by time range
-        let mut points = Vec::new();
-        for (i, ts) in timestamps.iter().enumerate() {
-            if !time_range.contains(*ts) {
-                continue;
-            }
-
+        // Build only the needed points
+        let mut points = Vec::with_capacity(read_end - read_start);
+        for i in read_start..read_end {
             let fields: Vec<(String, FieldValue)> = self
                 .meta
                 .fields
@@ -700,9 +731,14 @@ impl SegmentReader {
                 .collect();
 
             points.push(MemTablePoint {
-                timestamp: *ts,
+                timestamp: timestamps[i],
                 fields,
             });
+        }
+
+        // For descending, reverse to get newest first
+        if !ascending {
+            points.reverse();
         }
 
         Ok(points)
@@ -948,11 +984,42 @@ impl MmapSegmentReader {
 
     /// Read points within a time range
     pub fn read_range(&self, time_range: &TimeRange) -> Result<Vec<MemTablePoint>> {
+        // Delegate to read_range_with_limit with no limit
+        self.read_range_with_limit(time_range, usize::MAX, true)
+    }
+
+    /// Read points within a time range with limit.
+    /// For ascending: returns first K points in range (oldest).
+    /// For descending: returns last K points in range (newest).
+    pub fn read_range_with_limit(
+        &self,
+        time_range: &TimeRange,
+        limit: usize,
+        ascending: bool,
+    ) -> Result<Vec<MemTablePoint>> {
         // Read timestamps directly from mmap
         let ts_data = &self.mmap[self.data_offset..self.data_offset + self.timestamp_len];
         let ts_decompressed = rusts_compression::block::decompress(ts_data)?;
         let mut ts_decoder = TimestampDecoder::new(&ts_decompressed, self.meta.point_count);
         let timestamps = ts_decoder.decode_all()?;
+
+        // Binary search to find time range boundaries (timestamps are sorted)
+        let start_idx = timestamps.partition_point(|&ts| ts < time_range.start);
+        let end_idx = timestamps.partition_point(|&ts| ts < time_range.end);
+
+        let range_count = end_idx.saturating_sub(start_idx);
+        if range_count == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Determine which indices to read based on order and limit
+        let (read_start, read_end) = if ascending {
+            let take = limit.min(range_count);
+            (start_idx, start_idx + take)
+        } else {
+            let take = limit.min(range_count);
+            (end_idx - take, end_idx)
+        };
 
         // Calculate field data offsets
         let mut field_offset = self.data_offset + self.timestamp_len;
@@ -970,13 +1037,9 @@ impl MmapSegmentReader {
             field_offset = data_end;
         }
 
-        // Build points, filtering by time range
-        let mut points = Vec::new();
-        for (i, ts) in timestamps.iter().enumerate() {
-            if !time_range.contains(*ts) {
-                continue;
-            }
-
+        // Build only the needed points
+        let mut points = Vec::with_capacity(read_end - read_start);
+        for i in read_start..read_end {
             let fields: Vec<(String, FieldValue)> = self
                 .meta
                 .fields
@@ -986,9 +1049,14 @@ impl MmapSegmentReader {
                 .collect();
 
             points.push(MemTablePoint {
-                timestamp: *ts,
+                timestamp: timestamps[i],
                 fields,
             });
+        }
+
+        // For descending, reverse to get newest first
+        if !ascending {
+            points.reverse();
         }
 
         Ok(points)
@@ -1110,6 +1178,24 @@ impl Segment {
             mmap_reader.read_range(time_range)
         } else if let Some(ref reader) = self.reader {
             reader.read_range(time_range)
+        } else {
+            unreachable!("Segment must have either reader or mmap_reader")
+        }
+    }
+
+    /// Read points in time range with limit.
+    /// For ascending: returns first K points in range (oldest).
+    /// For descending: returns last K points in range (newest).
+    pub fn read_range_with_limit(
+        &self,
+        time_range: &TimeRange,
+        limit: usize,
+        ascending: bool,
+    ) -> Result<Vec<MemTablePoint>> {
+        if let Some(ref mmap_reader) = self.mmap_reader {
+            mmap_reader.read_range_with_limit(time_range, limit, ascending)
+        } else if let Some(ref reader) = self.reader {
+            reader.read_range_with_limit(time_range, limit, ascending)
         } else {
             unreachable!("Segment must have either reader or mmap_reader")
         }

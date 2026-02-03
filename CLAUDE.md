@@ -133,19 +133,23 @@ postgres:
 ### Usage Examples
 
 ```bash
-# Connect with psql
-psql -h localhost -p 5432
+# Connect with psql (PostgreSQL 12+ requires GSSAPI disabled)
+PGGSSENCMODE=disable psql -h localhost -p 5432
 
 # Run queries
-psql -h localhost -p 5432 -c "SHOW TABLES"
-psql -h localhost -p 5432 -c "SELECT * FROM cpu LIMIT 10"
-psql -h localhost -p 5432 -c "SELECT COUNT(*) FROM trips"
+PGGSSENCMODE=disable psql -h localhost -p 5432 -c "SHOW TABLES"
+PGGSSENCMODE=disable psql -h localhost -p 5432 -c "SELECT * FROM trips LIMIT 10"
+PGGSSENCMODE=disable psql -h localhost -p 5432 -c "SELECT COUNT(*) FROM trips"
+
+# Or set environment variable for session
+export PGGSSENCMODE=disable
+psql -h localhost -p 5432
 ```
 
 ```python
 # Python with SQLAlchemy
 from sqlalchemy import create_engine, text
-engine = create_engine('postgresql://localhost:5432/rusts')
+engine = create_engine('postgresql://localhost:5432/rusts?gssencmode=disable')
 with engine.connect() as conn:
     result = conn.execute(text('SELECT * FROM trips LIMIT 5'))
     for row in result:
@@ -168,6 +172,7 @@ with engine.connect() as conn:
 - Simple query protocol only (no prepared statements with parameters)
 - No authentication (trusts all connections)
 - No TLS/SSL support
+- No GSSAPI encryption (psql 12+ clients must set `PGGSSENCMODE=disable`)
 
 ## Cluster Configuration
 
