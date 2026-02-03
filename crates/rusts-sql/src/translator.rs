@@ -14,7 +14,7 @@ use sqlparser::ast::{
 use tracing::debug;
 
 /// Represents the result of parsing and translating a SQL statement
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum SqlCommand {
     /// A SELECT query to execute
     Query(Query),

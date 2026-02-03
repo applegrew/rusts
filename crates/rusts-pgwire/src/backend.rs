@@ -1,6 +1,6 @@
 //! PostgreSQL wire protocol backend implementation
 
-use crate::encoder::{query_result_to_response, tables_to_response};
+use crate::encoder::{build_tables_schema, query_result_to_response, tables_to_response};
 use crate::error::PgError;
 use async_trait::async_trait;
 use futures::Sink;
@@ -8,12 +8,10 @@ use pgwire::api::auth::noop::NoopStartupHandler;
 use pgwire::api::copy::NoopCopyHandler;
 use pgwire::api::portal::Portal;
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
-use pgwire::api::results::{DescribePortalResponse, DescribeStatementResponse, Response};
-use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
-use pgwire::api::store::PortalStore;
-use pgwire::api::{ClientInfo, ClientPortalStore, NoopErrorHandler, PgWireServerHandlers};
-use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
-use pgwire::messages::extendedquery::Parse;
+use pgwire::api::results::{DescribePortalResponse, DescribeStatementResponse, FieldInfo, Response};
+use pgwire::api::stmt::{QueryParser, StoredStatement};
+use pgwire::api::{ClientInfo, NoopErrorHandler, PgWireServerHandlers, Type};
+use pgwire::error::{PgWireError, PgWireResult};
 use pgwire::messages::PgWireBackendMessage;
 use rusts_api::handlers::AppState;
 use rusts_sql::{SqlCommand, SqlParser, SqlTranslator};
@@ -23,10 +21,42 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
+/// Parsed SQL statement for extended query protocol
+#[derive(Debug, Clone)]
+pub struct ParsedStatement {
+    /// Original SQL text
+    pub sql: String,
+    /// Parsed command
+    pub command: SqlCommand,
+}
+
+/// Query parser for RusTs SQL
+#[derive(Debug, Clone)]
+pub struct RustsQueryParser;
+
+#[async_trait]
+impl QueryParser for RustsQueryParser {
+    type Statement = ParsedStatement;
+
+    async fn parse_sql(&self, sql: &str, _types: &[Type]) -> PgWireResult<Self::Statement> {
+        // Parse SQL
+        let stmt = SqlParser::parse(sql).map_err(|e| PgError::SqlParse(e))?;
+
+        // Translate to command
+        let command = SqlTranslator::translate_command(&stmt).map_err(|e| PgError::SqlParse(e))?;
+
+        Ok(ParsedStatement {
+            sql: sql.to_string(),
+            command,
+        })
+    }
+}
+
 /// PostgreSQL wire protocol backend for RusTs
 pub struct PgWireBackend {
     app_state: Arc<AppState>,
     query_timeout: Duration,
+    query_parser: Arc<RustsQueryParser>,
 }
 
 impl PgWireBackend {
@@ -35,24 +65,19 @@ impl PgWireBackend {
         Self {
             app_state,
             query_timeout,
+            query_parser: Arc::new(RustsQueryParser),
         }
     }
 
     /// Execute a SQL command and return the PostgreSQL response
-    async fn execute_command(&self, query: &str) -> Result<Vec<Response<'static>>, PgError> {
-        // Parse SQL
-        let stmt = SqlParser::parse(query)?;
-
-        // Translate to command
-        let command = SqlTranslator::translate_command(&stmt)?;
-
+    async fn execute_command(&self, command: &SqlCommand) -> Result<Response<'static>, PgError> {
         match command {
             SqlCommand::ShowTables => {
                 // Return list of measurements as tables
                 let measurements = self.app_state.series_index.measurements();
                 let response = tables_to_response(measurements)
                     .map_err(|e| PgError::Internal(e.to_string()))?;
-                Ok(vec![response])
+                Ok(response)
             }
             SqlCommand::Explain(_query) => {
                 // For now, return a simple text response for EXPLAIN
@@ -80,6 +105,7 @@ impl PgWireBackend {
                 let timeout = self.query_timeout;
                 let cancel = CancellationToken::new();
                 let cancel_clone = cancel.clone();
+                let query = query.clone();
 
                 let query_result = tokio::time::timeout(timeout, async {
                     tokio::task::spawn_blocking(move || {
@@ -107,7 +133,35 @@ impl PgWireBackend {
                 // Convert to PostgreSQL response
                 let response =
                     query_result_to_response(result).map_err(|e| PgError::Internal(e.to_string()))?;
-                Ok(vec![response])
+                Ok(response)
+            }
+        }
+    }
+
+    /// Execute from SQL string (for simple query protocol)
+    async fn execute_sql(&self, sql: &str) -> Result<Vec<Response<'static>>, PgError> {
+        // Parse SQL
+        let stmt = SqlParser::parse(sql)?;
+
+        // Translate to command
+        let command = SqlTranslator::translate_command(&stmt)?;
+
+        let response = self.execute_command(&command).await?;
+        Ok(vec![response])
+    }
+
+    /// Get schema for a command (used for Describe in extended query)
+    fn get_command_schema(&self, command: &SqlCommand) -> Vec<FieldInfo> {
+        match command {
+            SqlCommand::ShowTables => {
+                // Single column: name (TEXT)
+                (*build_tables_schema()).clone()
+            }
+            SqlCommand::Explain(_) | SqlCommand::Query(_) => {
+                // For queries, we don't know the schema until execution
+                // Return empty schema - client will get actual schema on execute
+                // This is a limitation but works for most clients
+                Vec::new()
             }
         }
     }
@@ -130,16 +184,79 @@ impl SimpleQueryHandler for PgWireBackend {
     {
         debug!("Executing simple query: {}", query);
 
-        match self.execute_command(query).await {
-            Ok(responses) => {
-                // Convert 'static lifetime to 'a (safe because Response is owned)
-                Ok(responses)
-            }
+        match self.execute_sql(query).await {
+            Ok(responses) => Ok(responses),
             Err(e) => {
                 warn!("Query error: {}", e);
                 Err(e.into())
             }
         }
+    }
+}
+
+#[async_trait]
+impl ExtendedQueryHandler for PgWireBackend {
+    type Statement = ParsedStatement;
+    type QueryParser = RustsQueryParser;
+
+    fn query_parser(&self) -> Arc<Self::QueryParser> {
+        self.query_parser.clone()
+    }
+
+    async fn do_query<'a, 'b: 'a, C>(
+        &'b self,
+        _client: &mut C,
+        portal: &'a Portal<Self::Statement>,
+        _max_rows: usize,
+    ) -> PgWireResult<Response<'a>>
+    where
+        C: ClientInfo + Unpin + Send + Sync,
+    {
+        let statement = &portal.statement;
+        debug!("Executing extended query: {}", statement.statement.sql);
+
+        // Check for parameters - we don't support parameterized queries yet
+        if !portal.parameters.is_empty() {
+            return Err(PgError::SqlParse(rusts_sql::SqlError::UnsupportedFeature(
+                "Parameterized queries are not yet supported".to_string(),
+            ))
+            .into());
+        }
+
+        match self.execute_command(&statement.statement.command).await {
+            Ok(response) => Ok(response),
+            Err(e) => {
+                warn!("Query error: {}", e);
+                Err(e.into())
+            }
+        }
+    }
+
+    async fn do_describe_statement<C>(
+        &self,
+        _client: &mut C,
+        statement: &StoredStatement<Self::Statement>,
+    ) -> PgWireResult<DescribeStatementResponse>
+    where
+        C: ClientInfo + Unpin + Send + Sync,
+    {
+        let schema = self.get_command_schema(&statement.statement.command);
+
+        // No parameters supported
+        Ok(DescribeStatementResponse::new(vec![], schema))
+    }
+
+    async fn do_describe_portal<C>(
+        &self,
+        _client: &mut C,
+        portal: &Portal<Self::Statement>,
+    ) -> PgWireResult<DescribePortalResponse>
+    where
+        C: ClientInfo + Unpin + Send + Sync,
+    {
+        let schema = self.get_command_schema(&portal.statement.statement.command);
+
+        Ok(DescribePortalResponse::new(schema))
     }
 }
 
@@ -160,7 +277,7 @@ impl PgWireHandlerFactory {
 impl PgWireServerHandlers for PgWireHandlerFactory {
     type StartupHandler = PgWireBackend;
     type SimpleQueryHandler = PgWireBackend;
-    type ExtendedQueryHandler = UnsupportedExtendedQueryHandler;
+    type ExtendedQueryHandler = PgWireBackend;
     type CopyHandler = NoopCopyHandler;
     type ErrorHandler = NoopErrorHandler;
 
@@ -169,7 +286,7 @@ impl PgWireServerHandlers for PgWireHandlerFactory {
     }
 
     fn extended_query_handler(&self) -> Arc<Self::ExtendedQueryHandler> {
-        Arc::new(UnsupportedExtendedQueryHandler)
+        self.backend.clone()
     }
 
     fn startup_handler(&self) -> Arc<Self::StartupHandler> {
@@ -182,76 +299,5 @@ impl PgWireServerHandlers for PgWireHandlerFactory {
 
     fn error_handler(&self) -> Arc<Self::ErrorHandler> {
         Arc::new(NoopErrorHandler)
-    }
-}
-
-/// Extended query handler that returns a proper error instead of panicking.
-/// This allows clients like DBeaver to receive an error message rather than
-/// experiencing a connection drop.
-#[derive(Debug, Clone)]
-pub struct UnsupportedExtendedQueryHandler;
-
-impl UnsupportedExtendedQueryHandler {
-    fn not_supported_error() -> PgWireError {
-        PgWireError::UserError(Box::new(ErrorInfo::new(
-            "ERROR".to_string(),
-            "0A000".to_string(), // feature_not_supported
-            "Extended query protocol (prepared statements) is not supported. Use simple query mode.".to_string(),
-        )))
-    }
-}
-
-#[async_trait]
-impl ExtendedQueryHandler for UnsupportedExtendedQueryHandler {
-    type Statement = String;
-    type QueryParser = NoopQueryParser;
-
-    fn query_parser(&self) -> Arc<Self::QueryParser> {
-        Arc::new(NoopQueryParser)
-    }
-
-    /// Override on_parse to return error before any parsing happens
-    async fn on_parse<C>(&self, _client: &mut C, _message: Parse) -> PgWireResult<()>
-    where
-        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
-        C::PortalStore: PortalStore<Statement = Self::Statement>,
-        C::Error: Debug,
-        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
-    {
-        Err(Self::not_supported_error())
-    }
-
-    async fn do_query<'a, 'b: 'a, C>(
-        &'b self,
-        _client: &mut C,
-        _portal: &'a Portal<Self::Statement>,
-        _max_rows: usize,
-    ) -> PgWireResult<Response<'a>>
-    where
-        C: ClientInfo + Unpin + Send + Sync,
-    {
-        Err(Self::not_supported_error())
-    }
-
-    async fn do_describe_statement<C>(
-        &self,
-        _client: &mut C,
-        _statement: &StoredStatement<Self::Statement>,
-    ) -> PgWireResult<DescribeStatementResponse>
-    where
-        C: ClientInfo + Unpin + Send + Sync,
-    {
-        Err(Self::not_supported_error())
-    }
-
-    async fn do_describe_portal<C>(
-        &self,
-        _client: &mut C,
-        _portal: &Portal<Self::Statement>,
-    ) -> PgWireResult<DescribePortalResponse>
-    where
-        C: ClientInfo + Unpin + Send + Sync,
-    {
-        Err(Self::not_supported_error())
     }
 }
