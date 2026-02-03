@@ -554,11 +554,49 @@ pub fn pg_catalog_response(table: &str, measurements: &[String]) -> PgWireResult
             Ok(Response::Query(response))
         }
         "pg_type" => {
-            // Return empty result with proper schema
-            let schema = Arc::new(pg_catalog_schema(table));
-            let stream = futures::stream::iter(vec![]);
+            // Return basic PostgreSQL types
+            let schema = Arc::new(build_pg_type_schema());
+
+            // Basic types: (oid, typname, typnamespace, typowner, typlen, typbyval, typtype, typcategory, typispreferred, typisdefined, typdelim, typrelid, typelem, typarray, relkind, base_type_name, description)
+            let types = vec![
+                (16, "bool", 11, 10, 1, true, "b", "B", true, true, ",", 0, 0, 1000, "", "", "boolean"),
+                (20, "int8", 11, 10, 8, true, "b", "N", false, true, ",", 0, 0, 1016, "", "", "bigint"),
+                (21, "int2", 11, 10, 2, true, "b", "N", false, true, ",", 0, 0, 1005, "", "", "smallint"),
+                (23, "int4", 11, 10, 4, true, "b", "N", false, true, ",", 0, 0, 1007, "", "", "integer"),
+                (25, "text", 11, 10, -1, false, "b", "S", true, true, ",", 0, 0, 1009, "", "", "text"),
+                (700, "float4", 11, 10, 4, true, "b", "N", false, true, ",", 0, 0, 1021, "", "", "real"),
+                (701, "float8", 11, 10, 8, true, "b", "N", true, true, ",", 0, 0, 1022, "", "", "double precision"),
+                (1043, "varchar", 11, 10, -1, false, "b", "S", false, true, ",", 0, 0, 1015, "", "", "character varying"),
+                (1184, "timestamptz", 11, 10, 8, true, "b", "D", true, true, ",", 0, 0, 1185, "", "", "timestamp with time zone"),
+            ];
+
+            let mut data_rows = Vec::with_capacity(types.len());
+            for (oid, typname, typnamespace, typowner, typlen, typbyval, typtype, typcategory, typispreferred, typisdefined, typdelim, typrelid, typelem, typarray, relkind, base_type_name, description) in types {
+                let mut encoder = DataRowEncoder::new(schema.clone());
+                encoder.encode_field_with_type_and_format(&oid.to_string(), &Type::INT4, FieldFormat::Text)?;
+                encoder.encode_field_with_type_and_format(&typname.to_string(), &Type::TEXT, FieldFormat::Text)?;
+                encoder.encode_field_with_type_and_format(&typnamespace.to_string(), &Type::INT4, FieldFormat::Text)?;
+                encoder.encode_field_with_type_and_format(&typowner.to_string(), &Type::INT4, FieldFormat::Text)?;
+                encoder.encode_field_with_type_and_format(&typlen.to_string(), &Type::INT2, FieldFormat::Text)?;
+                encoder.encode_field_with_type_and_format(&if typbyval { "t" } else { "f" }.to_string(), &Type::BOOL, FieldFormat::Text)?;
+                encoder.encode_field_with_type_and_format(&typtype.to_string(), &Type::CHAR, FieldFormat::Text)?;
+                encoder.encode_field_with_type_and_format(&typcategory.to_string(), &Type::CHAR, FieldFormat::Text)?;
+                encoder.encode_field_with_type_and_format(&if typispreferred { "t" } else { "f" }.to_string(), &Type::BOOL, FieldFormat::Text)?;
+                encoder.encode_field_with_type_and_format(&if typisdefined { "t" } else { "f" }.to_string(), &Type::BOOL, FieldFormat::Text)?;
+                encoder.encode_field_with_type_and_format(&typdelim.to_string(), &Type::CHAR, FieldFormat::Text)?;
+                encoder.encode_field_with_type_and_format(&typrelid.to_string(), &Type::INT4, FieldFormat::Text)?;
+                encoder.encode_field_with_type_and_format(&typelem.to_string(), &Type::INT4, FieldFormat::Text)?;
+                encoder.encode_field_with_type_and_format(&typarray.to_string(), &Type::INT4, FieldFormat::Text)?;
+                encoder.encode_field_with_type_and_format(&if relkind.is_empty() { None } else { Some(relkind.to_string()) }, &Type::CHAR, FieldFormat::Text)?;
+                encoder.encode_field_with_type_and_format(&if base_type_name.is_empty() { None } else { Some(base_type_name.to_string()) }, &Type::TEXT, FieldFormat::Text)?;
+                encoder.encode_field_with_type_and_format(&description.to_string(), &Type::TEXT, FieldFormat::Text)?;
+                data_rows.push(encoder.finish()?);
+            }
+
+            let row_count = data_rows.len();
+            let stream = futures::stream::iter(data_rows.into_iter().map(Ok));
             let mut response = QueryResponse::new(schema, stream);
-            response.set_command_tag("SELECT 0");
+            response.set_command_tag(&format!("SELECT {}", row_count));
             Ok(Response::Query(response))
         }
         _ => {
