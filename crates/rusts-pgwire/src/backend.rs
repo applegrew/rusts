@@ -6,10 +6,14 @@ use async_trait::async_trait;
 use futures::Sink;
 use pgwire::api::auth::noop::NoopStartupHandler;
 use pgwire::api::copy::NoopCopyHandler;
-use pgwire::api::query::{PlaceholderExtendedQueryHandler, SimpleQueryHandler};
-use pgwire::api::results::Response;
-use pgwire::api::{ClientInfo, NoopErrorHandler, PgWireServerHandlers};
-use pgwire::error::{PgWireError, PgWireResult};
+use pgwire::api::portal::Portal;
+use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
+use pgwire::api::results::{DescribePortalResponse, DescribeStatementResponse, Response};
+use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
+use pgwire::api::store::PortalStore;
+use pgwire::api::{ClientInfo, ClientPortalStore, NoopErrorHandler, PgWireServerHandlers};
+use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
+use pgwire::messages::extendedquery::Parse;
 use pgwire::messages::PgWireBackendMessage;
 use rusts_api::handlers::AppState;
 use rusts_sql::{SqlCommand, SqlParser, SqlTranslator};
@@ -156,7 +160,7 @@ impl PgWireHandlerFactory {
 impl PgWireServerHandlers for PgWireHandlerFactory {
     type StartupHandler = PgWireBackend;
     type SimpleQueryHandler = PgWireBackend;
-    type ExtendedQueryHandler = PlaceholderExtendedQueryHandler;
+    type ExtendedQueryHandler = UnsupportedExtendedQueryHandler;
     type CopyHandler = NoopCopyHandler;
     type ErrorHandler = NoopErrorHandler;
 
@@ -165,7 +169,7 @@ impl PgWireServerHandlers for PgWireHandlerFactory {
     }
 
     fn extended_query_handler(&self) -> Arc<Self::ExtendedQueryHandler> {
-        Arc::new(PlaceholderExtendedQueryHandler)
+        Arc::new(UnsupportedExtendedQueryHandler)
     }
 
     fn startup_handler(&self) -> Arc<Self::StartupHandler> {
@@ -178,5 +182,76 @@ impl PgWireServerHandlers for PgWireHandlerFactory {
 
     fn error_handler(&self) -> Arc<Self::ErrorHandler> {
         Arc::new(NoopErrorHandler)
+    }
+}
+
+/// Extended query handler that returns a proper error instead of panicking.
+/// This allows clients like DBeaver to receive an error message rather than
+/// experiencing a connection drop.
+#[derive(Debug, Clone)]
+pub struct UnsupportedExtendedQueryHandler;
+
+impl UnsupportedExtendedQueryHandler {
+    fn not_supported_error() -> PgWireError {
+        PgWireError::UserError(Box::new(ErrorInfo::new(
+            "ERROR".to_string(),
+            "0A000".to_string(), // feature_not_supported
+            "Extended query protocol (prepared statements) is not supported. Use simple query mode.".to_string(),
+        )))
+    }
+}
+
+#[async_trait]
+impl ExtendedQueryHandler for UnsupportedExtendedQueryHandler {
+    type Statement = String;
+    type QueryParser = NoopQueryParser;
+
+    fn query_parser(&self) -> Arc<Self::QueryParser> {
+        Arc::new(NoopQueryParser)
+    }
+
+    /// Override on_parse to return error before any parsing happens
+    async fn on_parse<C>(&self, _client: &mut C, _message: Parse) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        Err(Self::not_supported_error())
+    }
+
+    async fn do_query<'a, 'b: 'a, C>(
+        &'b self,
+        _client: &mut C,
+        _portal: &'a Portal<Self::Statement>,
+        _max_rows: usize,
+    ) -> PgWireResult<Response<'a>>
+    where
+        C: ClientInfo + Unpin + Send + Sync,
+    {
+        Err(Self::not_supported_error())
+    }
+
+    async fn do_describe_statement<C>(
+        &self,
+        _client: &mut C,
+        _statement: &StoredStatement<Self::Statement>,
+    ) -> PgWireResult<DescribeStatementResponse>
+    where
+        C: ClientInfo + Unpin + Send + Sync,
+    {
+        Err(Self::not_supported_error())
+    }
+
+    async fn do_describe_portal<C>(
+        &self,
+        _client: &mut C,
+        _portal: &Portal<Self::Statement>,
+    ) -> PgWireResult<DescribePortalResponse>
+    where
+        C: ClientInfo + Unpin + Send + Sync,
+    {
+        Err(Self::not_supported_error())
     }
 }
