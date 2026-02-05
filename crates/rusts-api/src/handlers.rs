@@ -1025,7 +1025,7 @@ mod tests {
         let tag_index = Arc::new(TagIndex::new());
 
         let app_state = AppState::new(
-            storage,
+            Arc::clone(&storage),
             series_index,
             tag_index,
             Duration::from_secs(30),
@@ -1041,6 +1041,8 @@ mod tests {
         // Startup state should be Ready
         assert_eq!(app_state.startup_state.phase(), StartupPhase::Ready);
         assert!(app_state.startup_state.is_ready());
+
+        storage.shutdown().unwrap();
     }
 
     #[test]
@@ -1067,12 +1069,14 @@ mod tests {
         };
         let storage = Arc::new(StorageEngine::new(config).unwrap());
 
-        app_state.set_storage(storage);
+        app_state.set_storage(Arc::clone(&storage));
 
         // Now storage should be available
         assert!(app_state.is_storage_ready());
         assert!(app_state.get_storage().is_some());
         assert!(app_state.get_executor().is_some());
+
+        storage.shutdown().unwrap();
     }
 
     #[test]

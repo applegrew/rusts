@@ -50,28 +50,43 @@ mod tests {
     use tempfile::TempDir;
     use tower::ServiceExt;
 
-    fn create_test_state() -> (Arc<AppState>, TempDir) {
-        let dir = TempDir::new().unwrap();
-        let config = StorageEngineConfig {
-            data_dir: dir.path().to_path_buf(),
-            wal_durability: WalDurability::None,
-            ..Default::default()
-        };
+    struct TestState {
+        state: Arc<AppState>,
+        _dir: TempDir,
+    }
 
-        let storage = Arc::new(StorageEngine::new(config).unwrap());
-        let series_index = Arc::new(SeriesIndex::new());
-        let tag_index = Arc::new(TagIndex::new());
+    impl TestState {
+        fn new() -> Self {
+            let dir = TempDir::new().unwrap();
+            let config = StorageEngineConfig {
+                data_dir: dir.path().to_path_buf(),
+                wal_durability: WalDurability::None,
+                ..Default::default()
+            };
 
-        let state = Arc::new(AppState::new(
-            storage,
-            series_index,
-            tag_index,
-            Duration::from_secs(30),
-            100,
-            ParallelConfig::default(),
-        ));
+            let storage = Arc::new(StorageEngine::new(config).unwrap());
+            let series_index = Arc::new(SeriesIndex::new());
+            let tag_index = Arc::new(TagIndex::new());
 
-        (state, dir)
+            let state = Arc::new(AppState::new(
+                storage,
+                series_index,
+                tag_index,
+                Duration::from_secs(30),
+                100,
+                ParallelConfig::default(),
+            ));
+
+            Self { state, _dir: dir }
+        }
+    }
+
+    impl Drop for TestState {
+        fn drop(&mut self) {
+            if let Some(storage) = self.state.get_storage() {
+                let _ = storage.shutdown();
+            }
+        }
     }
 
     fn create_initializing_state() -> Arc<AppState> {
@@ -86,8 +101,8 @@ mod tests {
 
     #[test]
     fn test_router_creation() {
-        let (state, _dir) = create_test_state();
-        let _router = create_router(state, Duration::from_secs(30));
+        let env = TestState::new();
+        let _router = create_router(Arc::clone(&env.state), Duration::from_secs(30));
     }
 
     #[tokio::test]
@@ -113,8 +128,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_health_endpoint_when_ready() {
-        let (state, _dir) = create_test_state();
-        let app = create_router(state, Duration::from_secs(30));
+        let env = TestState::new();
+        let app = create_router(Arc::clone(&env.state), Duration::from_secs(30));
 
         let response = app
             .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
@@ -153,8 +168,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_ready_endpoint_when_ready() {
-        let (state, _dir) = create_test_state();
-        let app = create_router(state, Duration::from_secs(30));
+        let env = TestState::new();
+        let app = create_router(Arc::clone(&env.state), Duration::from_secs(30));
 
         let response = app
             .oneshot(Request::builder().uri("/ready").body(Body::empty()).unwrap())
@@ -276,8 +291,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_endpoint_when_ready() {
-        let (state, _dir) = create_test_state();
-        let app = create_router(state, Duration::from_secs(30));
+        let env = TestState::new();
+        let app = create_router(Arc::clone(&env.state), Duration::from_secs(30));
 
         let response = app
             .oneshot(

@@ -1995,7 +1995,7 @@ mod tests {
 
         // Write 100 points to a single series
         for i in 0..100 {
-            let point = create_test_point("server01", i * 1000, i as f64);
+            let point = create_test_point("server01", (i + 1) * 1000000, (i + 1) as f64);
             storage.write(&point).unwrap();
 
             let series_id = point.series_id();
@@ -2011,7 +2011,7 @@ mod tests {
 
         // Query with LIMIT and tag filter (single series)
         let query = Query::builder("cpu")
-            .time_range(0, 1000000)
+            .time_range(0, 1000000000)
             .where_tag("host", "server01")
             .limit(10)
             .build()
@@ -2022,7 +2022,7 @@ mod tests {
 
         // Verify ascending order
         for i in 0..10 {
-            assert_eq!(result.rows[i].timestamp, Some(i as i64 * 1000));
+            assert_eq!(result.rows[i].timestamp, Some(i as i64 * 1000000 + 1000000));
         }
 
         storage.shutdown().unwrap();

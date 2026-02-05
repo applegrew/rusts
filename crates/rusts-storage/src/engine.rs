@@ -1395,7 +1395,7 @@ impl StorageEngine {
             }
         };
 
-        let flushed_seq = self.last_flushed_sequence.load(Ordering::SeqCst);
+        let flushed_seq = Self::load_checkpoint(&self.config.data_dir).unwrap_or(0);
         if flushed_seq == 0 {
             debug!("No data flushed yet, skipping WAL cleanup");
             return Ok(0);
@@ -1608,7 +1608,8 @@ fn flush_memtable_to_partitions(memtable: &MemTable, partitions: &PartitionManag
             std::collections::HashMap::new();
 
         for point in points {
-            let partition_start = (point.timestamp / partitions.partitions().first().map(|p| p.time_range().end - p.time_range().start).unwrap_or(86400_000_000_000)) * partitions.partitions().first().map(|p| p.time_range().end - p.time_range().start).unwrap_or(86400_000_000_000);
+            let duration = partitions.partition_duration();
+            let partition_start = (point.timestamp / duration) * duration;
             partition_points.entry(partition_start).or_default().push(point);
         }
 
@@ -1655,6 +1656,88 @@ mod tests {
             .field("value", value)
             .build()
             .unwrap()
+    }
+
+    #[test]
+    fn test_flush_partition_duration_respected_after_restart() {
+        let dir = TempDir::new().unwrap();
+        let partition_duration = 1_000;
+        let config = StorageEngineConfig {
+            data_dir: dir.path().to_path_buf(),
+            wal_durability: WalDurability::None,
+            partition_duration,
+            ..Default::default()
+        };
+
+        let engine = StorageEngine::new(config).unwrap();
+
+        for (ts, v) in [(100, 1.0), (1100, 2.0), (2100, 3.0)] {
+            let point = create_test_point("cpu", "server01", ts, v);
+            engine.write(&point).unwrap();
+        }
+
+        engine.shutdown().unwrap();
+
+        let engine2 = StorageEngine::new(StorageEngineConfig {
+            data_dir: dir.path().to_path_buf(),
+            wal_durability: WalDurability::None,
+            partition_duration,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let series_id = create_test_point("cpu", "server01", 0, 0.0).series_id();
+        let results = engine2.query(series_id, &TimeRange::new(0, 10_000)).unwrap();
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].timestamp, 100);
+        assert_eq!(results[1].timestamp, 1100);
+        assert_eq!(results[2].timestamp, 2100);
+
+        engine2.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_cleanup_wal_uses_checkpoint_after_flush() {
+        let dir = TempDir::new().unwrap();
+
+        let config = StorageEngineConfig {
+            data_dir: dir.path().to_path_buf(),
+            wal_durability: WalDurability::None,
+            wal_retention_secs: Some(0),
+            ..Default::default()
+        };
+
+        let engine = StorageEngine::new(config).unwrap();
+
+        for i in 0..10 {
+            let point = create_test_point("cpu", "server01", 1000 + i * 10, i as f64);
+            engine.write(&point).unwrap();
+        }
+        engine.shutdown().unwrap();
+
+        let wal_dir = dir.path().join("wal");
+        let reader = WalReader::new(&wal_dir);
+        let files_before = reader.list_wal_files().unwrap();
+        assert!(!files_before.is_empty());
+
+        let checkpoint = StorageEngine::load_checkpoint(dir.path()).unwrap_or(0);
+        assert!(checkpoint > 0);
+
+        let engine2 = StorageEngine::new(StorageEngineConfig {
+            data_dir: dir.path().to_path_buf(),
+            wal_durability: WalDurability::None,
+            wal_retention_secs: Some(0),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let cleaned = engine2.cleanup_wal().unwrap();
+        assert!(cleaned > 0);
+
+        let files_after = reader.list_wal_files().unwrap();
+        assert!(files_after.len() < files_before.len());
+
+        engine2.shutdown().unwrap();
     }
 
     #[test]

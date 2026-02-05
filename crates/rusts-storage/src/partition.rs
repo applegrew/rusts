@@ -485,6 +485,10 @@ impl PartitionManager {
         })
     }
 
+    pub fn partition_duration(&self) -> i64 {
+        self.partition_duration
+    }
+
     /// Load existing partitions from disk.
     ///
     /// Corrupted partitions are removed and will be recreated during the next
