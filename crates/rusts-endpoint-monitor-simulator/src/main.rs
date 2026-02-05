@@ -23,8 +23,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Generate data and write (no queries)
-    Write {
+    /// Run mode: Generate data and write to an external server (no queries)
+    #[command(alias = "write")]
+    Run {
         /// Number of devices to simulate
         #[arg(short, long, default_value = "1000")]
         devices: usize,
@@ -66,7 +67,7 @@ enum Commands {
         output: Option<String>,
     },
 
-    /// Run queries against existing data (no writes)
+    /// Run mode: Run queries against an external server (no writes)
     Query {
         /// Duration in seconds
         #[arg(short = 'D', long, default_value = "60")]
@@ -97,7 +98,7 @@ enum Commands {
         output: Option<String>,
     },
 
-    /// Combined workload (read + write)
+    /// Run mode: Combined workload against an external server (read + write)
     Benchmark {
         /// Number of devices to simulate
         #[arg(short, long, default_value = "1000")]
@@ -148,8 +149,8 @@ enum Commands {
         json: bool,
     },
 
-    /// Run a self-contained performance test (spawns server with temp config)
-    PerfTest {
+    /// Test mode: Self-contained performance test (spawns own server, cleans up after)
+    Test {
         /// Number of devices to simulate
         #[arg(short, long, default_value = "10000")]
         devices: usize,
@@ -199,7 +200,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     let (config, mode) = match cli.command {
-        Commands::Write {
+        Commands::Run {
             devices,
             duration,
             interval,
@@ -316,7 +317,7 @@ async fn main() -> Result<()> {
             (config, WorkloadMode::Benchmark)
         }
 
-        Commands::PerfTest {
+        Commands::Test {
             devices,
             duration,
             interval_ms,
