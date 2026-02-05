@@ -11,11 +11,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::mpsc;
+use tokio::task::JoinError;
 
 #[derive(Error, Debug)]
 pub enum WriteError {
     #[error("HTTP request failed: {0}")]
     HttpError(#[from] reqwest::Error),
+
+    #[error("Task join failed: {0}")]
+    JoinError(#[from] JoinError),
 
     #[error("Server returned error: {status} - {body}")]
     ServerError { status: u16, body: String },
@@ -55,6 +59,7 @@ impl WriteStats {
 }
 
 /// Writer that sends data to RusTs via REST API.
+#[derive(Clone)]
 pub struct Writer {
     client: reqwest::Client,
     write_url: String,

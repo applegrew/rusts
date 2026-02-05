@@ -51,6 +51,12 @@ pub struct WriteConfig {
     /// Maximum points per batch
     pub batch_size: usize,
 
+    /// Number of parallel write workers
+    pub workers: usize,
+
+    /// Maximum number of in-flight HTTP write requests per worker
+    pub max_in_flight: usize,
+
     /// Number of retry attempts for failed writes
     pub max_retries: u32,
 
@@ -66,6 +72,8 @@ impl Default for WriteConfig {
         Self {
             interval: Duration::from_secs(15),
             batch_size: 5000,
+            workers: 1,
+            max_in_flight: 4,
             max_retries: 3,
             retry_delay: Duration::from_millis(100),
             timeout: Duration::from_secs(30),

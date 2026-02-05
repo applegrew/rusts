@@ -13,6 +13,62 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
+async fn write_line_protocol_batched(
+    writer: Writer,
+    line_protocol: String,
+    batch_size_points: usize,
+    max_in_flight: usize,
+) -> Result<(), crate::writer::WriteError> {
+    if line_protocol.is_empty() {
+        return Ok(());
+    }
+
+    let batch_size_points = batch_size_points.max(1);
+    let max_in_flight = max_in_flight.max(1);
+
+    let mut in_flight = tokio::task::JoinSet::new();
+    let mut current: Vec<&str> = Vec::with_capacity(batch_size_points);
+
+    let mut push_chunk = |chunk: &mut Vec<&str>, in_flight: &mut tokio::task::JoinSet<_>| {
+        if chunk.is_empty() {
+            return;
+        }
+
+        let body = chunk.join("\n");
+        chunk.clear();
+
+        let w = writer.clone();
+        in_flight.spawn(async move { w.write_batch(&body).await });
+    };
+
+    for line in line_protocol.lines() {
+        current.push(line);
+        if current.len() >= batch_size_points {
+            while in_flight.len() >= max_in_flight {
+                match in_flight.join_next().await {
+                    Some(Ok(Ok(()))) => {}
+                    Some(Ok(Err(e))) => return Err(e),
+                    Some(Err(e)) => return Err(e.into()),
+                    None => break,
+                }
+            }
+            push_chunk(&mut current, &mut in_flight);
+        }
+    }
+
+    push_chunk(&mut current, &mut in_flight);
+
+    while let Some(res) = in_flight.join_next().await {
+        match res {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    Ok(())
+}
+
 /// Runs the complete workload based on configuration.
 pub async fn run_workload(config: Config, mode: WorkloadMode) -> Report {
     info!("Starting workload in {} mode", mode);
@@ -171,7 +227,14 @@ async fn run_warmup(
 
     while start.elapsed() < warmup_duration {
         let batch = generate_batch(fleet, &mut generator, timestamp);
-        if let Err(e) = writer.write_batch(&batch).await {
+        if let Err(e) = write_line_protocol_batched(
+            writer.clone(),
+            batch,
+            config.write.batch_size,
+            config.write.max_in_flight,
+        )
+        .await
+        {
             warn!("Warmup write error: {}", e);
         }
 
@@ -187,21 +250,47 @@ async fn run_write_workload(
     stats: Arc<WriteStats>,
     latency_tx: mpsc::UnboundedSender<Duration>,
 ) {
-    let writer = Writer::new(&config.server_url, config.write.clone(), stats, latency_tx);
+    let workers = config.write.workers.max(1);
+    let worker_count = workers.min(fleet.len().max(1));
 
-    let mut generator = MetricGenerator::new(rand::random());
-    let start = Instant::now();
-    let mut interval = tokio::time::interval(config.write.interval);
+    let mut handles = Vec::with_capacity(worker_count);
+    for worker_idx in 0..worker_count {
+        let cfg = config.clone();
+        let fleet = Arc::clone(&fleet);
+        let stats = Arc::clone(&stats);
+        let latency_tx = latency_tx.clone();
 
-    while start.elapsed() < config.duration {
-        interval.tick().await;
+        let start = (fleet.len() * worker_idx) / worker_count;
+        let end = (fleet.len() * (worker_idx + 1)) / worker_count;
 
-        let timestamp = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-        let batch = generate_batch(&fleet, &mut generator, timestamp);
+        handles.push(tokio::spawn(async move {
+            let writer = Writer::new(&cfg.server_url, cfg.write.clone(), stats, latency_tx);
+            let mut generator = MetricGenerator::new(rand::random());
+            let start_time = Instant::now();
+            let mut interval = tokio::time::interval(cfg.write.interval);
 
-        if let Err(e) = writer.write_batch(&batch).await {
-            warn!("Write error: {}", e);
-        }
+            while start_time.elapsed() < cfg.duration {
+                interval.tick().await;
+
+                let timestamp = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+                let batch = generate_batch(&fleet[start..end], &mut generator, timestamp);
+
+                if let Err(e) = write_line_protocol_batched(
+                    writer.clone(),
+                    batch,
+                    cfg.write.batch_size,
+                    cfg.write.max_in_flight,
+                )
+                .await
+                {
+                    warn!("Write error: {}", e);
+                }
+            }
+        }));
+    }
+
+    for h in handles {
+        let _ = h.await;
     }
 
     info!("Write workload completed");

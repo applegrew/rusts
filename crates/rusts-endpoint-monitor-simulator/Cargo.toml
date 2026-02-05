@@ -40,3 +40,13 @@ tracing-subscriber = { workspace = true }
 
 # Statistics
 hdrhistogram = "7.5"
+
+# Temp files
+tempfile = { workspace = true }
+
+# Find binaries in PATH
+which = "6"
+
+# Unix filesystem operations
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

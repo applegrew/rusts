@@ -1,0 +1,64 @@
+{
+  "mode": "write-only",
+  "device_count": 18000,
+  "estimated_series": 134908,
+  "duration": {
+    "secs": 60,
+    "nanos": 286065500
+  },
+  "total_duration": {
+    "secs": 70,
+    "nanos": 912592333
+  },
+  "warmup_secs": 10,
+  "write_interval": {
+    "secs": 0,
+    "nanos": 100000000
+  },
+  "query_rate": 5.0,
+  "points_written": 45092926,
+  "batches_written": 10651,
+  "bytes_written": 9072093298,
+  "write_errors": 0,
+  "write_retries": 0,
+  "write_latency": {
+    "count": 10651,
+    "min_us": 8464,
+    "max_us": 2373631,
+    "mean_us": 131398,
+    "p50_us": 86015,
+    "p95_us": 378623,
+    "p99_us": 969215
+  },
+  "dashboard_queries": 0,
+  "alerting_queries": 0,
+  "historical_queries": 0,
+  "query_errors": 0,
+  "dashboard_latency": {
+    "count": 0,
+    "min_us": 0,
+    "max_us": 0,
+    "mean_us": 0,
+    "p50_us": 0,
+    "p95_us": 0,
+    "p99_us": 0
+  },
+  "alerting_latency": {
+    "count": 0,
+    "min_us": 0,
+    "max_us": 0,
+    "mean_us": 0,
+    "p50_us": 0,
+    "p95_us": 0,
+    "p99_us": 0
+  },
+  "historical_latency": {
+    "count": 0,
+    "min_us": 0,
+    "max_us": 0,
+    "mean_us": 0,
+    "p50_us": 0,
+    "p95_us": 0,
+    "p99_us": 0
+  }
+}
