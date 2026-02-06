@@ -4,7 +4,7 @@
 
 A high-performance time series database written in Rust, designed for monitoring, IoT, and real-time analytics workloads.
 
-[![Video Overview](https://img.youtube.com/vi/-aaLTkZcpJ8/maxresdefault.jpg)](https://youtu.be/-aaLTkZcpJ8)
+[![Video Overview](https://img.youtube.com/vi/POF4iet4GKA/maxresdefault.jpg)](https://youtu.be/POF4iet4GKA)
 
 ## Features
 
