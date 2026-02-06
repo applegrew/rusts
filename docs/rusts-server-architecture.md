@@ -148,6 +148,21 @@ struct CliArgs {
 CLI Arguments > Config File > Defaults
 ```
 
+## Load Testing / Endpoint Monitor Simulator
+
+The `rusts-endpoint-monitor-simulator` crate can generate write/query workloads against the server.
+
+- **Run mode** (`run`, `query`, `benchmark`) targets an existing server URL.
+- **Test mode** (`test`) spawns a `rusts-server` process using a generated config file and a temporary data directory under `./.perf_test_data/`, then cleans up after completion.
+
+Example (test mode):
+
+```bash
+cargo run -p rusts-endpoint-monitor-simulator --release -- test \
+  --devices 18000 --duration 60 --warmup 10 \
+  --interval-ms 100 --batch-size 5000 --workers 8 --max-in-flight 16
+```
+
 ## Component Wiring
 
 ```

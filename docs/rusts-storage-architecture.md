@@ -723,3 +723,12 @@ StorageEngineConfig {
     compression: CompressionLevel::Default,
 }
 ```
+
+## Load Testing / Endpoint Monitor Simulator
+
+For high-throughput ingestion benchmarks, the `rusts-endpoint-monitor-simulator` **test mode** (`test`) runs `rusts-server` with an isolated data directory under `./.perf_test_data/` and typically sets `wal_durability` to `none` (fastest) to measure raw ingestion throughput.
+
+This does not change storage engine architecture, but it affects:
+
+- **WAL durability**: `WalDurability::None` avoids `fsync` overhead during benchmarks.
+- **Disk usage**: high-throughput tests can consume tens of GB quickly depending on run duration.

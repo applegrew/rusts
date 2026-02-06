@@ -30,7 +30,24 @@ cargo run -p rusts-server -- --generate-config
 
 # Run with custom config
 cargo run -p rusts-server -- --config /path/to/rusts.yml
+
+# Endpoint monitor simulator (run mode: external server)
+cargo run -p rusts-endpoint-monitor-simulator --release -- run \
+  --server http://localhost:8086 \
+  --devices 1000 --duration 300 --interval 15
+
+# Endpoint monitor simulator (test mode: spawns its own server + cleans up)
+cargo run -p rusts-endpoint-monitor-simulator --release -- test \
+  --devices 18000 --duration 60 --warmup 10 \
+  --interval-ms 100 --batch-size 5000 --workers 8 --max-in-flight 16
 ```
+
+## Endpoint Monitor Simulator
+
+The `rusts-endpoint-monitor-simulator` supports two modes:
+
+- **Run mode** (`run`, `query`, `benchmark`): connects to an existing server URL.
+- **Test mode** (`test`): starts a `rusts-server` instance using a generated config and a data directory under `./.perf_test_data/`, and cleans up test data after completion.
 
 ## Configuration
 

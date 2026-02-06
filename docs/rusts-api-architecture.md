@@ -267,6 +267,13 @@ Client → Router (/write) → write() handler
 → WriteResponse
 ```
 
+## Load Testing / Endpoint Monitor Simulator
+
+The `rusts-endpoint-monitor-simulator` crate can be used to drive sustained load against the `/write` endpoint (and optionally `/query` and `/sql`).
+
+- **Run mode** (`run`, `query`, `benchmark`) targets an existing server URL.
+- **Test mode** (`test`) spawns a `rusts-server` process with a generated config and cleans up its data directory after completion.
+
 ### Query Path
 
 ```

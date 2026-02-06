@@ -493,44 +493,78 @@ Data source: [NYC TLC Trip Record Data](https://www.nyc.gov/site/tlc/about/tlc-t
 
 Simulated Digital Employee Experience (DEX) workload using the `rusts-endpoint-monitor-simulator`:
 
+**Modes:**
+- **Run mode**: connects to an existing server (no server lifecycle management)
+- **Test mode**: starts its own server with a temporary config/data dir and cleans up after
+
+#### Mixed read/write benchmark (run mode)
+
 **Configuration:**
-| Parameter | Value |
-|-----------|-------|
-| Devices | 1,000 |
-| Series | ~7,500 |
-| Duration | 5 minutes |
-| Write interval | 15 seconds |
-| Query rate | 5 queries/sec |
-| Measurements | `device_health`, `app_performance`, `network_health`, `experience_score` |
-
-**Write Performance:**
-| Metric | Value |
-|--------|-------|
-| Points Written | 382,653 |
-| Throughput | 1,275 points/sec |
-| Data Volume | 73.19 MB (249.78 KB/s) |
-| p50 Latency | 26.5ms |
-| p95 Latency | 51.6ms |
-| p99 Latency | 109.5ms |
-
-**Query Performance:**
-| Query Type | Count | p50 | p95 | p99 |
-|------------|-------|-----|-----|-----|
-| Dashboard (aggregations, GROUP BY) | 901 | 13.7ms | 51.4ms | 62.5ms |
-| Alerting (HAVING thresholds) | 451 | 12.6ms | 55.3ms | 62.6ms |
-| Historical (single-device trends) | 149 | 0.9ms | 2.1ms | 4.0ms |
-
-**Summary:**
-- Zero errors during 5-minute benchmark
-- Sustained 1,275 writes/sec + 5 queries/sec concurrently
-- Sub-100ms p99 write latency under mixed read/write load
-- Historical point queries complete in under 1ms (p50)
-
-Run the benchmark yourself:
-```bash
-cargo run -p rusts-endpoint-monitor-simulator --release -- benchmark \
-  --devices 1000 --duration 300 --write-interval 15 --query-rate 5
-```
+ | Parameter | Value |
+ |-----------|-------|
+ | Devices | 1,000 |
+ | Series | ~7,500 |
+ | Duration | 5 minutes |
+ | Write interval | 15 seconds |
+ | Query rate | 5 queries/sec |
+ | Measurements | `device_health`, `app_performance`, `network_health`, `experience_score` |
+ 
+ **Write Performance:**
+ | Metric | Value |
+ |--------|-------|
+ | Points Written | 382,653 |
+ | Throughput | 1,275 points/sec |
+ | Data Volume | 73.19 MB (249.78 KB/s) |
+ | p50 Latency | 26.5ms |
+ | p95 Latency | 51.6ms |
+ | p99 Latency | 109.5ms |
+ 
+ **Query Performance:**
+ | Query Type | Count | p50 | p95 | p99 |
+ |------------|-------|-----|-----|-----|
+ | Dashboard (aggregations, GROUP BY) | 901 | 13.7ms | 51.4ms | 62.5ms |
+ | Alerting (HAVING thresholds) | 451 | 12.6ms | 55.3ms | 62.6ms |
+ | Historical (single-device trends) | 149 | 0.9ms | 2.1ms | 4.0ms |
+ 
+ **Summary:**
+ - Zero errors during 5-minute benchmark
+ - Sustained 1,275 writes/sec + 5 queries/sec concurrently
+ - Sub-100ms p99 write latency under mixed read/write load
+ - Historical point queries complete in under 1ms (p50)
+ 
+ Run the benchmark yourself:
+ ```bash
+ cargo run -p rusts-endpoint-monitor-simulator --release -- benchmark \
+   --devices 1000 --duration 300 --write-interval 15 --query-rate 5
+ ```
+ 
+ #### High-throughput ingestion benchmark (test mode)
+ 
+ **Configuration:**
+ | Parameter | Value |
+ |-----------|-------|
+ | Devices | 18,000 |
+ | Series | ~134,908 |
+ | Duration | 60 seconds |
+ | Write interval | 100ms |
+ | Measurements | `device_health`, `app_performance`, `network_health`, `experience_score` |
+ 
+ **Write Performance:**
+ | Metric | Value |
+ |--------|-------|
+ | Points Written | 45,092,926 |
+ | Throughput | 747,983 points/sec |
+ | Data Volume | 8.45 GB (143.51 MB/s) |
+ | p50 Latency | 86.0ms |
+ | p95 Latency | 378.6ms |
+ | p99 Latency | 969.2ms |
+ 
+ Run the test yourself:
+ ```bash
+ cargo run -p rusts-endpoint-monitor-simulator --release -- test \
+   --devices 18000 --duration 60 --warmup 10 \
+   --interval-ms 100 --batch-size 5000 --workers 8 --max-in-flight 16
+ ```
 
 ### Code Coverage
 
