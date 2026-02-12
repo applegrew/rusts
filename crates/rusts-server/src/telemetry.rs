@@ -18,7 +18,7 @@ use opentelemetry::metrics::MeterProvider;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry::KeyValue;
 use opentelemetry_otlp::WithExportConfig;
-use opentelemetry_sdk::metrics::SdkMeterProvider;
+use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use opentelemetry_sdk::Resource;
 use rusts_api::handlers::ServerMetrics;
@@ -226,9 +226,14 @@ pub fn init(
         .with_endpoint(&settings.otlp_endpoint)
         .build()?;
 
+    let export_interval = Duration::from_secs(settings.export_interval_secs.max(1));
+    let metric_reader = PeriodicReader::builder(metric_exporter)
+        .with_interval(export_interval)
+        .build();
+
     let meter_provider = SdkMeterProvider::builder()
         .with_resource(resource)
-        .with_periodic_exporter(metric_exporter)
+        .with_reader(metric_reader)
         .build();
 
     // Register global providers so libraries can use them

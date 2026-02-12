@@ -46,7 +46,7 @@ postgres:
 telemetry:
   # Enable OpenTelemetry metrics and trace export (default: false).
   # When disabled, zero overhead — no providers are installed.
-  enabled: false
+  enabled: true
   # OTLP gRPC endpoint for the OpenTelemetry Collector.
   otlp_endpoint: "http://localhost:4317"
   # How often the background thread samples process CPU / memory (seconds).

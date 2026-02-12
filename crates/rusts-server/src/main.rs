@@ -544,6 +544,10 @@ async fn main() -> anyhow::Result<()> {
         config.logging.show_location,
     )?;
 
+    tracing::info_span!("server.startup", version = env!("CARGO_PKG_VERSION")).in_scope(|| {
+        tracing::info!("Telemetry pipeline initialized");
+    });
+
     info!("Starting RusTs v{}", env!("CARGO_PKG_VERSION"));
     if config.telemetry.enabled {
         info!("Telemetry enabled — exporting to {}", config.telemetry.otlp_endpoint);

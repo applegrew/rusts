@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 /// Server startup phase
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -350,146 +351,153 @@ pub async fn query(
     State(state): State<Arc<AppState>>,
     Json(req): Json<QueryRequest>,
 ) -> std::result::Result<Json<QueryResponse>, ApiError> {
-    let start = Instant::now();
+    let measurement = req.measurement.clone();
+    let span = tracing::info_span!("api.query", measurement = %measurement);
 
-    // Check if storage/executor is ready
-    let executor = state.get_executor().ok_or_else(|| {
-        let phase = state.startup_state.phase();
-        ApiError::ServiceUnavailable(format!("Server is starting up ({})", phase))
-    })?;
+    async move {
+        let start = Instant::now();
 
-    // Acquire semaphore permit (Layer 3: concurrent query limit)
-    let _permit = state.query_semaphore.acquire().await
-        .map_err(|_| ApiError::Internal("Query semaphore closed".to_string()))?;
+        // Check if storage/executor is ready
+        let executor = state.get_executor().ok_or_else(|| {
+            let phase = state.startup_state.phase();
+            ApiError::ServiceUnavailable(format!("Server is starting up ({})", phase))
+        })?;
 
-    // Track active queries
-    if let Some(m) = &state.metrics {
-        m.active_queries.record(1, &[]);
-    }
+        // Acquire semaphore permit (Layer 3: concurrent query limit)
+        let _permit = state.query_semaphore.acquire().await
+            .map_err(|_| ApiError::Internal("Query semaphore closed".to_string()))?;
 
-    // Build query
-    let time_range = req.time_range.map(|tr| TimeRange::new(tr.start, tr.end))
-        .unwrap_or_default();
-
-    let mut builder = Query::builder(&req.measurement)
-        .time_range(time_range.start, time_range.end);
-
-    // Add tag filters
-    if let Some(tags) = &req.tags {
-        for (key, value) in tags {
-            builder = builder.where_tag(key, value);
+        // Track active queries
+        if let Some(m) = &state.metrics {
+            m.active_queries.record(1, &[]);
         }
-    }
 
-    // Add field selection or aggregation
-    if let Some(agg) = &req.aggregate {
-        let function = AggregateFunction::from_str(&agg.function)
-            .map_err(|e| ApiError::Query(e.to_string()))?;
-        builder = builder.select_aggregate(&agg.field, function, agg.alias.clone());
-    } else if let Some(fields) = &req.fields {
-        builder = builder.select_fields(fields.clone());
-    }
+        // Build query
+        let time_range = req.time_range.map(|tr| TimeRange::new(tr.start, tr.end))
+            .unwrap_or_default();
 
-    // Add grouping
-    if let Some(group_by) = &req.group_by {
-        builder = builder.group_by_tags(group_by.clone());
-    }
+        let mut builder = Query::builder(&req.measurement)
+            .time_range(time_range.start, time_range.end);
 
-    if let Some(interval_str) = &req.group_by_time {
-        let interval = parse_duration(interval_str)
-            .map_err(|e| ApiError::Query(e))?;
-        builder = builder.group_by_interval(interval);
-    }
-
-    // Add limit/offset
-    if let Some(limit) = req.limit {
-        builder = builder.limit(limit);
-    }
-    if let Some(offset) = req.offset {
-        builder = builder.offset(offset);
-    }
-
-    let query = builder.build().map_err(|e| ApiError::Query(e.to_string()))?;
-
-    // Clone for spawn_blocking
-    let timeout = state.query_timeout;
-    let cancel = CancellationToken::new();
-    let cancel_clone = cancel.clone();
-
-    // Execute with timeout and spawn_blocking (Layer 2 + 4)
-    let query_result = tokio::time::timeout(timeout, async {
-        tokio::task::spawn_blocking(move || {
-            executor.execute_with_cancellation(query, cancel_clone)
-        }).await
-    }).await;
-
-    // Handle results
-    let result = match query_result {
-        Ok(Ok(Ok(result))) => result,
-        Ok(Ok(Err(query_err))) => {
-            // Query error (including cancellation)
-            return Err(ApiError::Query(query_err.to_string()));
-        }
-        Ok(Err(join_err)) => {
-            // spawn_blocking panicked
-            return Err(ApiError::Internal(format!("Query task failed: {}", join_err)));
-        }
-        Err(_timeout) => {
-            // Timeout - cancel the query
-            cancel.cancel();
-            return Err(ApiError::Query("Query timeout exceeded".to_string()));
-        }
-    };
-
-    // Convert to response
-    let results: Vec<ResultRowResponse> = result
-        .rows
-        .iter()
-        .map(|row| {
-            let tags: HashMap<String, String> = row
-                .tags
-                .iter()
-                .map(|t| (t.key.clone(), t.value.clone()))
-                .collect();
-
-            let fields: HashMap<String, serde_json::Value> = row
-                .fields
-                .iter()
-                .map(|(k, v)| {
-                    let json_value = match v {
-                        rusts_core::FieldValue::Float(f) => serde_json::json!(f),
-                        rusts_core::FieldValue::Integer(i) => serde_json::json!(i),
-                        rusts_core::FieldValue::UnsignedInteger(u) => serde_json::json!(u),
-                        rusts_core::FieldValue::String(s) => serde_json::json!(s),
-                        rusts_core::FieldValue::Boolean(b) => serde_json::json!(b),
-                    };
-                    (k.clone(), json_value)
-                })
-                .collect();
-
-            ResultRowResponse {
-                time: row.timestamp,
-                tags,
-                fields,
+        // Add tag filters
+        if let Some(tags) = &req.tags {
+            for (key, value) in tags {
+                builder = builder.where_tag(key, value);
             }
-        })
-        .collect();
+        }
 
-    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        // Add field selection or aggregation
+        if let Some(agg) = &req.aggregate {
+            let function = AggregateFunction::from_str(&agg.function)
+                .map_err(|e| ApiError::Query(e.to_string()))?;
+            builder = builder.select_aggregate(&agg.field, function, agg.alias.clone());
+        } else if let Some(fields) = &req.fields {
+            builder = builder.select_fields(fields.clone());
+        }
 
-    // Record metrics
-    if let Some(m) = &state.metrics {
-        m.queries_executed.add(1, &[]);
-        m.query_latency_ms.record(elapsed_ms, &[]);
-        m.active_queries.record(-1, &[]);
+        // Add grouping
+        if let Some(group_by) = &req.group_by {
+            builder = builder.group_by_tags(group_by.clone());
+        }
+
+        if let Some(interval_str) = &req.group_by_time {
+            let interval = parse_duration(interval_str)
+                .map_err(|e| ApiError::Query(e))?;
+            builder = builder.group_by_interval(interval);
+        }
+
+        // Add limit/offset
+        if let Some(limit) = req.limit {
+            builder = builder.limit(limit);
+        }
+        if let Some(offset) = req.offset {
+            builder = builder.offset(offset);
+        }
+
+        let query = builder.build().map_err(|e| ApiError::Query(e.to_string()))?;
+
+        // Clone for spawn_blocking
+        let timeout = state.query_timeout;
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+
+        // Execute with timeout and spawn_blocking (Layer 2 + 4)
+        let query_result = tokio::time::timeout(timeout, async {
+            tokio::task::spawn_blocking(move || {
+                executor.execute_with_cancellation(query, cancel_clone)
+            }).await
+        }).await;
+
+        // Handle results
+        let result = match query_result {
+            Ok(Ok(Ok(result))) => result,
+            Ok(Ok(Err(query_err))) => {
+                // Query error (including cancellation)
+                return Err(ApiError::Query(query_err.to_string()));
+            }
+            Ok(Err(join_err)) => {
+                // spawn_blocking panicked
+                return Err(ApiError::Internal(format!("Query task failed: {}", join_err)));
+            }
+            Err(_timeout) => {
+                // Timeout - cancel the query
+                cancel.cancel();
+                return Err(ApiError::Query("Query timeout exceeded".to_string()));
+            }
+        };
+
+        // Convert to response
+        let results: Vec<ResultRowResponse> = result
+            .rows
+            .iter()
+            .map(|row| {
+                let tags: HashMap<String, String> = row
+                    .tags
+                    .iter()
+                    .map(|t| (t.key.clone(), t.value.clone()))
+                    .collect();
+
+                let fields: HashMap<String, serde_json::Value> = row
+                    .fields
+                    .iter()
+                    .map(|(k, v)| {
+                        let json_value = match v {
+                            rusts_core::FieldValue::Float(f) => serde_json::json!(f),
+                            rusts_core::FieldValue::Integer(i) => serde_json::json!(i),
+                            rusts_core::FieldValue::UnsignedInteger(u) => serde_json::json!(u),
+                            rusts_core::FieldValue::String(s) => serde_json::json!(s),
+                            rusts_core::FieldValue::Boolean(b) => serde_json::json!(b),
+                        };
+                        (k.clone(), json_value)
+                    })
+                    .collect();
+
+                ResultRowResponse {
+                    time: row.timestamp,
+                    tags,
+                    fields,
+                }
+            })
+            .collect();
+
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+        // Record metrics
+        if let Some(m) = &state.metrics {
+            m.queries_executed.add(1, &[]);
+            m.query_latency_ms.record(elapsed_ms, &[]);
+            m.active_queries.record(-1, &[]);
+        }
+
+        Ok(Json(QueryResponse {
+            measurement: result.measurement,
+            results,
+            total_rows: result.total_rows,
+            execution_time_ms: elapsed_ms,
+        }))
     }
-
-    Ok(Json(QueryResponse {
-        measurement: result.measurement,
-        results,
-        total_rows: result.total_rows,
-        execution_time_ms: elapsed_ms,
-    }))
+    .instrument(span)
+    .await
 }
 
 /// Parse duration string (e.g., "1m", "5s", "1h")
