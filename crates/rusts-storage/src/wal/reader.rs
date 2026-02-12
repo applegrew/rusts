@@ -336,7 +336,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
 
         // Write some entries
-        let writer = WalWriter::new(dir.path(), WalDurability::EveryWrite).unwrap();
+        let writer = WalWriter::new(dir.path(), WalDurability::EveryWrite, false).unwrap();
         for i in 0..10 {
             let point = create_test_point(i * 1000, i as f64);
             writer.write_point(&point).unwrap();
@@ -358,7 +358,7 @@ mod tests {
     fn test_wal_batch_read() {
         let dir = TempDir::new().unwrap();
 
-        let writer = WalWriter::new(dir.path(), WalDurability::EveryWrite).unwrap();
+        let writer = WalWriter::new(dir.path(), WalDurability::EveryWrite, false).unwrap();
 
         // Write batch of 100 points
         let points: Vec<Point> = (0..100)
@@ -377,7 +377,7 @@ mod tests {
     fn test_wal_read_from_sequence() {
         let dir = TempDir::new().unwrap();
 
-        let writer = WalWriter::new(dir.path(), WalDurability::EveryWrite).unwrap();
+        let writer = WalWriter::new(dir.path(), WalDurability::EveryWrite, false).unwrap();
         for i in 0..10 {
             let point = create_test_point(i * 1000, i as f64);
             writer.write_point(&point).unwrap();
@@ -405,7 +405,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
 
         // Use small file size to force rotation
-        let writer = WalWriter::new(dir.path(), WalDurability::EveryWrite)
+        let writer = WalWriter::new(dir.path(), WalDurability::EveryWrite, false)
             .unwrap()
             .with_max_file_size(512);
 
@@ -430,7 +430,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
 
         // Use small file size to force multiple files
-        let writer = WalWriter::new(dir.path(), WalDurability::EveryWrite)
+        let writer = WalWriter::new(dir.path(), WalDurability::EveryWrite, false)
             .unwrap()
             .with_max_file_size(512);
 
@@ -468,7 +468,7 @@ mod tests {
     fn test_wal_read_after_checkpoint_all_flushed() {
         let dir = TempDir::new().unwrap();
 
-        let writer = WalWriter::new(dir.path(), WalDurability::EveryWrite).unwrap();
+        let writer = WalWriter::new(dir.path(), WalDurability::EveryWrite, false).unwrap();
 
         // Write 10 entries (sequences 0-9)
         for i in 0..10 {
@@ -493,7 +493,7 @@ mod tests {
     fn test_wal_read_after_checkpoint_none_flushed() {
         let dir = TempDir::new().unwrap();
 
-        let writer = WalWriter::new(dir.path(), WalDurability::EveryWrite).unwrap();
+        let writer = WalWriter::new(dir.path(), WalDurability::EveryWrite, false).unwrap();
 
         // Write 10 entries (sequences 0-9)
         for i in 0..10 {
@@ -516,7 +516,7 @@ mod tests {
     fn test_wal_peek_first_sequence() {
         let dir = TempDir::new().unwrap();
 
-        let writer = WalWriter::new(dir.path(), WalDurability::EveryWrite).unwrap();
+        let writer = WalWriter::new(dir.path(), WalDurability::EveryWrite, false).unwrap();
         for i in 0..5 {
             let point = create_test_point(i * 1000, i as f64);
             writer.write_point(&point).unwrap();
@@ -534,7 +534,7 @@ mod tests {
     fn test_wal_peek_last_sequence() {
         let dir = TempDir::new().unwrap();
 
-        let writer = WalWriter::new(dir.path(), WalDurability::EveryWrite).unwrap();
+        let writer = WalWriter::new(dir.path(), WalDurability::EveryWrite, false).unwrap();
         for i in 0..5 {
             let point = create_test_point(i * 1000, i as f64);
             writer.write_point(&point).unwrap();

@@ -95,6 +95,14 @@ pub struct StorageSettings {
     pub partition_duration_hours: u64,
     /// Compression level: "none", "fast", "default", "best"
     pub compression: String,
+    /// fsync segment files and partition metadata after writes (default: true).
+    /// Disabling trades durability for write throughput.
+    pub fsync_on_write: bool,
+    /// Use Direct I/O (bypass OS page cache) for WAL files (default: false).
+    /// Reduces cache pollution on write-heavy workloads but requires aligned buffers.
+    pub direct_io_wal: bool,
+    /// Use Direct I/O (bypass OS page cache) for segment files (default: false).
+    pub direct_io_segments: bool,
 }
 
 impl Default for StorageSettings {
@@ -108,6 +116,9 @@ impl Default for StorageSettings {
             memtable: MemTableSettings::default(),
             partition_duration_hours: 24,
             compression: "default".to_string(),
+            fsync_on_write: true,
+            direct_io_wal: false,
+            direct_io_segments: false,
         }
     }
 }
@@ -309,6 +320,9 @@ impl ServerConfig {
             },
             partition_duration: self.storage.partition_duration_hours as i64 * 60 * 60 * 1_000_000_000,
             compression,
+            fsync_on_write: self.storage.fsync_on_write,
+            direct_io_wal: self.storage.direct_io_wal,
+            direct_io_segments: self.storage.direct_io_segments,
         }
     }
 

@@ -23,6 +23,7 @@ tracing = { workspace = true }
 bytes = { workspace = true }
 crossbeam-channel = { workspace = true }
 rayon = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

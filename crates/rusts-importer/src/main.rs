@@ -310,6 +310,9 @@ async fn import_direct_streaming(
         },
         partition_duration: 24 * 60 * 60 * 1_000_000_000, // 1 day
         compression: rusts_compression::CompressionLevel::Default,
+        fsync_on_write: false, // Bulk import favors throughput
+        direct_io_wal: false,
+        direct_io_segments: false,
     };
 
     let engine = StorageEngine::new(storage_config).context("Failed to open storage engine")?;

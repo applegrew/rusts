@@ -3072,6 +3072,7 @@ dependencies = [
  "crc32fast",
  "crossbeam-channel",
  "dashmap",
+ "libc",
  "memmap2",
  "parking_lot",
  "rand 0.8.5",

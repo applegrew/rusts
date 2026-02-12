@@ -114,12 +114,14 @@ pub struct WalWriter {
     pending_entries: AtomicUsize,
     /// Group commit configuration
     group_commit: GroupCommitConfig,
+    /// Whether to use Direct I/O (bypass OS page cache)
+    direct_io: bool,
 }
 
 impl WalWriter {
     /// Create a new WAL writer
-    pub fn new(dir: impl AsRef<Path>, durability: WalDurability) -> Result<Self> {
-        Self::with_config(dir, durability, GroupCommitConfig::default())
+    pub fn new(dir: impl AsRef<Path>, durability: WalDurability, direct_io: bool) -> Result<Self> {
+        Self::with_config(dir, durability, GroupCommitConfig::default(), direct_io)
     }
 
     /// Create a new WAL writer with custom group commit configuration
@@ -127,6 +129,7 @@ impl WalWriter {
         dir: impl AsRef<Path>,
         durability: WalDurability,
         group_commit: GroupCommitConfig,
+        direct_io: bool,
     ) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)?;
@@ -139,6 +142,10 @@ impl WalWriter {
             .create(true)
             .append(true)
             .open(&file_path)?;
+
+        if direct_io {
+            Self::apply_direct_io(&file);
+        }
 
         let current_size = file.metadata()?.len();
 
@@ -154,7 +161,26 @@ impl WalWriter {
             pending_bytes: AtomicUsize::new(0),
             pending_entries: AtomicUsize::new(0),
             group_commit,
+            direct_io,
         })
+    }
+
+    /// Apply Direct I/O hint to a file descriptor.
+    /// On macOS: F_NOCACHE disables the unified buffer cache.
+    /// On Linux: posix_fadvise with DONTNEED advises the kernel to drop pages.
+    fn apply_direct_io(file: &File) {
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = file.as_raw_fd();
+            unsafe { libc::fcntl(fd, libc::F_NOCACHE, 1) };
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = file.as_raw_fd();
+            unsafe { libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_DONTNEED) };
+        }
     }
 
     /// Create with custom max file size
@@ -284,6 +310,10 @@ impl WalWriter {
             .append(true)
             .open(&file_path)?;
 
+        if self.direct_io {
+            Self::apply_direct_io(&new_file);
+        }
+
         let mut file = self.file.lock();
         file.flush()?;
         file.get_ref().sync_all()?;
@@ -394,7 +424,7 @@ mod tests {
     #[test]
     fn test_wal_write_single() {
         let dir = TempDir::new().unwrap();
-        let wal = WalWriter::new(dir.path(), WalDurability::None).unwrap();
+        let wal = WalWriter::new(dir.path(), WalDurability::None, false).unwrap();
 
         let point = create_test_point(1000, 42.0);
         let seq = wal.write_point(&point).unwrap();
@@ -406,7 +436,7 @@ mod tests {
     #[test]
     fn test_wal_write_batch() {
         let dir = TempDir::new().unwrap();
-        let wal = WalWriter::new(dir.path(), WalDurability::None).unwrap();
+        let wal = WalWriter::new(dir.path(), WalDurability::None, false).unwrap();
 
         let points: Vec<Point> = (0..100)
             .map(|i| create_test_point(i * 1000, i as f64))
@@ -426,7 +456,7 @@ mod tests {
             WalDurability::EveryWrite,
         ] {
             let dir = TempDir::new().unwrap();
-            let wal = WalWriter::new(dir.path(), durability).unwrap();
+            let wal = WalWriter::new(dir.path(), durability, false).unwrap();
 
             let point = create_test_point(1000, 42.0);
             wal.write_point(&point).unwrap();
@@ -437,7 +467,7 @@ mod tests {
     #[test]
     fn test_wal_rotation() {
         let dir = TempDir::new().unwrap();
-        let wal = WalWriter::new(dir.path(), WalDurability::None)
+        let wal = WalWriter::new(dir.path(), WalDurability::None, false)
             .unwrap()
             .with_max_file_size(1024); // Small size to trigger rotation
 
@@ -460,7 +490,7 @@ mod tests {
     #[test]
     fn test_wal_empty_write() {
         let dir = TempDir::new().unwrap();
-        let wal = WalWriter::new(dir.path(), WalDurability::None).unwrap();
+        let wal = WalWriter::new(dir.path(), WalDurability::None, false).unwrap();
 
         let seq = wal.write(&[]).unwrap();
         assert_eq!(seq, 0);
@@ -483,6 +513,7 @@ mod tests {
             dir.path(),
             WalDurability::Periodic { interval_ms: 10000 }, // Long interval
             config,
+            false,
         ).unwrap();
 
         // Write 4 entries - should not trigger sync yet
@@ -517,6 +548,7 @@ mod tests {
             dir.path(),
             WalDurability::Periodic { interval_ms: 10000 },
             config,
+            false,
         ).unwrap();
 
         // Write enough data to exceed the pending bytes threshold
@@ -528,5 +560,77 @@ mod tests {
         // Should complete without error and sync should have occurred
         // (pending_bytes threshold of 512 bytes was exceeded)
         assert!(wal.sequence() >= 10);
+    }
+
+    #[test]
+    fn test_wal_direct_io_write_read_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let wal = WalWriter::new(dir.path(), WalDurability::EveryWrite, true).unwrap();
+
+        // Write entries with Direct I/O enabled
+        for i in 0..20 {
+            let point = create_test_point(i * 1000, i as f64);
+            wal.write_point(&point).unwrap();
+        }
+
+        // Read them back using the standard reader
+        let reader = crate::wal::WalReader::new(dir.path());
+        let entries = reader.read_all().unwrap();
+
+        assert_eq!(entries.len(), 20);
+        for (i, entry) in entries.iter().enumerate() {
+            assert_eq!(entry.sequence, i as u64);
+            assert_eq!(entry.points.len(), 1);
+            assert_eq!(entry.points[0].timestamp, i as i64 * 1000);
+        }
+    }
+
+    #[test]
+    fn test_wal_direct_io_rotation() {
+        let dir = TempDir::new().unwrap();
+        let wal = WalWriter::new(dir.path(), WalDurability::None, true)
+            .unwrap()
+            .with_max_file_size(1024);
+
+        // Write enough data to trigger rotation with Direct I/O
+        for i in 0..100 {
+            let point = create_test_point(i * 1000, i as f64);
+            wal.write_point(&point).unwrap();
+        }
+
+        // Verify multiple files were created
+        let files: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".log"))
+            .collect();
+        assert!(files.len() > 1, "Expected multiple WAL files after rotation with direct_io");
+
+        // Verify all data is readable
+        let reader = crate::wal::WalReader::new(dir.path());
+        let entries = reader.read_all().unwrap();
+        assert_eq!(entries.len(), 100);
+    }
+
+    #[test]
+    fn test_wal_direct_io_all_durability_modes() {
+        for durability in [
+            WalDurability::None,
+            WalDurability::OsDefault,
+            WalDurability::Periodic { interval_ms: 10 },
+            WalDurability::EveryWrite,
+        ] {
+            let dir = TempDir::new().unwrap();
+            let wal = WalWriter::new(dir.path(), durability, true).unwrap();
+
+            let point = create_test_point(1000, 42.0);
+            wal.write_point(&point).unwrap();
+            wal.sync().unwrap();
+
+            // Verify data is readable
+            let reader = crate::wal::WalReader::new(dir.path());
+            let entries = reader.read_all().unwrap();
+            assert_eq!(entries.len(), 1);
+        }
     }
 }

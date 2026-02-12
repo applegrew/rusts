@@ -51,6 +51,9 @@ pub struct StorageSettings {
     pub memtable: MemTableSettings,
     pub partition_duration_hours: u64,    // Default: 24
     pub compression: String,        // none|fast|default|best
+    pub fsync_on_write: bool,       // Default: true - fsync segments & partition meta
+    pub direct_io_wal: bool,        // Default: false - Direct I/O for WAL files
+    pub direct_io_segments: bool,   // Default: false - Direct I/O for segment files
 }
 ```
 
@@ -223,6 +226,7 @@ Converts string configuration to typed enums:
 - Compression string → `CompressionLevel` enum
 - Size calculations (MB to bytes)
 - Duration calculations (hours to nanoseconds)
+- Passes through `fsync_on_write`, `direct_io_wal`, `direct_io_segments` booleans directly
 
 ### to_auth_config() (main.rs:241-248)
 
@@ -370,6 +374,9 @@ storage:
     max_age_secs: 60
   partition_duration_hours: 24
   compression: default
+  fsync_on_write: true
+  direct_io_wal: false
+  direct_io_segments: false
 
 auth:
   enabled: false

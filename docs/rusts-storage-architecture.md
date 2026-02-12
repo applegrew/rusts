@@ -33,6 +33,9 @@ pub struct StorageEngineConfig {
     pub flush_trigger: FlushTrigger,
     pub partition_duration: i64,         // Default: 1 day in nanos
     pub compression: CompressionLevel,
+    pub fsync_on_write: bool,            // Default: true - fsync segments & partition meta
+    pub direct_io_wal: bool,             // Default: false - Direct I/O for WAL files
+    pub direct_io_segments: bool,        // Default: false - Direct I/O for segment files
 }
 ```
 
@@ -238,6 +241,29 @@ The checkpoint file (`wal_checkpoint`) tracks the last WAL sequence number that 
 - If checkpoint exists: Only recover entries with sequence > checkpoint
 - If no checkpoint: Recover all WAL entries (fresh start or crash recovery)
 - Binary search efficiently skips files where all entries ≤ checkpoint
+
+### Storage I/O Tuning
+
+The storage engine provides three config knobs for controlling I/O behavior:
+
+**`fsync_on_write`** (default: `true`)
+- When enabled, segment files are `sync_all()`'d after writing and partition metadata files are `sync_all()`'d after each update.
+- Disabling removes the fsync overhead but risks data loss if the OS crashes before dirty pages are flushed. WAL durability modes still control WAL fsync independently.
+
+**`direct_io_wal`** (default: `false`)
+- Bypasses the OS page cache for WAL file writes.
+- On **macOS**: applies `F_NOCACHE` via `fcntl()` on each WAL file descriptor (including after rotation).
+- On **Linux**: applies `posix_fadvise(POSIX_FADV_DONTNEED)` to advise the kernel to drop pages.
+- Useful for write-heavy workloads where WAL writes pollute the page cache and evict hot query data.
+
+**`direct_io_segments`** (default: `false`)
+- Bypasses the OS page cache for segment file writes using the same platform mechanisms as `direct_io_wal`.
+- Partition metadata (`partition.meta`) is intentionally excluded from Direct I/O because these files are small and benefit from caching.
+
+**Interaction with WAL durability modes:**
+- `fsync_on_write` controls segment/partition fsync only. WAL fsync is controlled by `wal_durability`.
+- `direct_io_wal` and `direct_io_segments` are orthogonal to fsync — they control *caching*, not *durability*.
+- For maximum throughput benchmarks: `wal_durability: none`, `fsync_on_write: false`, `direct_io_wal: true`.
 
 ### WAL Retention (engine.rs:306-371)
 

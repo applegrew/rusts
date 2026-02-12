@@ -157,6 +157,10 @@ pub struct SegmentWriter {
     compression: CompressionLevel,
     /// Next segment ID
     next_id: u64,
+    /// Whether to fsync after writing segment files
+    fsync_on_write: bool,
+    /// Whether to use Direct I/O (bypass OS page cache)
+    direct_io: bool,
 }
 
 impl SegmentWriter {
@@ -165,6 +169,18 @@ impl SegmentWriter {
         Self {
             compression,
             next_id: 0,
+            fsync_on_write: true,
+            direct_io: false,
+        }
+    }
+
+    /// Create a new segment writer with IO options
+    pub fn with_io_options(compression: CompressionLevel, fsync_on_write: bool, direct_io: bool) -> Self {
+        Self {
+            compression,
+            next_id: 0,
+            fsync_on_write,
+            direct_io,
         }
     }
 
@@ -269,6 +285,29 @@ impl SegmentWriter {
         }
 
         writer.flush()?;
+
+        if self.direct_io {
+            // For Direct I/O, set F_NOCACHE on macOS or O_DIRECT on Linux
+            // after writing to bypass the page cache
+            #[cfg(target_os = "macos")]
+            {
+                use std::os::unix::io::AsRawFd;
+                let fd = writer.get_ref().as_raw_fd();
+                unsafe { libc::fcntl(fd, libc::F_NOCACHE, 1) };
+            }
+            // On Linux, O_DIRECT requires opening with the flag from the start
+            // and aligned writes. For segments we use posix_fadvise instead.
+            #[cfg(target_os = "linux")]
+            {
+                use std::os::unix::io::AsRawFd;
+                let fd = writer.get_ref().as_raw_fd();
+                unsafe { libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_DONTNEED) };
+            }
+        }
+
+        if self.fsync_on_write {
+            writer.get_ref().sync_all()?;
+        }
 
         Ok(meta)
     }
@@ -1444,6 +1483,83 @@ mod tests {
         for (std_pt, mmap_pt) in standard_points.iter().zip(mmap_points.iter()) {
             assert_eq!(std_pt.timestamp, mmap_pt.timestamp);
             assert_eq!(std_pt.fields.len(), mmap_pt.fields.len());
+        }
+    }
+
+    #[test]
+    fn test_segment_writer_with_fsync() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test_fsync.seg");
+
+        let points = create_test_points(50);
+        let mut writer = SegmentWriter::with_io_options(CompressionLevel::Fast, true, false);
+        let meta = writer.write(&path, 12345, "cpu", &[], &points).unwrap();
+
+        assert_eq!(meta.point_count, 50);
+
+        // Verify data is readable
+        let segment = Segment::open(&path).unwrap();
+        let read_points = segment.read_all().unwrap();
+        assert_eq!(read_points.len(), 50);
+    }
+
+    #[test]
+    fn test_segment_writer_without_fsync() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test_no_fsync.seg");
+
+        let points = create_test_points(50);
+        let mut writer = SegmentWriter::with_io_options(CompressionLevel::Fast, false, false);
+        let meta = writer.write(&path, 12345, "cpu", &[], &points).unwrap();
+
+        assert_eq!(meta.point_count, 50);
+
+        // Verify data is readable
+        let segment = Segment::open(&path).unwrap();
+        let read_points = segment.read_all().unwrap();
+        assert_eq!(read_points.len(), 50);
+    }
+
+    #[test]
+    fn test_segment_writer_with_direct_io() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test_dio.seg");
+
+        let points = create_test_points(100);
+        let mut writer = SegmentWriter::with_io_options(CompressionLevel::Fast, true, true);
+        let meta = writer.write(&path, 12345, "cpu", &[], &points).unwrap();
+
+        assert_eq!(meta.point_count, 100);
+
+        // Verify data is readable after Direct I/O write
+        let segment = Segment::open(&path).unwrap();
+        let read_points = segment.read_all().unwrap();
+        assert_eq!(read_points.len(), 100);
+
+        // Verify data integrity
+        for (i, point) in read_points.iter().enumerate() {
+            assert_eq!(point.timestamp, i as i64 * 1000);
+        }
+    }
+
+    #[test]
+    fn test_segment_writer_io_options_combinations() {
+        // Test all combinations of fsync and direct_io
+        for fsync in [true, false] {
+            for direct_io in [true, false] {
+                let dir = TempDir::new().unwrap();
+                let path = dir.path().join("test.seg");
+
+                let points = create_test_points(25);
+                let mut writer = SegmentWriter::with_io_options(CompressionLevel::Fast, fsync, direct_io);
+                let meta = writer.write(&path, 12345, "cpu", &[], &points).unwrap();
+
+                assert_eq!(meta.point_count, 25, "Failed with fsync={}, direct_io={}", fsync, direct_io);
+
+                let segment = Segment::open(&path).unwrap();
+                let read_points = segment.read_all().unwrap();
+                assert_eq!(read_points.len(), 25, "Read failed with fsync={}, direct_io={}", fsync, direct_io);
+            }
         }
     }
 }

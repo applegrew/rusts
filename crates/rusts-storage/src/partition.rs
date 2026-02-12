@@ -44,11 +44,27 @@ pub struct Partition {
     next_segment_id: AtomicU64,
     /// Compression level for new segments
     compression: CompressionLevel,
+    /// Whether to fsync after writing segment/meta files
+    fsync_on_write: bool,
+    /// Whether to use Direct I/O for segment files
+    direct_io_segments: bool,
 }
 
 impl Partition {
     /// Create a new partition
     pub fn new(id: u64, dir: impl AsRef<Path>, time_range: TimeRange, compression: CompressionLevel) -> Result<Self> {
+        Self::with_io_options(id, dir, time_range, compression, true, false)
+    }
+
+    /// Create a new partition with IO options
+    pub fn with_io_options(
+        id: u64,
+        dir: impl AsRef<Path>,
+        time_range: TimeRange,
+        compression: CompressionLevel,
+        fsync_on_write: bool,
+        direct_io_segments: bool,
+    ) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)?;
 
@@ -60,6 +76,8 @@ impl Partition {
             segment_metas: RwLock::new(Vec::new()),
             next_segment_id: AtomicU64::new(0),
             compression,
+            fsync_on_write,
+            direct_io_segments,
         })
     }
 
@@ -80,6 +98,8 @@ impl Partition {
             segment_metas: RwLock::new(Vec::new()),
             next_segment_id: AtomicU64::new(0),
             compression: CompressionLevel::Default,
+            fsync_on_write: true,
+            direct_io_segments: false,
         };
 
         // Load existing segments
@@ -131,7 +151,11 @@ impl Partition {
         let segment_id = self.next_segment_id.fetch_add(1, Ordering::SeqCst);
         let segment_path = self.dir.join(format!("segment_{:08}.seg", segment_id));
 
-        let mut writer = SegmentWriter::new(self.compression);
+        let mut writer = SegmentWriter::with_io_options(
+            self.compression,
+            self.fsync_on_write,
+            self.direct_io_segments,
+        );
         let meta = writer.write(&segment_path, series_id, measurement, tags, points)?;
 
         // Load the segment and add to our collection
@@ -435,7 +459,12 @@ impl Partition {
         let meta = self.meta();
         let meta_bytes = bincode::serialize(&meta)?;
         let meta_path = self.dir.join("partition.meta");
-        std::fs::write(meta_path, meta_bytes)?;
+        std::fs::write(&meta_path, &meta_bytes)?;
+        if self.fsync_on_write {
+            // Open the file we just wrote and fsync it
+            let file = std::fs::File::open(&meta_path)?;
+            file.sync_all()?;
+        }
         Ok(())
     }
 
@@ -458,6 +487,10 @@ pub struct PartitionManager {
     compression: CompressionLevel,
     /// Next partition ID
     next_partition_id: AtomicU64,
+    /// Whether to fsync after writing segment/meta files
+    fsync_on_write: bool,
+    /// Whether to use Direct I/O for segment files
+    direct_io_segments: bool,
 }
 
 impl PartitionManager {
@@ -482,6 +515,43 @@ impl PartitionManager {
             partitions: RwLock::new(Vec::new()),
             compression,
             next_partition_id: AtomicU64::new(0),
+            fsync_on_write: true,
+            direct_io_segments: false,
+        })
+    }
+
+    /// Create a new partition manager with IO options and load existing partitions
+    pub fn with_io_options(
+        data_dir: impl AsRef<Path>,
+        partition_duration: i64,
+        compression: CompressionLevel,
+        fsync_on_write: bool,
+        direct_io_segments: bool,
+    ) -> Result<Self> {
+        let manager = Self::with_io_options_empty(data_dir, partition_duration, compression, fsync_on_write, direct_io_segments)?;
+        manager.load_partitions()?;
+        Ok(manager)
+    }
+
+    /// Create a new partition manager with IO options without loading existing partitions.
+    pub fn with_io_options_empty(
+        data_dir: impl AsRef<Path>,
+        partition_duration: i64,
+        compression: CompressionLevel,
+        fsync_on_write: bool,
+        direct_io_segments: bool,
+    ) -> Result<Self> {
+        let data_dir = data_dir.as_ref().to_path_buf();
+        std::fs::create_dir_all(&data_dir)?;
+
+        Ok(Self {
+            data_dir,
+            partition_duration,
+            partitions: RwLock::new(Vec::new()),
+            compression,
+            next_partition_id: AtomicU64::new(0),
+            fsync_on_write,
+            direct_io_segments,
         })
     }
 
@@ -561,7 +631,14 @@ impl PartitionManager {
         let partition_id = self.next_partition_id.fetch_add(1, Ordering::SeqCst);
         let partition_dir = self.data_dir.join(format!("partition_{:08}", partition_id));
 
-        let partition = Partition::new(partition_id, &partition_dir, time_range, self.compression)?;
+        let partition = Partition::with_io_options(
+            partition_id,
+            &partition_dir,
+            time_range,
+            self.compression,
+            self.fsync_on_write,
+            self.direct_io_segments,
+        )?;
         partition.save_meta()?;
 
         let mut partitions = self.partitions.write();
@@ -759,5 +836,90 @@ mod tests {
             let results = partition.query(12345, &TimeRange::new(0, 100000)).unwrap();
             assert_eq!(results.len(), 100);
         }
+    }
+
+    #[test]
+    fn test_partition_with_fsync_enabled() {
+        let dir = TempDir::new().unwrap();
+        let time_range = TimeRange::new(0, 86400_000_000_000);
+
+        let partition = Partition::with_io_options(
+            0, dir.path(), time_range, CompressionLevel::Fast, true, false,
+        ).unwrap();
+
+        let points = create_test_points(1000, 50);
+        let tags = vec![Tag::new("host", "server01")];
+        let meta = partition.write_segment(12345, "cpu", &tags, &points).unwrap();
+
+        assert_eq!(meta.point_count, 50);
+
+        // Verify partition.meta was written and is readable
+        let meta_path = dir.path().join("partition.meta");
+        assert!(meta_path.exists());
+
+        // Reopen and verify
+        let reopened = Partition::open(dir.path()).unwrap();
+        assert_eq!(reopened.segment_count(), 1);
+    }
+
+    #[test]
+    fn test_partition_without_fsync() {
+        let dir = TempDir::new().unwrap();
+        let time_range = TimeRange::new(0, 86400_000_000_000);
+
+        let partition = Partition::with_io_options(
+            0, dir.path(), time_range, CompressionLevel::Fast, false, false,
+        ).unwrap();
+
+        let points = create_test_points(1000, 50);
+        let meta = partition.write_segment(12345, "cpu", &[], &points).unwrap();
+
+        assert_eq!(meta.point_count, 50);
+
+        // Verify data is still readable (just no fsync guarantee)
+        let results = partition.query(12345, &TimeRange::new(0, 100000)).unwrap();
+        assert_eq!(results.len(), 50);
+    }
+
+    #[test]
+    fn test_partition_with_direct_io_segments() {
+        let dir = TempDir::new().unwrap();
+        let time_range = TimeRange::new(0, 86400_000_000_000);
+
+        let partition = Partition::with_io_options(
+            0, dir.path(), time_range, CompressionLevel::Fast, true, true,
+        ).unwrap();
+
+        let points = create_test_points(1000, 100);
+        let meta = partition.write_segment(12345, "cpu", &[], &points).unwrap();
+
+        assert_eq!(meta.point_count, 100);
+
+        // Verify data integrity after Direct I/O write
+        let results = partition.query(12345, &TimeRange::new(0, 200000)).unwrap();
+        assert_eq!(results.len(), 100);
+    }
+
+    #[test]
+    fn test_partition_manager_with_io_options() {
+        let dir = TempDir::new().unwrap();
+        let duration = 3600_000_000_000_i64;
+
+        let manager = PartitionManager::with_io_options(
+            dir.path(), duration, CompressionLevel::Fast, false, true,
+        ).unwrap();
+
+        let p1 = manager.get_or_create_partition(1000).unwrap();
+        let p2 = manager.get_or_create_partition(duration + 1000).unwrap();
+
+        assert_eq!(manager.partition_count(), 2);
+        assert_ne!(p1.id(), p2.id());
+
+        // Write data through the partition
+        let points = create_test_points(1000, 30);
+        p1.write_segment(12345, "cpu", &[], &points).unwrap();
+
+        let results = p1.query(12345, &TimeRange::new(0, 100000)).unwrap();
+        assert_eq!(results.len(), 30);
     }
 }

@@ -47,6 +47,15 @@ pub struct StorageEngineConfig {
     pub partition_duration: i64,
     /// Compression level for segments
     pub compression: CompressionLevel,
+    /// fsync segment files and partition metadata after writes (default: true).
+    /// Disabling trades durability for write throughput.
+    pub fsync_on_write: bool,
+    /// Use Direct I/O (bypass OS page cache) for WAL files (default: false).
+    /// Reduces cache pollution on write-heavy workloads but requires aligned buffers.
+    /// On macOS this uses F_NOCACHE; on Linux it uses O_DIRECT.
+    pub direct_io_wal: bool,
+    /// Use Direct I/O (bypass OS page cache) for segment files (default: false).
+    pub direct_io_segments: bool,
 }
 
 impl Default for StorageEngineConfig {
@@ -59,6 +68,9 @@ impl Default for StorageEngineConfig {
             flush_trigger: FlushTrigger::default(),
             partition_duration: 24 * 60 * 60 * 1_000_000_000, // 1 day
             compression: CompressionLevel::Default,
+            fsync_on_write: true,
+            direct_io_wal: false,
+            direct_io_segments: false,
         }
     }
 }
@@ -105,16 +117,18 @@ impl StorageEngine {
             .clone()
             .unwrap_or_else(|| config.data_dir.join("wal"));
 
-        let wal = WalWriter::new(&wal_dir, config.wal_durability)?;
+        let wal = WalWriter::new(&wal_dir, config.wal_durability, config.direct_io_wal)?;
 
         // Create partition manager without loading partitions yet
         // We need to recover from WAL first so that corrupted partition data
         // is already in memtable before we try to load partitions
         let partitions_dir = config.data_dir.join("partitions");
-        let partitions = PartitionManager::new_empty(
+        let partitions = PartitionManager::with_io_options_empty(
             &partitions_dir,
             config.partition_duration,
             config.compression,
+            config.fsync_on_write,
+            config.direct_io_segments,
         )?;
 
         let active_memtable = Arc::new(MemTable::with_flush_trigger(config.flush_trigger.clone()));
@@ -1485,6 +1499,8 @@ impl StorageEngine {
         let partitions_dir = self.config.data_dir.join("partitions");
         let partition_duration = self.config.partition_duration;
         let compression = self.config.compression;
+        let fsync_on_write = self.config.fsync_on_write;
+        let direct_io_segments = self.config.direct_io_segments;
 
         thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -1494,7 +1510,7 @@ impl StorageEngine {
 
             rt.block_on(async move {
                 // Create a new partition manager for the flusher
-                let partitions = match PartitionManager::new(&partitions_dir, partition_duration, compression) {
+                let partitions = match PartitionManager::with_io_options(&partitions_dir, partition_duration, compression, fsync_on_write, direct_io_segments) {
                     Ok(p) => p,
                     Err(e) => {
                         error!("Failed to create partition manager in flusher: {}", e);

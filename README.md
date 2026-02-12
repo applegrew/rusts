@@ -69,6 +69,27 @@ Read Path:
 | Integers | Zigzag + Varint | 4-8x |
 | Strings | Dictionary encoding | 3-10x |
 
+### Storage I/O Tuning
+
+RusTs provides fine-grained control over storage I/O behavior for different durability/performance tradeoffs:
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `fsync_on_write` | `true` | fsync segment files and partition metadata after every write. Disabling trades durability for throughput. |
+| `direct_io_wal` | `false` | Bypass OS page cache for WAL files. Reduces cache pollution on write-heavy workloads. |
+| `direct_io_segments` | `false` | Bypass OS page cache for segment files. Useful when the working set exceeds available RAM. |
+
+**Direct I/O implementation:**
+- **macOS**: Uses `F_NOCACHE` via `fcntl` to disable the unified buffer cache per file descriptor.
+- **Linux**: Uses `posix_fadvise(POSIX_FADV_DONTNEED)` to advise the kernel to drop pages after writes.
+
+**When to enable Direct I/O:**
+- Write-heavy workloads where WAL/segment writes evict useful read cache entries.
+- Systems with limited RAM where page cache pollution degrades query performance.
+- SSD-backed storage where bypassing the cache avoids double-buffering.
+
+**Note:** Direct I/O is *not* applied to partition metadata files (`partition.meta`) since they are small and benefit from caching.
+
 ## Quick Start
 
 ### Prerequisites
@@ -132,6 +153,9 @@ storage:
     max_age_secs: 60
   partition_duration_hours: 24
   compression: default       # none, fast, default, best
+  fsync_on_write: true       # fsync segments & partition meta (default: true)
+  direct_io_wal: false       # Direct I/O for WAL (bypass page cache)
+  direct_io_segments: false  # Direct I/O for segment files
 
 auth:
   enabled: false

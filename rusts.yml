@@ -20,6 +20,15 @@ storage:
     out_of_order_lag_ms: 1000
   partition_duration_hours: 24
   compression: default
+  # fsync segment files and partition metadata after writes (default: true).
+  # Disabling trades durability for write throughput.
+  fsync_on_write: true
+  # Use Direct I/O (bypass OS page cache) for WAL files (default: false).
+  # Reduces cache pollution on write-heavy workloads. Uses F_NOCACHE on macOS,
+  # posix_fadvise(DONTNEED) on Linux.
+  direct_io_wal: false
+  # Use Direct I/O (bypass OS page cache) for segment files (default: false).
+  direct_io_segments: false
 auth:
   enabled: false
   jwt_secret: change-me-in-production

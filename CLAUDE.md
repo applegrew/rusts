@@ -54,7 +54,7 @@ The `rusts-endpoint-monitor-simulator` supports two modes:
 Server configuration is managed via `rusts.yml` (YAML). Key sections:
 
 - **server**: host, port, max_body_size, request_timeout
-- **storage**: data_dir, wal_dir, wal_durability, wal_retention_secs, memtable settings, compression
+- **storage**: data_dir, wal_dir, wal_durability, wal_retention_secs, memtable settings, compression, fsync_on_write, direct_io_wal, direct_io_segments
 - **auth**: enabled, jwt_secret, token_expiration
 - **logging**: level, show_target, show_thread_ids, show_location
 - **postgres**: enabled, host, port, max_connections (PostgreSQL wire protocol)
@@ -62,6 +62,12 @@ Server configuration is managed via `rusts.yml` (YAML). Key sections:
 WAL durability modes: `every_write`, `periodic`, `os_default`, `none`
 
 WAL retention: Set `wal_retention_secs` for automatic cleanup, or `null` to retain forever (for CDC)
+
+Storage I/O tuning:
+- `fsync_on_write` (default: true): fsync segment files and partition metadata after writes
+- `direct_io_wal` (default: false): bypass OS page cache for WAL (macOS: F_NOCACHE, Linux: posix_fadvise)
+- `direct_io_segments` (default: false): bypass OS page cache for segment files
+- Direct I/O is not applied to partition metadata (small files that benefit from caching)
 
 ## Crate Structure
 
