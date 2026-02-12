@@ -58,6 +58,7 @@ Server configuration is managed via `rusts.yml` (YAML). Key sections:
 - **auth**: enabled, jwt_secret, token_expiration
 - **logging**: level, show_target, show_thread_ids, show_location
 - **postgres**: enabled, host, port, max_connections (PostgreSQL wire protocol)
+- **telemetry**: enabled, otlp_endpoint, sample_interval_secs, export_interval_secs, service_name (OpenTelemetry)
 
 WAL durability modes: `every_write`, `periodic`, `os_default`, `none`
 
@@ -125,6 +126,7 @@ Query → Planner → Partition Pruner → Series Resolver → Parallel Scanner 
 - `crates/rusts-sql/src/translator.rs` - SQL to Query translation
 - `crates/rusts-pgwire/src/backend.rs` - PostgreSQL wire protocol handler
 - `crates/rusts-server/src/main.rs` - Server config parsing (rusts.yml)
+- `crates/rusts-server/src/telemetry.rs` - OpenTelemetry init, background CPU/mem sampler, OTLP export
 - `crates/rusts-importer/src/main.rs` - Data import CLI
 - `rusts.yml` - Default server configuration file
 

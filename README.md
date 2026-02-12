@@ -168,6 +168,13 @@ logging:
   show_thread_ids: false
   show_location: false
 
+telemetry:
+  enabled: false             # Enable OpenTelemetry export (default: false)
+  otlp_endpoint: "http://localhost:4317"  # OTLP gRPC collector endpoint
+  sample_interval_secs: 5   # CPU/memory sampling interval
+  export_interval_secs: 10  # Metric export interval
+  service_name: rusts        # Service name in traces/metrics
+
 retention_policies: []
 ```
 
@@ -620,6 +627,52 @@ Default MemTable flush triggers:
 - Age: 60 seconds
 
 Adjust via configuration for your workload.
+
+## Telemetry (OpenTelemetry)
+
+RusTs has built-in OpenTelemetry support for exporting metrics and distributed traces to any OTLP-compatible collector (Jaeger, Grafana Tempo, Prometheus via OTel Collector, etc.).
+
+### Design
+
+- **Zero overhead when disabled** (the default) — no providers are installed, no background threads spawned.
+- **Background CPU/memory sampler** — a dedicated OS thread samples `getrusage` / `/proc/self/statm` at a configurable interval (default 5 s), keeping the hot write/query paths free of syscalls.
+- **Batched OTLP export** — spans and metric points are batched and exported asynchronously on the Tokio runtime.
+- **Tracing integration** — a `tracing-opentelemetry` layer converts existing `tracing` spans into OTel spans automatically.
+
+### Exported Metrics
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `rusts.points_written` | Counter | Total data points written |
+| `rusts.write_latency_ms` | Histogram | Write request latency |
+| `rusts.queries_executed` | Counter | Total queries executed |
+| `rusts.query_latency_ms` | Histogram | Query latency |
+| `rusts.active_queries` | Gauge | Currently executing queries |
+| `rusts.memtable_flushes` | Counter | Memtable flush operations |
+| `rusts.wal_syncs` | Counter | WAL fsync operations |
+| `rusts.wal_bytes_written` | Counter | Bytes written to WAL |
+| `rusts.process.cpu_usage` | Gauge | Process CPU usage ratio |
+| `rusts.process.memory_rss_bytes` | Gauge | Process resident set size |
+
+### Exported Trace Spans
+
+| Span | Location | Description |
+|------|----------|-------------|
+| `storage.write_batch` | Storage engine | End-to-end write path |
+| `wal.write` | WAL writer | WAL serialization + disk write |
+| `storage.rotate_memtable` | Storage engine | Memtable rotation |
+| `storage.flush` | Background flusher | Memtable flush to segments |
+
+### Quick Start
+
+```yaml
+# rusts.yml
+telemetry:
+  enabled: true
+  otlp_endpoint: "http://localhost:4317"
+```
+
+Then run an OTel Collector (e.g. `docker run -p 4317:4317 otel/opentelemetry-collector`) and start the server.
 
 ## PostgreSQL Wire Protocol
 

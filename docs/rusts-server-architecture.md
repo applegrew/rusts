@@ -9,6 +9,7 @@ The `rusts-server` crate is the main entry point for the RusTs time series datab
 ```
 src/
 ├── main.rs         # Main entry point and configuration
+├── telemetry.rs    # OpenTelemetry init, background CPU/mem sampler, OTLP export
 benches/
 ├── ingestion.rs    # Ingestion benchmarks
 └── query.rs        # Query benchmarks
@@ -24,6 +25,8 @@ pub struct ServerConfig {
     pub storage: StorageSettings,
     pub auth: AuthSettings,
     pub logging: LoggingSettings,
+    pub postgres: PostgresSettings,
+    pub telemetry: TelemetrySettings,
     pub retention_policies: Vec<RetentionPolicyConfig>,
 }
 ```
@@ -85,6 +88,18 @@ pub struct LoggingSettings {
     pub show_target: bool,          // Default: true
     pub show_thread_ids: bool,      // Default: false
     pub show_location: bool,        // Default: false
+}
+```
+
+### TelemetrySettings (telemetry.rs)
+
+```rust
+pub struct TelemetrySettings {
+    pub enabled: bool,              // Default: false
+    pub otlp_endpoint: String,      // Default: "http://localhost:4317"
+    pub sample_interval_secs: u64,  // Default: 5
+    pub export_interval_secs: u64,  // Default: 10
+    pub service_name: String,       // Default: "rusts"
 }
 ```
 

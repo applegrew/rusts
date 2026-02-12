@@ -9,6 +9,7 @@ use axum::{
     http::HeaderMap,
     response::Json,
 };
+use opentelemetry::metrics::{Counter, Gauge, Histogram};
 use parking_lot::RwLock;
 use rusts_core::{ParallelConfig, TimeRange};
 use rusts_index::{SeriesIndex, TagIndex};
@@ -84,6 +85,24 @@ impl Default for StartupState {
     }
 }
 
+/// Metrics handles for recording telemetry from API handlers.
+///
+/// All fields are OTel instrument handles which are internally `Arc`-ed and
+/// lock-free, so cloning and recording is extremely cheap (a few atomics).
+#[derive(Clone)]
+pub struct ServerMetrics {
+    pub points_written: Counter<u64>,
+    pub write_latency_ms: Histogram<f64>,
+    pub queries_executed: Counter<u64>,
+    pub query_latency_ms: Histogram<f64>,
+    pub active_queries: Gauge<i64>,
+    pub memtable_flushes: Counter<u64>,
+    pub wal_syncs: Counter<u64>,
+    pub wal_bytes_written: Counter<u64>,
+    pub process_cpu_usage: Gauge<f64>,
+    pub process_memory_rss: Gauge<i64>,
+}
+
 /// Application state shared across handlers
 pub struct AppState {
     pub storage: RwLock<Option<Arc<StorageEngine>>>,
@@ -94,6 +113,8 @@ pub struct AppState {
     pub query_timeout: Duration,
     pub startup_state: Arc<StartupState>,
     pub parallel_config: ParallelConfig,
+    /// Optional telemetry metrics (None when telemetry is disabled).
+    pub metrics: Option<ServerMetrics>,
 }
 
 impl AppState {
@@ -125,6 +146,7 @@ impl AppState {
             query_timeout,
             startup_state,
             parallel_config,
+            metrics: None,
         }
     }
 
@@ -144,7 +166,13 @@ impl AppState {
             query_timeout,
             startup_state,
             parallel_config,
+            metrics: None,
         }
+    }
+
+    /// Set telemetry metrics handles.
+    pub fn set_metrics(&mut self, metrics: ServerMetrics) {
+        self.metrics = Some(metrics);
     }
 
     /// Set the storage engine once it's initialized
@@ -230,6 +258,8 @@ pub async fn write(
     State(state): State<Arc<AppState>>,
     body: String,
 ) -> std::result::Result<Json<WriteResponse>, ApiError> {
+    let start = Instant::now();
+
     // Check if storage is ready
     let storage = state.get_storage().ok_or_else(|| {
         let phase = state.startup_state.phase();
@@ -254,12 +284,20 @@ pub async fn write(
         state.tag_index.index_series(series_id, &point.tags);
     }
 
+    let count = points.len();
+
     // Write to storage
     storage.write_batch(&points)?;
 
+    // Record metrics (no-op when telemetry is disabled)
+    if let Some(m) = &state.metrics {
+        m.points_written.add(count as u64, &[]);
+        m.write_latency_ms.record(start.elapsed().as_secs_f64() * 1000.0, &[]);
+    }
+
     Ok(Json(WriteResponse {
         success: true,
-        points_written: points.len(),
+        points_written: count,
         errors: parse_errors,
     }))
 }
@@ -323,6 +361,11 @@ pub async fn query(
     // Acquire semaphore permit (Layer 3: concurrent query limit)
     let _permit = state.query_semaphore.acquire().await
         .map_err(|_| ApiError::Internal("Query semaphore closed".to_string()))?;
+
+    // Track active queries
+    if let Some(m) = &state.metrics {
+        m.active_queries.record(1, &[]);
+    }
 
     // Build query
     let time_range = req.time_range.map(|tr| TimeRange::new(tr.start, tr.end))
@@ -432,11 +475,20 @@ pub async fn query(
         })
         .collect();
 
+    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+    // Record metrics
+    if let Some(m) = &state.metrics {
+        m.queries_executed.add(1, &[]);
+        m.query_latency_ms.record(elapsed_ms, &[]);
+        m.active_queries.record(-1, &[]);
+    }
+
     Ok(Json(QueryResponse {
         measurement: result.measurement,
         results,
         total_rows: result.total_rows,
-        execution_time_ms: start.elapsed().as_secs_f64() * 1000.0,
+        execution_time_ms: elapsed_ms,
     }))
 }
 

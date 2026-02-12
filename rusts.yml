@@ -43,4 +43,16 @@ postgres:
   host: 0.0.0.0
   port: 5432
   max_connections: 100
+telemetry:
+  # Enable OpenTelemetry metrics and trace export (default: false).
+  # When disabled, zero overhead — no providers are installed.
+  enabled: false
+  # OTLP gRPC endpoint for the OpenTelemetry Collector.
+  otlp_endpoint: "http://localhost:4317"
+  # How often the background thread samples process CPU / memory (seconds).
+  sample_interval_secs: 5
+  # OTLP metric export interval (seconds).
+  export_interval_secs: 10
+  # Service name reported to the collector.
+  service_name: rusts
 retention_policies: []

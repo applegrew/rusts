@@ -179,6 +179,8 @@ impl StorageEngine {
             return Ok(());
         }
 
+        let _span = tracing::info_span!("storage.write_batch", points = points.len()).entered();
+
         // Validate points
         for point in points {
             point.validate()?;
@@ -1463,6 +1465,7 @@ impl StorageEngine {
 
     /// Rotate the active memtable (make it immutable and create new active)
     fn rotate_memtable(&self) -> Result<()> {
+        let _span = tracing::info_span!("storage.rotate_memtable").entered();
         // Get the current WAL sequence before rotation
         // All data in this memtable was written at or before this sequence
         let wal_sequence = self.wal.sequence();
@@ -1614,6 +1617,7 @@ impl StorageEngine {
 
 /// Flush a memtable to partitions
 fn flush_memtable_to_partitions(memtable: &MemTable, partitions: &PartitionManager) -> Result<()> {
+    let _span = tracing::info_span!("storage.flush", points = memtable.point_count()).entered();
     for (series_id, measurement, tags, points) in memtable.iter_series() {
         if points.is_empty() {
             continue;

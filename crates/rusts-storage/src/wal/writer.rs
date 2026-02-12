@@ -232,6 +232,8 @@ impl WalWriter {
             return Ok(self.sequence.load(Ordering::SeqCst));
         }
 
+        let _span = tracing::info_span!("wal.write", points = points.len()).entered();
+
         // Pre-serialize points OUTSIDE the lock to reduce contention
         let data = bincode::serialize(points)?;
 

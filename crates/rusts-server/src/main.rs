@@ -9,6 +9,8 @@
 //!   --port <PORT>       HTTP port (overrides config)
 //!   --host <HOST>       Bind address (overrides config)
 
+mod telemetry;
+
 use rusts_api::auth::AuthConfig;
 use rusts_api::{create_router, handlers::AppState, StartupPhase, StartupState};
 use rusts_core::ParallelConfig;
@@ -18,10 +20,10 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use telemetry::TelemetrySettings;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, Level};
-use tracing_subscriber::FmtSubscriber;
 
 /// Complete server configuration - can be loaded from YAML
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,6 +41,8 @@ pub struct ServerConfig {
     pub parallel: ParallelSettings,
     /// PostgreSQL wire protocol configuration
     pub postgres: PostgresSettings,
+    /// Telemetry / OpenTelemetry configuration
+    pub telemetry: TelemetrySettings,
     /// Retention policies
     #[serde(default)]
     pub retention_policies: Vec<RetentionPolicyConfig>,
@@ -275,6 +279,7 @@ impl Default for ServerConfig {
             logging: LoggingSettings::default(),
             parallel: ParallelSettings::default(),
             postgres: PostgresSettings::default(),
+            telemetry: TelemetrySettings::default(),
             retention_policies: Vec::new(),
         }
     }
@@ -530,18 +535,21 @@ async fn main() -> anyhow::Result<()> {
         config.server.port = port;
     }
 
-    // Initialize logging
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(config.log_level())
-        .with_target(config.logging.show_target)
-        .with_thread_ids(config.logging.show_thread_ids)
-        .with_file(config.logging.show_location)
-        .with_line_number(config.logging.show_location)
-        .finish();
-
-    tracing::subscriber::set_global_default(subscriber).expect("Failed to set subscriber");
+    // Initialize telemetry (logging + optional OTel traces/metrics)
+    let (telemetry_guard, server_metrics) = telemetry::init(
+        &config.telemetry,
+        config.log_level(),
+        config.logging.show_target,
+        config.logging.show_thread_ids,
+        config.logging.show_location,
+    )?;
 
     info!("Starting RusTs v{}", env!("CARGO_PKG_VERSION"));
+    if config.telemetry.enabled {
+        info!("Telemetry enabled — exporting to {}", config.telemetry.otlp_endpoint);
+    } else {
+        info!("Telemetry disabled (set telemetry.enabled: true to enable)");
+    }
     info!("Data directory: {:?}", config.storage.data_dir);
     info!("WAL durability: {}", config.storage.wal_durability);
     if let Some(retention) = config.storage.wal_retention_secs {
@@ -570,12 +578,16 @@ async fn main() -> anyhow::Result<()> {
 
     // Create application state in initializing mode (no storage yet)
     // This allows health/ready endpoints to respond immediately
-    let app_state = Arc::new(AppState::new_initializing(
+    let mut app_state_inner = AppState::new_initializing(
         query_timeout,
         max_concurrent_queries,
         Arc::clone(&startup_state),
         parallel_config,
-    ));
+    );
+    if let Some(metrics) = server_metrics {
+        app_state_inner.set_metrics(metrics);
+    }
+    let app_state = Arc::new(app_state_inner);
 
     // Create router with request timeout
     let request_timeout = std::time::Duration::from_secs(config.server.request_timeout_secs);
@@ -712,6 +724,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Run server
     axum::serve(listener, app).await?;
+
+    // Flush telemetry on clean exit
+    telemetry_guard.shutdown();
 
     Ok(())
 }
