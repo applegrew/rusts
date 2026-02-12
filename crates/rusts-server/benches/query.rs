@@ -5,6 +5,7 @@ use rusts_index::{SeriesIndex, TagIndex};
 use rusts_query::{AggregateFunction, Query, QueryExecutor};
 use rusts_storage::{StorageEngine, StorageEngineConfig, WalDurability};
 use std::sync::Arc;
+use std::time::Duration;
 use tempfile::TempDir;
 
 struct BenchEnv {
@@ -100,6 +101,10 @@ fn bench_select_limit(c: &mut Criterion) {
 
 fn bench_count_star(c: &mut Criterion) {
     let mut group = c.benchmark_group("query_agg");
+    // COUNT(*) is relatively expensive; keep samples low to avoid long runs.
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(30));
+    group.warm_up_time(Duration::from_secs(5));
 
     group.bench_function("count_star", |b| {
         b.iter_batched(
@@ -113,7 +118,7 @@ fn bench_count_star(c: &mut Criterion) {
                 let _ = black_box(env.executor.execute(black_box(query)).unwrap());
                 env
             },
-            BatchSize::SmallInput,
+            BatchSize::LargeInput,
         )
     });
 
