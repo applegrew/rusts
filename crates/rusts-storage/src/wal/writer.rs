@@ -14,8 +14,9 @@ use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+use tracing::warn;
 
 /// WAL durability modes
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,7 +116,7 @@ pub struct WalWriter {
     /// Group commit configuration
     group_commit: GroupCommitConfig,
     /// Whether to use Direct I/O (bypass OS page cache)
-    direct_io: bool,
+    direct_io: AtomicBool,
 }
 
 impl WalWriter {
@@ -143,8 +144,9 @@ impl WalWriter {
             .append(true)
             .open(&file_path)?;
 
-        if direct_io {
-            Self::apply_direct_io(&file);
+        let mut direct_io_enabled = direct_io;
+        if direct_io_enabled && !Self::apply_direct_io(&file) {
+            direct_io_enabled = false;
         }
 
         let current_size = file.metadata()?.len();
@@ -161,25 +163,52 @@ impl WalWriter {
             pending_bytes: AtomicUsize::new(0),
             pending_entries: AtomicUsize::new(0),
             group_commit,
-            direct_io,
+            direct_io: AtomicBool::new(direct_io_enabled),
         })
     }
 
     /// Apply Direct I/O hint to a file descriptor.
     /// On macOS: F_NOCACHE disables the unified buffer cache.
     /// On Linux: posix_fadvise with DONTNEED advises the kernel to drop pages.
-    fn apply_direct_io(file: &File) {
+    /// Returns true if Direct I/O was applied successfully.
+    fn apply_direct_io(file: &File) -> bool {
         #[cfg(target_os = "macos")]
         {
             use std::os::unix::io::AsRawFd;
             let fd = file.as_raw_fd();
-            unsafe { libc::fcntl(fd, libc::F_NOCACHE, 1) };
+            let rc = unsafe { libc::fcntl(fd, libc::F_NOCACHE, 1) };
+            if rc == -1 {
+                let err = std::io::Error::last_os_error();
+                warn!(
+                    "Direct I/O requested but F_NOCACHE failed: {}. Falling back to buffered IO.",
+                    err
+                );
+                return false;
+            }
+            return true;
         }
         #[cfg(target_os = "linux")]
         {
             use std::os::unix::io::AsRawFd;
             let fd = file.as_raw_fd();
-            unsafe { libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_DONTNEED) };
+            let rc = unsafe { libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_DONTNEED) };
+            if rc != 0 {
+                let err = std::io::Error::from_raw_os_error(rc);
+                warn!(
+                    "Direct I/O requested but posix_fadvise failed: {}. Falling back to buffered IO.",
+                    err
+                );
+                return false;
+            }
+            return true;
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            let _ = file;
+            warn!(
+                "Direct I/O requested but is not supported on this OS. Falling back to buffered IO."
+            );
+            false
         }
     }
 
@@ -310,8 +339,8 @@ impl WalWriter {
             .append(true)
             .open(&file_path)?;
 
-        if self.direct_io {
-            Self::apply_direct_io(&new_file);
+        if self.direct_io.load(Ordering::Relaxed) && !Self::apply_direct_io(&new_file) {
+            self.direct_io.store(false, Ordering::Relaxed);
         }
 
         let mut file = self.file.lock();

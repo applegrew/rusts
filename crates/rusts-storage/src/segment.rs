@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use tracing::warn;
 
 /// Segment file magic number
 const SEGMENT_MAGIC: [u8; 4] = [0x52, 0x54, 0x53, 0x53]; // "RTSS"
@@ -184,6 +185,51 @@ impl SegmentWriter {
         }
     }
 
+    /// Apply Direct I/O hint to a file descriptor.
+    /// On macOS: F_NOCACHE disables the unified buffer cache.
+    /// On Linux: posix_fadvise with DONTNEED advises the kernel to drop pages.
+    /// Returns true if Direct I/O was applied successfully.
+    fn apply_direct_io(file: &File) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = file.as_raw_fd();
+            let rc = unsafe { libc::fcntl(fd, libc::F_NOCACHE, 1) };
+            if rc == -1 {
+                let err = std::io::Error::last_os_error();
+                warn!(
+                    "Direct I/O requested but F_NOCACHE failed: {}. Falling back to buffered IO.",
+                    err
+                );
+                return false;
+            }
+            return true;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = file.as_raw_fd();
+            let rc = unsafe { libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_DONTNEED) };
+            if rc != 0 {
+                let err = std::io::Error::from_raw_os_error(rc);
+                warn!(
+                    "Direct I/O requested but posix_fadvise failed: {}. Falling back to buffered IO.",
+                    err
+                );
+                return false;
+            }
+            return true;
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            let _ = file;
+            warn!(
+                "Direct I/O requested but is not supported on this OS. Falling back to buffered IO."
+            );
+            false
+        }
+    }
+
     /// Write a segment from MemTable points
     pub fn write(
         &mut self,
@@ -286,23 +332,8 @@ impl SegmentWriter {
 
         writer.flush()?;
 
-        if self.direct_io {
-            // For Direct I/O, set F_NOCACHE on macOS or O_DIRECT on Linux
-            // after writing to bypass the page cache
-            #[cfg(target_os = "macos")]
-            {
-                use std::os::unix::io::AsRawFd;
-                let fd = writer.get_ref().as_raw_fd();
-                unsafe { libc::fcntl(fd, libc::F_NOCACHE, 1) };
-            }
-            // On Linux, O_DIRECT requires opening with the flag from the start
-            // and aligned writes. For segments we use posix_fadvise instead.
-            #[cfg(target_os = "linux")]
-            {
-                use std::os::unix::io::AsRawFd;
-                let fd = writer.get_ref().as_raw_fd();
-                unsafe { libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_DONTNEED) };
-            }
+        if self.direct_io && !Self::apply_direct_io(writer.get_ref()) {
+            self.direct_io = false;
         }
 
         if self.fsync_on_write {
