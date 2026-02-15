@@ -2,7 +2,7 @@
 
 ## Overview
 
-The `rusts-query` crate implements the query engine for the RusTs time series database. It provides query building, planning, optimization, and execution with support for aggregations, time bucketing, and tag filtering.
+The `rusts-query` crate implements the query engine for the RusTs time series database. It provides query building, planning, optimization, and execution with support for aggregations, time bucketing, tag filtering, and window functions.
 
 ## Module Structure
 
@@ -13,7 +13,8 @@ src/
 ├── model.rs        # Query data structures and builders
 ├── planner.rs      # Query planning and optimization
 ├── executor.rs     # Query execution engine
-└── aggregation.rs  # Aggregation functions
+├── aggregation.rs  # Aggregation functions
+└── window.rs       # Window function evaluation engine
 ```
 
 ## Query Model (model.rs)
@@ -59,6 +60,7 @@ pub struct Query {
     pub order_by: Option<(String, bool)>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
+    pub window_functions: Vec<WindowFunction>,
 }
 ```
 
@@ -79,6 +81,7 @@ Query::builder("measurement")
     .order_by(field, ascending)
     .limit(n)
     .offset(n)
+    .window_function(wf)
     .build()?
 ```
 
@@ -221,7 +224,7 @@ Main execution engine with access to storage, series index, and tag index.
 ```
 Query Input
     ↓
-execute() [line 42-73]
+execute()
     ├─ query.validate()
     ├─ planner.plan(query)
     ├─ optimizer.optimize(plan)
@@ -229,6 +232,7 @@ execute() [line 42-73]
     └─ Execute based on FieldSelection
         ├─ All/Fields → execute_select()
         └─ Aggregate → execute_aggregate()
+    ├─ evaluate_window_functions() (if any)
     ├─ apply_limit_offset()
     └─ QueryResult
 ```
@@ -373,6 +377,9 @@ pub enum QueryError {
     Execution(String),
     Parse(String),
     TypeMismatch { expected, actual },
+    Timeout(u64),
+    Cancelled,
+    WindowError(String),
 }
 ```
 
@@ -395,6 +402,71 @@ pub enum QueryError {
 | StorageEngine | Query points by series_id and time range |
 | SeriesIndex | Lookup series metadata, get series by measurement |
 | TagIndex | Find series IDs matching tag filters |
+
+## Window Functions (window.rs)
+
+Window functions compute per-row values without collapsing rows (unlike GROUP BY aggregations). They are evaluated as a post-processing step on the full result set, after data retrieval but before LIMIT/OFFSET.
+
+### Supported Window Functions
+
+| Category | Functions |
+|----------|----------|
+| Ranking | ROW_NUMBER, RANK, DENSE_RANK |
+| Row Navigation | LAG(field, offset, default), LEAD(field, offset, default) |
+| Aggregate Windows | SUM, AVG, COUNT, MIN, MAX, FIRST, LAST, STDDEV, VARIANCE, PERCENTILE over frames |
+
+### Window Function Model
+
+```rust
+pub struct WindowFunction {
+    pub function: WindowFunctionType,
+    pub partition_by: Vec<String>,
+    pub order_by: Vec<(String, bool)>,
+    pub frame: Option<WindowFrame>,
+    pub alias: String,
+}
+
+pub enum WindowFunctionType {
+    RowNumber,
+    Rank,
+    DenseRank,
+    Lag { field: String, offset: usize, default: Option<FieldValue> },
+    Lead { field: String, offset: usize, default: Option<FieldValue> },
+    Aggregate(AggregateFunction),
+}
+
+pub struct WindowFrame {
+    pub units: WindowFrameUnits,  // Rows or Range
+    pub start: WindowFrameBound,
+    pub end: WindowFrameBound,
+}
+
+pub enum WindowFrameBound {
+    UnboundedPreceding,
+    Preceding(usize),
+    CurrentRow,
+    Following(usize),
+    UnboundedFollowing,
+}
+```
+
+### Evaluation Pipeline
+
+```
+Result Rows
+    ↓
+build_partitions()     → Group rows by PARTITION BY columns
+    ↓
+sort_partition()       → Sort each partition by ORDER BY columns
+    ↓
+evaluate_over_partition() → Compute window function per row
+    ↓
+Write computed values into row.fields[alias]
+```
+
+### NULL Handling
+
+`FieldValue` has no `Null` variant. NULL is represented by **absence** from the `fields` HashMap. For LAG/LEAD with no default, the alias key is simply not inserted for out-of-range rows.
 
 ## Public API
 

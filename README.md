@@ -776,6 +776,14 @@ curl -X POST 'http://localhost:8086/sql' \
 # Time range filtering
 curl -X POST 'http://localhost:8086/sql' \
   -d "SELECT * FROM cpu WHERE time >= '2024-01-01' AND time < '2024-01-02'"
+
+# Window functions
+curl -X POST 'http://localhost:8086/sql' \
+  -d "SELECT *, ROW_NUMBER() OVER (ORDER BY time) AS rn FROM cpu"
+
+# Running total
+curl -X POST 'http://localhost:8086/sql' \
+  -d "SELECT *, SUM(usage) OVER (ORDER BY time ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_sum FROM cpu"
 ```
 
 ### Supported SQL Features
@@ -795,11 +803,18 @@ curl -X POST 'http://localhost:8086/sql' \
 | GROUP BY tags | `GROUP BY host, region` |
 | ORDER BY | `ORDER BY time DESC` |
 | LIMIT/OFFSET | `LIMIT 100 OFFSET 50` |
+| Window functions | `ROW_NUMBER() OVER (ORDER BY time)` |
+| Ranking | `RANK() OVER (PARTITION BY host ORDER BY time)` |
+| LAG/LEAD | `LAG(usage, 1) OVER (ORDER BY time)` |
+| Running aggregates | `SUM(usage) OVER (ORDER BY time ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)` |
+| Moving averages | `AVG(usage) OVER (ORDER BY time ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)` |
 | Show tables | `SHOW TABLES` |
 
 **Supported aggregate functions:** COUNT, SUM, AVG/MEAN, MIN, MAX, FIRST, LAST, STDDEV, VARIANCE, PERCENTILE_N
 
-**Not supported (v1):** JOINs, subqueries, CTEs, window functions, UNION
+**Supported window functions:** ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD, plus all aggregate functions with OVER clause
+
+**Not supported:** JOINs, subqueries, CTEs, UNION, named windows (`WINDOW w AS ...`)
 
 ### SHOW TABLES
 
@@ -828,6 +843,7 @@ curl -X POST 'http://localhost:8086/sql' -d "SHOW TABLES"
   - [x] /sql API endpoint
   - [x] Documentation and examples
   - [x] OR-clause support (AND/OR/NOT filter expressions)
+  - [x] Window functions (ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD, aggregate OVER)
   - [ ] DataFusion integration (future)
 - [x] PostgreSQL wire protocol
   - [x] pgwire crate integration

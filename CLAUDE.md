@@ -78,7 +78,7 @@ crates/
 ├── rusts-compression/    # Gorilla XOR, delta-of-delta, dictionary, LZ4/Zstd compression
 ├── rusts-storage/        # WAL, MemTable, Segment, Partition, StorageEngine
 ├── rusts-index/          # Series index, Tag index (Roaring bitmaps), Bloom filters
-├── rusts-query/          # Query model, planner, executor, aggregation functions
+├── rusts-query/          # Query model, planner, executor, aggregation functions, window functions
 ├── rusts-api/            # REST API, line protocol parser, auth, rate limiting
 ├── rusts-sql/            # SQL query interface (sqlparser-rs, AST to Query translation)
 ├── rusts-pgwire/         # PostgreSQL wire protocol (pgwire crate, psql/DataGrip compatibility)
@@ -121,6 +121,7 @@ Query → Planner → Partition Pruner → Series Resolver → Parallel Scanner 
 - `crates/rusts-compression/src/float.rs` - Gorilla XOR compression
 - `crates/rusts-compression/src/timestamp.rs` - Delta-of-delta encoding
 - `crates/rusts-query/src/executor.rs` - Query execution
+- `crates/rusts-query/src/window.rs` - Window function evaluation engine
 - `crates/rusts-api/src/line_protocol.rs` - InfluxDB line protocol parser
 - `crates/rusts-api/src/router.rs` - Axum REST API routes
 - `crates/rusts-sql/src/translator.rs` - SQL to Query translation

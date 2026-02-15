@@ -85,8 +85,10 @@ pub enum SqlCommand {
 
 Maps SQL functions to RusTs operations:
 
+**Aggregate functions:**
+
 | SQL Function | RusTs Aggregate |
-|--------------|-----------------|
+|--------------|------------------|
 | COUNT | AggregateFunction::Count |
 | SUM | AggregateFunction::Sum |
 | AVG, MEAN, AVERAGE | AggregateFunction::Mean |
@@ -97,6 +99,18 @@ Maps SQL functions to RusTs operations:
 | STDDEV, STDDEV_SAMP | AggregateFunction::StdDev |
 | VARIANCE, VAR_SAMP | AggregateFunction::Variance |
 | PERCENTILE_N | AggregateFunction::Percentile(N) |
+
+**Window-only functions** (require OVER clause):
+
+| SQL Function | WindowFunctionType |
+|--------------|--------------------|
+| ROW_NUMBER() | WindowFunctionType::RowNumber |
+| RANK() | WindowFunctionType::Rank |
+| DENSE_RANK() | WindowFunctionType::DenseRank |
+| LAG(field, offset, default) | WindowFunctionType::Lag |
+| LEAD(field, offset, default) | WindowFunctionType::Lead |
+
+Aggregate functions (SUM, AVG, etc.) can also be used as window functions when combined with an OVER clause.
 
 Time functions:
 - `now()` - Returns current timestamp in nanoseconds
@@ -137,6 +151,13 @@ SELECT AVG(usage) AS avg_usage FROM cpu
 
 -- Time bucketing
 SELECT time_bucket('1h', time), AVG(usage) FROM cpu GROUP BY 1
+
+-- Window functions
+SELECT *, ROW_NUMBER() OVER (ORDER BY time) AS rn FROM cpu
+SELECT *, RANK() OVER (PARTITION BY host ORDER BY time DESC) AS rnk FROM cpu
+SELECT LAG(usage, 1) OVER (ORDER BY time) AS prev_usage FROM cpu
+SELECT SUM(usage) OVER (ORDER BY time ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_sum FROM cpu
+SELECT AVG(usage) OVER (ORDER BY time ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS moving_avg FROM cpu
 ```
 
 ### FROM Clause
@@ -167,11 +188,17 @@ SELECT * FROM cpu WHERE host IS NOT NULL
 -- Time range
 SELECT * FROM cpu WHERE time >= '2024-01-01' AND time < '2024-01-02'
 
--- Combined filters (AND only)
+-- Combined filters
 SELECT * FROM cpu WHERE host = 'server01' AND region = 'us-west'
+
+-- OR conditions
+SELECT * FROM cpu WHERE host = 'server01' OR host = 'server02'
+
+-- Nested AND/OR
+SELECT * FROM cpu WHERE (host = 'a' OR host = 'b') AND region = 'us-west'
 ```
 
-**Not Supported:** OR conditions, nested subqueries
+**Not Supported:** Nested subqueries
 
 ### GROUP BY Clause
 
@@ -316,11 +343,13 @@ vec![
 
 SELECT items map to FieldSelection:
 
-| SQL | FieldSelection |
-|-----|----------------|
-| `*` | FieldSelection::All |
-| `field1, field2` | FieldSelection::Fields(vec!["field1", "field2"]) |
-| `AVG(field)` | FieldSelection::Aggregate { field, function, alias } |
+| SQL | FieldSelection | Window Functions |
+|-----|----------------|------------------|
+| `*` | FieldSelection::All | — |
+| `field1, field2` | FieldSelection::Fields(vec!["field1", "field2"]) | — |
+| `AVG(field)` | FieldSelection::Aggregate { field, function, alias } | — |
+| `ROW_NUMBER() OVER (...)` | FieldSelection::All | Vec<WindowFunction> |
+| `field, SUM(field) OVER (...)` | FieldSelection::Fields | Vec<WindowFunction> |
 
 ## Dependencies
 
@@ -371,11 +400,11 @@ curl -X POST http://localhost:8086/sql \
 ## Limitations
 
 1. **No JOINs** - Time series data model doesn't support joins
-2. **No OR conditions** - Only AND conjunctions in WHERE clause
-3. **No subqueries** - Flat query structure only
-4. **No UNION/INTERSECT/EXCEPT** - Single query only
-5. **Single aggregate per query** - First aggregate function used
-6. **No window functions** - Use time_bucket for time-based aggregation
+2. **No subqueries** - Flat query structure only
+3. **No UNION/INTERSECT/EXCEPT** - Single query only
+4. **Single aggregate per query** - First aggregate function used (when not using window functions)
+5. **No named windows** - `WINDOW w AS (...)` syntax is not supported
+6. **No GROUPS frame unit** - Only ROWS and RANGE frame units are supported
 
 ## Testing
 
