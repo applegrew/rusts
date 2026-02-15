@@ -405,6 +405,7 @@ mod tests {
             order_by: None,
             limit: None,
             offset: None,
+            window_functions: Vec::new(),
         };
 
         // This should not panic

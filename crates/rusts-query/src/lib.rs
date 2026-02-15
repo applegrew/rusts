@@ -11,6 +11,7 @@ pub mod error;
 pub mod executor;
 pub mod model;
 pub mod planner;
+pub mod window;
 
 pub use aggregation::{AggregateFunction, Aggregator};
 pub use error::{QueryError, Result};

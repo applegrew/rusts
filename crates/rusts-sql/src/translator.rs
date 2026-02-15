@@ -5,11 +5,15 @@
 use crate::error::{Result, SqlError};
 use crate::functions::FunctionRegistry;
 use rusts_core::TimeRange;
+use rusts_core::FieldValue;
+use rusts_query::model::{
+    WindowFrame, WindowFrameBound, WindowFrameUnits, WindowFunction, WindowFunctionType,
+};
 use rusts_query::{AggregateFunction, FieldSelection, FilterExpr, Query, TagFilter};
 use sqlparser::ast::{
     BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
     LimitClause, ObjectName, OrderBy, OrderByExpr, OrderByKind, Query as SqlQuery, SelectItem,
-    SetExpr, Statement, TableFactor, TableWithJoins, Value,
+    SetExpr, Statement, TableFactor, TableWithJoins, Value, WindowType,
 };
 use tracing::debug;
 
@@ -358,8 +362,9 @@ impl SqlTranslator {
             }
         }
 
-        // Process SELECT clause for field selection and aggregations
-        let (field_selection, group_by_time) = Self::extract_select_items(&select.projection)?;
+        // Process SELECT clause for field selection, aggregations, and window functions
+        let (field_selection, group_by_time, window_functions) =
+            Self::extract_select_items(&select.projection)?;
         debug!("Field selection: {:?}", field_selection);
 
         match field_selection {
@@ -374,6 +379,11 @@ impl SqlTranslator {
             } => {
                 builder = builder.select_aggregate(field, function, alias);
             }
+        }
+
+        // Add window functions
+        for wf in window_functions {
+            builder = builder.window_function(wf);
         }
 
         // Process GROUP BY clause
@@ -665,10 +675,13 @@ impl SqlTranslator {
         }
     }
 
-    /// Extract SELECT items and determine field selection
-    fn extract_select_items(items: &[SelectItem]) -> Result<(FieldSelection, Option<i64>)> {
+    /// Extract SELECT items and determine field selection + window functions
+    fn extract_select_items(
+        items: &[SelectItem],
+    ) -> Result<(FieldSelection, Option<i64>, Vec<WindowFunction>)> {
         let mut fields: Vec<String> = Vec::new();
         let mut aggregates: Vec<(String, AggregateFunction, Option<String>)> = Vec::new();
+        let mut window_functions: Vec<WindowFunction> = Vec::new();
         let mut group_by_time: Option<i64> = None;
         let mut has_star = false;
 
@@ -683,6 +696,7 @@ impl SqlTranslator {
                         None,
                         &mut fields,
                         &mut aggregates,
+                        &mut window_functions,
                         &mut group_by_time,
                     )?;
                 }
@@ -692,6 +706,7 @@ impl SqlTranslator {
                         Some(&alias.value),
                         &mut fields,
                         &mut aggregates,
+                        &mut window_functions,
                         &mut group_by_time,
                     )?;
                 }
@@ -702,7 +717,7 @@ impl SqlTranslator {
         // Determine field selection
         let field_selection = if has_star && aggregates.is_empty() && fields.is_empty() {
             FieldSelection::All
-        } else if !aggregates.is_empty() {
+        } else if !aggregates.is_empty() && window_functions.is_empty() {
             // Use first aggregate (we'll need to support multiple in future)
             let (field, function, alias) = aggregates.into_iter().next().unwrap();
             FieldSelection::Aggregate {
@@ -710,13 +725,18 @@ impl SqlTranslator {
                 function,
                 alias,
             }
-        } else if !fields.is_empty() {
-            FieldSelection::Fields(fields)
+        } else if !fields.is_empty() || !window_functions.is_empty() {
+            if fields.is_empty() {
+                // Window functions only — select all fields so we have data to compute on
+                FieldSelection::All
+            } else {
+                FieldSelection::Fields(fields)
+            }
         } else {
             FieldSelection::All
         };
 
-        Ok((field_selection, group_by_time))
+        Ok((field_selection, group_by_time, window_functions))
     }
 
     /// Process a SELECT expression
@@ -725,6 +745,7 @@ impl SqlTranslator {
         alias: Option<&str>,
         fields: &mut Vec<String>,
         aggregates: &mut Vec<(String, AggregateFunction, Option<String>)>,
+        window_functions: &mut Vec<WindowFunction>,
         group_by_time: &mut Option<i64>,
     ) -> Result<()> {
         match expr {
@@ -740,7 +761,7 @@ impl SqlTranslator {
                 }
             }
 
-            // Function call (aggregates, time_bucket, etc.)
+            // Function call (aggregates, time_bucket, window functions)
             Expr::Function(func) => {
                 let func_name = Self::object_name_to_string(&func.name);
                 let func_name_lower = func_name.to_lowercase();
@@ -751,6 +772,21 @@ impl SqlTranslator {
                         *group_by_time = Some(interval);
                     }
                     return Ok(());
+                }
+
+                // Check for OVER clause → window function
+                if func.over.is_some() {
+                    let wf = Self::parse_window_function(func, alias)?;
+                    window_functions.push(wf);
+                    return Ok(());
+                }
+
+                // Window-only functions without OVER → error
+                if FunctionRegistry::is_window_only_function(&func_name) {
+                    return Err(SqlError::UnsupportedFeature(format!(
+                        "{}() requires an OVER clause",
+                        func_name
+                    )));
                 }
 
                 // Handle aggregate functions
@@ -770,6 +806,217 @@ impl SqlTranslator {
         }
 
         Ok(())
+    }
+
+    /// Parse a SQL function with OVER clause into a WindowFunction
+    fn parse_window_function(
+        func: &sqlparser::ast::Function,
+        alias: Option<&str>,
+    ) -> Result<WindowFunction> {
+        let func_name = Self::object_name_to_string(&func.name);
+        let func_name_lower = func_name.to_lowercase();
+
+        // Parse the OVER clause
+        let (partition_by, order_by, frame) = match &func.over {
+            Some(WindowType::WindowSpec(spec)) => {
+                let partition_by = spec
+                    .partition_by
+                    .iter()
+                    .filter_map(|e| match e {
+                        Expr::Identifier(ident) => Some(ident.value.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+
+                let order_by = spec
+                    .order_by
+                    .iter()
+                    .filter_map(|o| {
+                        let field = match &o.expr {
+                            Expr::Identifier(ident) => ident.value.clone(),
+                            _ => return None,
+                        };
+                        let ascending = o.options.asc.unwrap_or(true);
+                        Some((field, ascending))
+                    })
+                    .collect::<Vec<_>>();
+
+                let frame = spec
+                    .window_frame
+                    .as_ref()
+                    .map(|wf| Self::translate_window_frame(wf))
+                    .transpose()?;
+
+                (partition_by, order_by, frame)
+            }
+            Some(WindowType::NamedWindow(_)) => {
+                return Err(SqlError::UnsupportedFeature(
+                    "Named windows (WINDOW w AS ...) are not supported".to_string(),
+                ));
+            }
+            None => (vec![], vec![], None),
+        };
+
+        // Determine the window function type
+        let function = match func_name_lower.as_str() {
+            "row_number" => WindowFunctionType::RowNumber,
+            "rank" => WindowFunctionType::Rank,
+            "dense_rank" => WindowFunctionType::DenseRank,
+            "lag" => {
+                let (field, offset, default) = Self::extract_lag_lead_args(&func.args)?;
+                WindowFunctionType::Lag {
+                    field,
+                    offset,
+                    default,
+                }
+            }
+            "lead" => {
+                let (field, offset, default) = Self::extract_lag_lead_args(&func.args)?;
+                WindowFunctionType::Lead {
+                    field,
+                    offset,
+                    default,
+                }
+            }
+            _ if FunctionRegistry::is_aggregate(&func_name) => {
+                let agg_func = FunctionRegistry::get_aggregate(&func_name)?;
+                WindowFunctionType::Aggregate(agg_func)
+            }
+            _ => {
+                return Err(SqlError::UnsupportedFeature(format!(
+                    "Unsupported window function: {}",
+                    func_name
+                )));
+            }
+        };
+
+        // Generate alias: use explicit alias or synthesize one
+        let alias = alias
+            .map(String::from)
+            .unwrap_or_else(|| format!("{}_over", func_name_lower));
+
+        Ok(WindowFunction {
+            function,
+            partition_by,
+            order_by,
+            frame,
+            alias,
+        })
+    }
+
+    /// Translate a sqlparser WindowFrame into our WindowFrame model
+    fn translate_window_frame(
+        wf: &sqlparser::ast::WindowFrame,
+    ) -> Result<WindowFrame> {
+        let units = match wf.units {
+            sqlparser::ast::WindowFrameUnits::Rows => WindowFrameUnits::Rows,
+            sqlparser::ast::WindowFrameUnits::Range => WindowFrameUnits::Range,
+            sqlparser::ast::WindowFrameUnits::Groups => {
+                return Err(SqlError::UnsupportedFeature(
+                    "GROUPS frame unit is not supported".to_string(),
+                ));
+            }
+        };
+
+        let start = Self::translate_frame_bound(&wf.start_bound)?;
+        let end = wf
+            .end_bound
+            .as_ref()
+            .map(|b| Self::translate_frame_bound(b))
+            .transpose()?
+            .unwrap_or(WindowFrameBound::CurrentRow);
+
+        Ok(WindowFrame { units, start, end })
+    }
+
+    /// Translate a sqlparser WindowFrameBound into our WindowFrameBound
+    fn translate_frame_bound(
+        bound: &sqlparser::ast::WindowFrameBound,
+    ) -> Result<WindowFrameBound> {
+        match bound {
+            sqlparser::ast::WindowFrameBound::CurrentRow => Ok(WindowFrameBound::CurrentRow),
+            sqlparser::ast::WindowFrameBound::Preceding(None) => {
+                Ok(WindowFrameBound::UnboundedPreceding)
+            }
+            sqlparser::ast::WindowFrameBound::Preceding(Some(expr)) => {
+                let n = Self::expr_to_frame_bound(expr)?;
+                Ok(WindowFrameBound::Preceding(n))
+            }
+            sqlparser::ast::WindowFrameBound::Following(None) => {
+                Ok(WindowFrameBound::UnboundedFollowing)
+            }
+            sqlparser::ast::WindowFrameBound::Following(Some(expr)) => {
+                let n = Self::expr_to_frame_bound(expr)?;
+                Ok(WindowFrameBound::Following(n))
+            }
+        }
+    }
+
+    /// Extract an expression as a usize (for frame bounds like "3 PRECEDING")
+    fn expr_to_frame_bound(expr: &Expr) -> Result<usize> {
+        match expr {
+            Expr::Value(val_with_span) => match &val_with_span.value {
+                Value::Number(n, _) => n
+                    .parse::<usize>()
+                    .map_err(|_| SqlError::Translation(format!("Invalid frame bound: {}", n))),
+                _ => Err(SqlError::Translation(
+                    "Frame bound must be a number".to_string(),
+                )),
+            },
+            _ => Err(SqlError::Translation(
+                "Frame bound must be a literal number".to_string(),
+            )),
+        }
+    }
+
+    /// Extract LAG/LEAD arguments: (field, offset, default)
+    fn extract_lag_lead_args(
+        args: &FunctionArguments,
+    ) -> Result<(String, usize, Option<FieldValue>)> {
+        match args {
+            FunctionArguments::List(arg_list) => {
+                let args_vec = &arg_list.args;
+
+                // First arg: field name (required)
+                let field = if let Some(first) = args_vec.first() {
+                    Self::function_arg_to_field(first)?
+                } else {
+                    return Err(SqlError::Translation(
+                        "LAG/LEAD requires at least one argument".to_string(),
+                    ));
+                };
+
+                // Second arg: offset (optional, default 1)
+                let offset = if let Some(second) = args_vec.get(1) {
+                    let s = Self::function_arg_to_string(second)?;
+                    s.parse::<usize>().unwrap_or(1)
+                } else {
+                    1
+                };
+
+                // Third arg: default value (optional)
+                let default = if let Some(third) = args_vec.get(2) {
+                    let s = Self::function_arg_to_string(third)?;
+                    if let Ok(f) = s.parse::<f64>() {
+                        Some(FieldValue::Float(f))
+                    } else if let Ok(i) = s.parse::<i64>() {
+                        Some(FieldValue::Integer(i))
+                    } else {
+                        Some(FieldValue::String(s))
+                    }
+                } else {
+                    None
+                };
+
+                Ok((field, offset, default))
+            }
+            FunctionArguments::None => Err(SqlError::Translation(
+                "LAG/LEAD requires at least one argument".to_string(),
+            )),
+            FunctionArguments::Subquery(_) => Err(SqlError::UnsupportedFeature(
+                "Subquery in LAG/LEAD not supported".to_string(),
+            )),
+        }
     }
 
     /// Extract interval from time_bucket function arguments (sqlparser 0.60 API)
@@ -1330,5 +1577,174 @@ mod tests {
             }
             _ => panic!("Expected Or filter, got {:?}", filter),
         }
+    }
+
+    // =========================================================================
+    // Window function translation tests
+    // =========================================================================
+
+    #[test]
+    fn test_window_row_number() {
+        let query =
+            translate("SELECT *, ROW_NUMBER() OVER (ORDER BY time) AS rn FROM cpu").unwrap();
+        assert_eq!(query.window_functions.len(), 1);
+        let wf = &query.window_functions[0];
+        assert!(matches!(wf.function, WindowFunctionType::RowNumber));
+        assert_eq!(wf.alias, "rn");
+        assert!(wf.partition_by.is_empty());
+        assert_eq!(wf.order_by, vec![("time".to_string(), true)]);
+    }
+
+    #[test]
+    fn test_window_rank_with_partition() {
+        let query = translate(
+            "SELECT *, RANK() OVER (PARTITION BY host ORDER BY time DESC) AS rnk FROM cpu",
+        )
+        .unwrap();
+        assert_eq!(query.window_functions.len(), 1);
+        let wf = &query.window_functions[0];
+        assert!(matches!(wf.function, WindowFunctionType::Rank));
+        assert_eq!(wf.alias, "rnk");
+        assert_eq!(wf.partition_by, vec!["host".to_string()]);
+        assert_eq!(wf.order_by, vec![("time".to_string(), false)]);
+    }
+
+    #[test]
+    fn test_window_dense_rank() {
+        let query =
+            translate("SELECT DENSE_RANK() OVER (ORDER BY time) AS drnk FROM cpu").unwrap();
+        assert_eq!(query.window_functions.len(), 1);
+        assert!(matches!(
+            query.window_functions[0].function,
+            WindowFunctionType::DenseRank
+        ));
+        assert_eq!(query.window_functions[0].alias, "drnk");
+    }
+
+    #[test]
+    fn test_window_lag() {
+        let query =
+            translate("SELECT LAG(usage, 1) OVER (ORDER BY time) AS prev_usage FROM cpu").unwrap();
+        assert_eq!(query.window_functions.len(), 1);
+        let wf = &query.window_functions[0];
+        match &wf.function {
+            WindowFunctionType::Lag {
+                field,
+                offset,
+                default,
+            } => {
+                assert_eq!(field, "usage");
+                assert_eq!(*offset, 1);
+                assert!(default.is_none());
+            }
+            _ => panic!("Expected Lag, got {:?}", wf.function),
+        }
+        assert_eq!(wf.alias, "prev_usage");
+    }
+
+    #[test]
+    fn test_window_lead_with_default() {
+        let query = translate(
+            "SELECT LEAD(usage, 1, 0) OVER (ORDER BY time) AS next_usage FROM cpu",
+        )
+        .unwrap();
+        assert_eq!(query.window_functions.len(), 1);
+        let wf = &query.window_functions[0];
+        match &wf.function {
+            WindowFunctionType::Lead {
+                field,
+                offset,
+                default,
+            } => {
+                assert_eq!(field, "usage");
+                assert_eq!(*offset, 1);
+                assert!(default.is_some());
+            }
+            _ => panic!("Expected Lead, got {:?}", wf.function),
+        }
+    }
+
+    #[test]
+    fn test_window_aggregate_running_sum() {
+        let query = translate(
+            "SELECT SUM(usage) OVER (ORDER BY time ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_sum FROM cpu",
+        )
+        .unwrap();
+        assert_eq!(query.window_functions.len(), 1);
+        let wf = &query.window_functions[0];
+        assert!(matches!(
+            wf.function,
+            WindowFunctionType::Aggregate(AggregateFunction::Sum)
+        ));
+        assert_eq!(wf.alias, "running_sum");
+        let frame = wf.frame.as_ref().expect("Expected frame");
+        assert!(matches!(frame.units, WindowFrameUnits::Rows));
+        assert!(matches!(frame.start, WindowFrameBound::UnboundedPreceding));
+        assert!(matches!(frame.end, WindowFrameBound::CurrentRow));
+    }
+
+    #[test]
+    fn test_window_aggregate_moving_avg() {
+        let query = translate(
+            "SELECT AVG(usage) OVER (ORDER BY time ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS moving_avg FROM cpu",
+        )
+        .unwrap();
+        assert_eq!(query.window_functions.len(), 1);
+        let wf = &query.window_functions[0];
+        assert!(matches!(
+            wf.function,
+            WindowFunctionType::Aggregate(AggregateFunction::Mean)
+        ));
+        let frame = wf.frame.as_ref().expect("Expected frame");
+        assert!(matches!(frame.start, WindowFrameBound::Preceding(2)));
+        assert!(matches!(frame.end, WindowFrameBound::CurrentRow));
+    }
+
+    #[test]
+    fn test_window_auto_alias() {
+        let query =
+            translate("SELECT ROW_NUMBER() OVER (ORDER BY time) FROM cpu").unwrap();
+        assert_eq!(query.window_functions.len(), 1);
+        assert_eq!(query.window_functions[0].alias, "row_number_over");
+    }
+
+    #[test]
+    fn test_window_function_without_over_rejected() {
+        let result = translate("SELECT ROW_NUMBER() FROM cpu");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_multiple_window_functions() {
+        let query = translate(
+            "SELECT ROW_NUMBER() OVER (ORDER BY time) AS rn, \
+             RANK() OVER (ORDER BY time) AS rnk \
+             FROM cpu",
+        )
+        .unwrap();
+        assert_eq!(query.window_functions.len(), 2);
+        assert!(matches!(
+            query.window_functions[0].function,
+            WindowFunctionType::RowNumber
+        ));
+        assert!(matches!(
+            query.window_functions[1].function,
+            WindowFunctionType::Rank
+        ));
+    }
+
+    #[test]
+    fn test_window_with_fields() {
+        let query = translate(
+            "SELECT usage, ROW_NUMBER() OVER (ORDER BY time) AS rn FROM cpu",
+        )
+        .unwrap();
+        match &query.field_selection {
+            FieldSelection::Fields(fields) => {
+                assert!(fields.contains(&"usage".to_string()));
+            }
+            _ => panic!("Expected Fields selection"),
+        }
+        assert_eq!(query.window_functions.len(), 1);
     }
 }

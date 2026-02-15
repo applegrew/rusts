@@ -40,6 +40,9 @@ pub enum QueryError {
 
     #[error("Query cancelled")]
     Cancelled,
+
+    #[error("Window function error: {0}")]
+    WindowError(String),
 }
 
 /// Result type for query operations

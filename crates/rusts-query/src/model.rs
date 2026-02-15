@@ -179,6 +179,91 @@ impl FieldSelection {
     }
 }
 
+/// Window frame units
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WindowFrameUnits {
+    /// Row-based frame
+    Rows,
+    /// Range-based frame
+    Range,
+}
+
+/// Window frame bound
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WindowFrameBound {
+    /// UNBOUNDED PRECEDING
+    UnboundedPreceding,
+    /// N PRECEDING
+    Preceding(usize),
+    /// CURRENT ROW
+    CurrentRow,
+    /// N FOLLOWING
+    Following(usize),
+    /// UNBOUNDED FOLLOWING
+    UnboundedFollowing,
+}
+
+/// Window frame specification
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowFrame {
+    /// Frame units (ROWS or RANGE)
+    pub units: WindowFrameUnits,
+    /// Start bound
+    pub start: WindowFrameBound,
+    /// End bound
+    pub end: WindowFrameBound,
+}
+
+impl Default for WindowFrame {
+    fn default() -> Self {
+        Self {
+            units: WindowFrameUnits::Range,
+            start: WindowFrameBound::UnboundedPreceding,
+            end: WindowFrameBound::CurrentRow,
+        }
+    }
+}
+
+/// Type of window function
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum WindowFunctionType {
+    /// Aggregate function applied over a window (SUM, AVG, COUNT, MIN, MAX)
+    Aggregate(AggregateFunction),
+    /// ROW_NUMBER() - sequential row number within partition
+    RowNumber,
+    /// RANK() - rank with gaps for ties
+    Rank,
+    /// DENSE_RANK() - rank without gaps for ties
+    DenseRank,
+    /// LAG(field, offset, default) - value from a preceding row
+    Lag {
+        field: String,
+        offset: usize,
+        default: Option<FieldValue>,
+    },
+    /// LEAD(field, offset, default) - value from a following row
+    Lead {
+        field: String,
+        offset: usize,
+        default: Option<FieldValue>,
+    },
+}
+
+/// A window function definition
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowFunction {
+    /// The window function type
+    pub function: WindowFunctionType,
+    /// PARTITION BY columns (tag names)
+    pub partition_by: Vec<String>,
+    /// ORDER BY within the window: (field, ascending)
+    pub order_by: Vec<(String, bool)>,
+    /// Optional frame clause
+    pub frame: Option<WindowFrame>,
+    /// Output column alias
+    pub alias: String,
+}
+
 /// Query definition
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Query {
@@ -204,6 +289,9 @@ pub struct Query {
     pub limit: Option<usize>,
     /// Offset results
     pub offset: Option<usize>,
+    /// Window functions to evaluate on the result set
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub window_functions: Vec<WindowFunction>,
 }
 
 impl Query {
@@ -259,6 +347,7 @@ pub struct QueryBuilder {
     order_by: Option<(String, bool)>,
     limit: Option<usize>,
     offset: Option<usize>,
+    window_functions: Vec<WindowFunction>,
 }
 
 impl QueryBuilder {
@@ -275,6 +364,7 @@ impl QueryBuilder {
             order_by: None,
             limit: None,
             offset: None,
+            window_functions: Vec::new(),
         }
     }
 
@@ -379,6 +469,12 @@ impl QueryBuilder {
         self
     }
 
+    /// Add a window function
+    pub fn window_function(mut self, wf: WindowFunction) -> Self {
+        self.window_functions.push(wf);
+        self
+    }
+
     /// Build the query
     pub fn build(self) -> Result<Query> {
         let query = Query {
@@ -392,6 +488,7 @@ impl QueryBuilder {
             order_by: self.order_by,
             limit: self.limit,
             offset: self.offset,
+            window_functions: self.window_functions,
         };
 
         query.validate()?;

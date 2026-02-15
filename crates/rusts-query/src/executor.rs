@@ -290,7 +290,7 @@ impl QueryExecutor {
         let uses_hot_data = self.can_use_hot_data_routing(&query);
 
         // Execute based on field selection
-        let result = match &query.field_selection {
+        let mut result = match &query.field_selection {
             FieldSelection::All | FieldSelection::Fields(_) => {
                 if uses_hot_data {
                     self.execute_select_memtable_only(&query, &series_ids)?
@@ -302,6 +302,14 @@ impl QueryExecutor {
                 self.execute_aggregate(&query, &series_ids, field, *function, alias.clone(), None)?
             }
         };
+
+        // Evaluate window functions (before limit/offset)
+        if !query.window_functions.is_empty() {
+            crate::window::evaluate_window_functions(
+                &mut result.rows,
+                &query.window_functions,
+            )?;
+        }
 
         // Apply limit and offset (skip for optimized path - already applied)
         let result = if uses_optimized_limit && !uses_hot_data {
@@ -349,7 +357,7 @@ impl QueryExecutor {
         let uses_optimized_limit = self.can_use_optimized_limit(&query);
 
         // Execute based on field selection
-        let result = match &query.field_selection {
+        let mut result = match &query.field_selection {
             FieldSelection::All | FieldSelection::Fields(_) => {
                 self.execute_select(&query, &series_ids, Some(&cancel))?
             }
@@ -357,6 +365,14 @@ impl QueryExecutor {
                 self.execute_aggregate(&query, &series_ids, field, *function, alias.clone(), Some(&cancel))?
             }
         };
+
+        // Evaluate window functions (before limit/offset)
+        if !query.window_functions.is_empty() {
+            crate::window::evaluate_window_functions(
+                &mut result.rows,
+                &query.window_functions,
+            )?;
+        }
 
         // Apply limit and offset (skip for optimized path - already applied)
         let result = if uses_optimized_limit {
@@ -1912,6 +1928,7 @@ mod tests {
             order_by: None,
             limit: None,
             offset: None,
+            window_functions: Vec::new(),
         };
 
         // This should NOT panic (was previously causing "attempt to subtract with overflow")

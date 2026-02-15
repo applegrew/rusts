@@ -40,6 +40,15 @@ impl FunctionRegistry {
         Self::get_aggregate(name).is_ok()
     }
 
+    /// Check if a function name is a window-only function (requires OVER clause)
+    pub fn is_window_only_function(name: &str) -> bool {
+        let name_lower = name.to_lowercase();
+        matches!(
+            name_lower.as_str(),
+            "row_number" | "rank" | "dense_rank" | "lag" | "lead"
+        )
+    }
+
     /// Check if a function is a time function
     pub fn is_time_function(name: &str) -> bool {
         let name_lower = name.to_lowercase();
