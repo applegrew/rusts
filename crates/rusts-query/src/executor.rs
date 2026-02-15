@@ -4,7 +4,7 @@
 
 use crate::aggregation::{AggregateFunction, Aggregator, TimeBucketAggregator};
 use crate::error::{QueryError, Result};
-use crate::model::{FieldSelection, Query, QueryResult, ResultRow, TagFilter};
+use crate::model::{FieldSelection, FilterExpr, Query, QueryResult, ResultRow, TagFilter};
 use crate::planner::{QueryOptimizer, QueryPlanner};
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
@@ -417,6 +417,8 @@ impl QueryExecutor {
     /// - Equals filters use bitmap AND operations
     /// - NotEquals filters use bitmap AND NOT operations
     /// - In filters use bitmap OR followed by AND
+    /// - OR expressions use bitmap union
+    /// - NOT expressions use bitmap subtraction
     ///
     /// Filters are ordered by cardinality (most selective first) to shrink
     /// bitmaps faster and reduce intermediate work.
@@ -432,113 +434,183 @@ impl QueryExecutor {
             return Ok(Vec::new());
         }
 
-        if query.tag_filters.is_empty() {
-            return Ok(measurement_series);
-        }
+        // Use effective_filter() which resolves filter vs tag_filters
+        let filter_expr = match query.effective_filter() {
+            Some(expr) => expr,
+            None => return Ok(measurement_series),
+        };
 
         // Convert measurement series to bitmap for efficient filtering
-        let mut result_bitmap = self.tag_index.series_to_bitmap(&measurement_series);
+        let all_bitmap = self.tag_index.series_to_bitmap(&measurement_series);
 
-        // Order filters by cardinality (most selective first)
-        let ordered_filters = self.order_filters_by_cardinality(&query.tag_filters);
-
-        // Track whether we need to fall back to per-series filtering for some filters
-        let mut needs_per_series_filter = Vec::new();
-
-        for (filter, _cardinality) in &ordered_filters {
-            // Check cancellation before each filter
-            if let Some(cancel) = cancel {
-                if cancel.is_cancelled() {
-                    return Err(QueryError::Cancelled);
-                }
-            }
-
-            match filter {
-                TagFilter::Equals { key, value } => {
-                    // Use bitmap AND operation
-                    self.tag_index.intersect_with(key, value, &mut result_bitmap);
-                    if result_bitmap.is_empty() {
-                        return Ok(Vec::new());
-                    }
-                }
-                TagFilter::NotEquals { key, value } => {
-                    // Get matching bitmap and subtract from result
-                    if let Some(matching_bitmap) = self.tag_index.find_by_tag_bitmap(key, value) {
-                        result_bitmap -= &matching_bitmap;
-                        if result_bitmap.is_empty() {
-                            return Ok(Vec::new());
-                        }
-                    }
-                    // If tag doesn't exist, all series pass the filter (no change needed)
-                }
-                TagFilter::In { key, values } => {
-                    // Build OR bitmap of all matching values, then AND with result
-                    let mut or_bitmap = roaring::RoaringBitmap::new();
-                    for value in values {
-                        self.tag_index.union_with(key, value, &mut or_bitmap);
-                    }
-                    result_bitmap &= &or_bitmap;
-                    if result_bitmap.is_empty() {
-                        return Ok(Vec::new());
-                    }
-                }
-                TagFilter::NotIn { key, values } => {
-                    // Build OR bitmap of all matching values, then subtract from result
-                    let mut or_bitmap = roaring::RoaringBitmap::new();
-                    for value in values {
-                        self.tag_index.union_with(key, value, &mut or_bitmap);
-                    }
-                    result_bitmap -= &or_bitmap;
-                    if result_bitmap.is_empty() {
-                        return Ok(Vec::new());
-                    }
-                }
-                TagFilter::Exists { .. } | TagFilter::Regex { .. } => {
-                    // These require per-series evaluation, defer to later
-                    needs_per_series_filter.push(filter.clone());
-                }
-            }
-        }
+        // Evaluate the filter expression tree using bitmap operations
+        let result_bitmap = self.evaluate_filter_expr(&filter_expr, &all_bitmap, cancel)?;
 
         // Convert bitmap back to series IDs
         let mut result = self.tag_index.bitmap_to_series(&result_bitmap);
 
-        // Apply remaining filters that require per-series evaluation
-        for filter in needs_per_series_filter {
-            // Check cancellation before each filter
-            if let Some(cancel) = cancel {
-                if cancel.is_cancelled() {
-                    return Err(QueryError::Cancelled);
-                }
-            }
+        // Apply per-series filtering for Exists and Regex leaf filters
+        // that couldn't be resolved via bitmap operations
+        self.apply_per_series_filters(&filter_expr, &mut result, cancel)?;
 
-            match &filter {
-                TagFilter::Exists { key } => {
-                    result.retain(|id| {
-                        if let Some(meta) = self.series_index.get(*id) {
-                            meta.tags.iter().any(|t| &t.key == key)
-                        } else {
-                            false
-                        }
-                    });
-                }
-                TagFilter::Regex { key, pattern } => {
-                    // Use cached regex to avoid recompilation
-                    if let Some(re) = get_or_compile_regex(pattern) {
-                        result.retain(|id| {
-                            if let Some(meta) = self.series_index.get(*id) {
-                                meta.tags.iter().any(|t| &t.key == key && re.is_match(&t.value))
-                            } else {
-                                false
-                            }
-                        });
-                    }
-                }
-                _ => unreachable!("Only Exists and Regex filters are deferred"),
+        Ok(result)
+    }
+
+    /// Recursively evaluate a FilterExpr tree using Roaring bitmap operations.
+    ///
+    /// Returns a bitmap of internal IDs matching the expression, scoped to
+    /// the provided `scope_bitmap` (typically the measurement's series).
+    fn evaluate_filter_expr(
+        &self,
+        expr: &FilterExpr,
+        scope_bitmap: &roaring::RoaringBitmap,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<roaring::RoaringBitmap> {
+        if let Some(cancel) = cancel {
+            if cancel.is_cancelled() {
+                return Err(QueryError::Cancelled);
             }
         }
 
-        Ok(result)
+        match expr {
+            FilterExpr::Leaf(filter) => {
+                self.evaluate_leaf_filter(filter, scope_bitmap)
+            }
+            FilterExpr::And(exprs) => {
+                if exprs.is_empty() {
+                    return Ok(scope_bitmap.clone());
+                }
+                // Start with the full scope and intersect each sub-expression
+                let mut result = scope_bitmap.clone();
+                for sub_expr in exprs {
+                    if result.is_empty() {
+                        break; // Short-circuit: AND with empty is always empty
+                    }
+                    let sub_bitmap = self.evaluate_filter_expr(sub_expr, &result, cancel)?;
+                    result &= &sub_bitmap;
+                }
+                Ok(result)
+            }
+            FilterExpr::Or(exprs) => {
+                if exprs.is_empty() {
+                    return Ok(roaring::RoaringBitmap::new());
+                }
+                // Union all sub-expression results
+                let mut result = roaring::RoaringBitmap::new();
+                for sub_expr in exprs {
+                    let sub_bitmap = self.evaluate_filter_expr(sub_expr, scope_bitmap, cancel)?;
+                    result |= &sub_bitmap;
+                }
+                // Scope the result to the parent bitmap
+                result &= scope_bitmap;
+                Ok(result)
+            }
+            FilterExpr::Not(inner) => {
+                let inner_bitmap = self.evaluate_filter_expr(inner, scope_bitmap, cancel)?;
+                let mut result = scope_bitmap.clone();
+                result -= &inner_bitmap;
+                Ok(result)
+            }
+        }
+    }
+
+    /// Evaluate a single leaf TagFilter into a bitmap result.
+    ///
+    /// For Exists and Regex filters that can't be resolved purely via bitmap
+    /// lookups, this returns the scope_bitmap unchanged (they are handled
+    /// later in apply_per_series_filters).
+    fn evaluate_leaf_filter(
+        &self,
+        filter: &TagFilter,
+        scope_bitmap: &roaring::RoaringBitmap,
+    ) -> Result<roaring::RoaringBitmap> {
+        match filter {
+            TagFilter::Equals { key, value } => {
+                let mut result = scope_bitmap.clone();
+                self.tag_index.intersect_with(key, value, &mut result);
+                Ok(result)
+            }
+            TagFilter::NotEquals { key, value } => {
+                let mut result = scope_bitmap.clone();
+                if let Some(matching_bitmap) = self.tag_index.find_by_tag_bitmap(key, value) {
+                    result -= &matching_bitmap;
+                }
+                Ok(result)
+            }
+            TagFilter::In { key, values } => {
+                let mut or_bitmap = roaring::RoaringBitmap::new();
+                for value in values {
+                    self.tag_index.union_with(key, value, &mut or_bitmap);
+                }
+                let mut result = scope_bitmap.clone();
+                result &= &or_bitmap;
+                Ok(result)
+            }
+            TagFilter::NotIn { key, values } => {
+                let mut or_bitmap = roaring::RoaringBitmap::new();
+                for value in values {
+                    self.tag_index.union_with(key, value, &mut or_bitmap);
+                }
+                let mut result = scope_bitmap.clone();
+                result -= &or_bitmap;
+                Ok(result)
+            }
+            TagFilter::Exists { .. } | TagFilter::Regex { .. } => {
+                // These require per-series evaluation; return scope unchanged
+                // and handle in apply_per_series_filters
+                Ok(scope_bitmap.clone())
+            }
+        }
+    }
+
+    /// Apply per-series filters (Exists, Regex) that can't be resolved via bitmaps.
+    ///
+    /// Walks the FilterExpr tree and retains only series that match Exists/Regex
+    /// leaf filters in their correct logical context.
+    fn apply_per_series_filters(
+        &self,
+        expr: &FilterExpr,
+        result: &mut Vec<SeriesId>,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<()> {
+        if result.is_empty() {
+            return Ok(());
+        }
+
+        // Check if the expression contains any per-series filters
+        if !self.has_per_series_filters(expr) {
+            return Ok(());
+        }
+
+        if let Some(cancel) = cancel {
+            if cancel.is_cancelled() {
+                return Err(QueryError::Cancelled);
+            }
+        }
+
+        // For expressions containing Exists/Regex, fall back to per-series evaluation
+        // of the entire expression tree using TagFilter::matches / FilterExpr::matches
+        result.retain(|id| {
+            if let Some(meta) = self.series_index.get(*id) {
+                expr.matches(&meta.tags)
+            } else {
+                false
+            }
+        });
+
+        Ok(())
+    }
+
+    /// Check if a FilterExpr tree contains any filters requiring per-series evaluation
+    fn has_per_series_filters(&self, expr: &FilterExpr) -> bool {
+        match expr {
+            FilterExpr::Leaf(TagFilter::Exists { .. }) | FilterExpr::Leaf(TagFilter::Regex { .. }) => true,
+            FilterExpr::Leaf(_) => false,
+            FilterExpr::And(exprs) | FilterExpr::Or(exprs) => {
+                exprs.iter().any(|e| self.has_per_series_filters(e))
+            }
+            FilterExpr::Not(inner) => self.has_per_series_filters(inner),
+        }
     }
 
     /// Check if the query can use the optimized LIMIT path
@@ -1831,6 +1903,7 @@ mod tests {
             measurement: "cpu".to_string(),
             time_range: rusts_core::TimeRange::new(i64::MIN, i64::MAX),
             tag_filters: Vec::new(),
+            filter: None,
             field_selection: crate::model::FieldSelection::All,
             group_by: Vec::new(),
             group_by_time: None,

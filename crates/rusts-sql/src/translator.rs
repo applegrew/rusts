@@ -5,7 +5,7 @@
 use crate::error::{Result, SqlError};
 use crate::functions::FunctionRegistry;
 use rusts_core::TimeRange;
-use rusts_query::{AggregateFunction, FieldSelection, Query, TagFilter};
+use rusts_query::{AggregateFunction, FieldSelection, FilterExpr, Query, TagFilter};
 use sqlparser::ast::{
     BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
     LimitClause, ObjectName, OrderBy, OrderByExpr, OrderByKind, Query as SqlQuery, SelectItem,
@@ -341,29 +341,20 @@ impl SqlTranslator {
         // Start building the query
         let mut builder = Query::builder(&measurement);
 
-        // Process WHERE clause for time range and tag filters
+        // Process WHERE clause for time range and filter expression
         if let Some(selection) = &select.selection {
-            let (time_range, tag_filters) = Self::extract_where_clause(selection)?;
+            let (time_range, filter_expr) = Self::extract_where_clause(selection)?;
             debug!(
-                "Time range: {:?}, Tag filters: {:?}",
-                time_range, tag_filters
+                "Time range: {:?}, Filter: {:?}",
+                time_range, filter_expr
             );
 
             if let Some(tr) = time_range {
                 builder = builder.time_range(tr.start, tr.end);
             }
 
-            for filter in tag_filters {
-                builder = match filter {
-                    TagFilter::Equals { key, value } => builder.where_tag(key, value),
-                    TagFilter::NotEquals { key, value } => builder.where_tag_not(key, value),
-                    TagFilter::In { key, values } => builder.where_tag_in(key, values),
-                    TagFilter::NotIn { key, values } => builder.where_tag_not_in(key, values),
-                    TagFilter::Regex { .. } | TagFilter::Exists { .. } => {
-                        // These need direct manipulation, so we handle them after build
-                        builder
-                    }
-                };
+            if let Some(expr) = filter_expr {
+                builder = builder.filter(expr);
             }
         }
 
@@ -463,13 +454,15 @@ impl SqlTranslator {
             .join(".")
     }
 
-    /// Extract time range and tag filters from WHERE clause
-    fn extract_where_clause(expr: &Expr) -> Result<(Option<TimeRange>, Vec<TagFilter>)> {
+    /// Extract time range and filter expression from WHERE clause.
+    ///
+    /// Time conditions (on `time`/`timestamp`/`_time` columns) are extracted
+    /// into a `TimeRange`. All other conditions are built into a `FilterExpr` tree.
+    fn extract_where_clause(expr: &Expr) -> Result<(Option<TimeRange>, Option<FilterExpr>)> {
         let mut time_start: Option<i64> = None;
         let mut time_end: Option<i64> = None;
-        let mut tag_filters = Vec::new();
 
-        Self::process_where_expr(expr, &mut time_start, &mut time_end, &mut tag_filters)?;
+        let filter_expr = Self::process_where_expr(expr, &mut time_start, &mut time_end)?;
 
         let time_range = match (time_start, time_end) {
             (Some(start), Some(end)) => Some(TimeRange::new(start, end)),
@@ -478,16 +471,18 @@ impl SqlTranslator {
             (None, None) => None,
         };
 
-        Ok((time_range, tag_filters))
+        Ok((time_range, filter_expr))
     }
 
-    /// Process a WHERE expression recursively
+    /// Process a WHERE expression recursively, returning a FilterExpr tree.
+    ///
+    /// Time conditions are extracted into the mutable time_start/time_end
+    /// parameters and excluded from the returned FilterExpr.
     fn process_where_expr(
         expr: &Expr,
         time_start: &mut Option<i64>,
         time_end: &mut Option<i64>,
-        tag_filters: &mut Vec<TagFilter>,
-    ) -> Result<()> {
+    ) -> Result<Option<FilterExpr>> {
         match expr {
             // AND expressions - process both sides
             Expr::BinaryOp {
@@ -495,23 +490,61 @@ impl SqlTranslator {
                 op: BinaryOperator::And,
                 right,
             } => {
-                Self::process_where_expr(left, time_start, time_end, tag_filters)?;
-                Self::process_where_expr(right, time_start, time_end, tag_filters)?;
+                let left_expr = Self::process_where_expr(left, time_start, time_end)?;
+                let right_expr = Self::process_where_expr(right, time_start, time_end)?;
+
+                match (left_expr, right_expr) {
+                    (None, None) => Ok(None),
+                    (Some(l), None) => Ok(Some(l)),
+                    (None, Some(r)) => Ok(Some(r)),
+                    (Some(l), Some(r)) => {
+                        // Flatten nested ANDs
+                        let mut children = Vec::new();
+                        match l {
+                            FilterExpr::And(inner) => children.extend(inner),
+                            other => children.push(other),
+                        }
+                        match r {
+                            FilterExpr::And(inner) => children.extend(inner),
+                            other => children.push(other),
+                        }
+                        Ok(Some(FilterExpr::And(children)))
+                    }
+                }
             }
 
-            // OR expressions - not supported at top level
+            // OR expressions - now supported!
             Expr::BinaryOp {
+                left,
                 op: BinaryOperator::Or,
-                ..
+                right,
             } => {
-                return Err(SqlError::UnsupportedFeature(
-                    "OR conditions in WHERE clause not supported".to_string(),
-                ));
+                let left_expr = Self::process_where_expr(left, time_start, time_end)?;
+                let right_expr = Self::process_where_expr(right, time_start, time_end)?;
+
+                match (left_expr, right_expr) {
+                    (None, None) => Ok(None),
+                    (Some(l), None) => Ok(Some(l)),
+                    (None, Some(r)) => Ok(Some(r)),
+                    (Some(l), Some(r)) => {
+                        // Flatten nested ORs
+                        let mut children = Vec::new();
+                        match l {
+                            FilterExpr::Or(inner) => children.extend(inner),
+                            other => children.push(other),
+                        }
+                        match r {
+                            FilterExpr::Or(inner) => children.extend(inner),
+                            other => children.push(other),
+                        }
+                        Ok(Some(FilterExpr::Or(children)))
+                    }
+                }
             }
 
             // Comparison operations
             Expr::BinaryOp { left, op, right } => {
-                Self::process_comparison(left, op, right, time_start, time_end, tag_filters)?;
+                Self::process_comparison_to_filter(left, op, right, time_start, time_end)
             }
 
             // IN / NOT IN expressions: tag IN (value1, value2, ...)
@@ -523,51 +556,54 @@ impl SqlTranslator {
                 if let Expr::Identifier(ident) = expr.as_ref() {
                     let values: Result<Vec<String>> =
                         list.iter().map(|e| Self::expr_to_string(e)).collect();
-                    if *negated {
-                        tag_filters.push(TagFilter::NotIn {
+                    let filter = if *negated {
+                        TagFilter::NotIn {
                             key: ident.value.clone(),
                             values: values?,
-                        });
+                        }
                     } else {
-                        tag_filters.push(TagFilter::In {
+                        TagFilter::In {
                             key: ident.value.clone(),
                             values: values?,
-                        });
-                    }
+                        }
+                    };
+                    Ok(Some(FilterExpr::Leaf(filter)))
+                } else {
+                    Ok(None)
                 }
             }
 
             // IS NOT NULL: tag IS NOT NULL
             Expr::IsNotNull(inner) => {
                 if let Expr::Identifier(ident) = inner.as_ref() {
-                    tag_filters.push(TagFilter::Exists {
+                    Ok(Some(FilterExpr::Leaf(TagFilter::Exists {
                         key: ident.value.clone(),
-                    });
+                    })))
+                } else {
+                    Ok(None)
                 }
             }
 
-            // Nested expressions
+            // Nested expressions (parenthesized)
             Expr::Nested(inner) => {
-                Self::process_where_expr(inner, time_start, time_end, tag_filters)?;
+                Self::process_where_expr(inner, time_start, time_end)
             }
 
             _ => {
                 debug!("Ignoring unsupported WHERE expression: {:?}", expr);
+                Ok(None)
             }
         }
-
-        Ok(())
     }
 
-    /// Process a comparison expression
-    fn process_comparison(
+    /// Process a comparison expression, returning a FilterExpr leaf or None (for time conditions).
+    fn process_comparison_to_filter(
         left: &Expr,
         op: &BinaryOperator,
         right: &Expr,
         time_start: &mut Option<i64>,
         time_end: &mut Option<i64>,
-        tag_filters: &mut Vec<TagFilter>,
-    ) -> Result<()> {
+    ) -> Result<Option<FilterExpr>> {
         // Get the column name
         let column = match left {
             Expr::Identifier(ident) => ident.value.clone(),
@@ -575,7 +611,7 @@ impl SqlTranslator {
                 .last()
                 .map(|i| i.value.clone())
                 .unwrap_or_default(),
-            _ => return Ok(()), // Skip complex left expressions
+            _ => return Ok(None), // Skip complex left expressions
         };
 
         // Check if this is a time column
@@ -596,36 +632,37 @@ impl SqlTranslator {
                 }
                 _ => {}
             }
+            Ok(None) // Time conditions are extracted, not returned as filters
         } else {
             // Tag filter
-            match op {
+            let filter = match op {
                 BinaryOperator::Eq => {
-                    tag_filters.push(TagFilter::Equals {
+                    Some(TagFilter::Equals {
                         key: column,
                         value: Self::expr_to_string(right)?,
-                    });
+                    })
                 }
                 BinaryOperator::NotEq => {
-                    tag_filters.push(TagFilter::NotEquals {
+                    Some(TagFilter::NotEquals {
                         key: column,
                         value: Self::expr_to_string(right)?,
-                    });
+                    })
                 }
                 // Regex operator (custom extension)
                 BinaryOperator::BitwiseOr => {
                     // Using ~ for regex in some SQL dialects
-                    tag_filters.push(TagFilter::Regex {
+                    Some(TagFilter::Regex {
                         key: column,
                         pattern: Self::expr_to_string(right)?,
-                    });
+                    })
                 }
                 _ => {
                     debug!("Ignoring unsupported comparison operator: {:?}", op);
+                    None
                 }
-            }
+            };
+            Ok(filter.map(FilterExpr::Leaf))
         }
-
-        Ok(())
     }
 
     /// Extract SELECT items and determine field selection
@@ -1043,13 +1080,13 @@ mod tests {
     #[test]
     fn test_where_tag_equals() {
         let query = translate("SELECT * FROM cpu WHERE host = 'server01'").unwrap();
-        assert_eq!(query.tag_filters.len(), 1);
-        match &query.tag_filters[0] {
-            TagFilter::Equals { key, value } => {
+        let filter = query.filter.expect("Expected filter");
+        match &filter {
+            FilterExpr::Leaf(TagFilter::Equals { key, value }) => {
                 assert_eq!(key, "host");
                 assert_eq!(value, "server01");
             }
-            _ => panic!("Expected Equals filter"),
+            _ => panic!("Expected Leaf(Equals) filter, got {:?}", filter),
         }
     }
 
@@ -1057,14 +1094,14 @@ mod tests {
     fn test_where_tag_in() {
         let query =
             translate("SELECT * FROM cpu WHERE region IN ('us-west', 'us-east')").unwrap();
-        assert_eq!(query.tag_filters.len(), 1);
-        match &query.tag_filters[0] {
-            TagFilter::In { key, values } => {
+        let filter = query.filter.expect("Expected filter");
+        match &filter {
+            FilterExpr::Leaf(TagFilter::In { key, values }) => {
                 assert_eq!(key, "region");
                 assert!(values.contains(&"us-west".to_string()));
                 assert!(values.contains(&"us-east".to_string()));
             }
-            _ => panic!("Expected In filter"),
+            _ => panic!("Expected Leaf(In) filter, got {:?}", filter),
         }
     }
 
@@ -1072,14 +1109,14 @@ mod tests {
     fn test_where_tag_not_in() {
         let query =
             translate("SELECT * FROM cpu WHERE region NOT IN ('us-west', 'us-east')").unwrap();
-        assert_eq!(query.tag_filters.len(), 1);
-        match &query.tag_filters[0] {
-            TagFilter::NotIn { key, values } => {
+        let filter = query.filter.expect("Expected filter");
+        match &filter {
+            FilterExpr::Leaf(TagFilter::NotIn { key, values }) => {
                 assert_eq!(key, "region");
                 assert!(values.contains(&"us-west".to_string()));
                 assert!(values.contains(&"us-east".to_string()));
             }
-            _ => panic!("Expected NotIn filter"),
+            _ => panic!("Expected Leaf(NotIn) filter, got {:?}", filter),
         }
     }
 
@@ -1131,20 +1168,24 @@ mod tests {
             "SELECT * FROM cpu WHERE host = 'server01' AND region = 'us-west' AND time >= '2024-01-01'",
         )
         .unwrap();
-        assert_eq!(query.tag_filters.len(), 2);
+        let filter = query.filter.expect("Expected filter");
+        match &filter {
+            FilterExpr::And(children) => assert_eq!(children.len(), 2),
+            _ => panic!("Expected And filter with 2 children, got {:?}", filter),
+        }
         assert!(query.time_range.start > 0);
     }
 
     #[test]
     fn test_tag_not_equals() {
         let query = translate("SELECT * FROM cpu WHERE host != 'server01'").unwrap();
-        assert_eq!(query.tag_filters.len(), 1);
-        match &query.tag_filters[0] {
-            TagFilter::NotEquals { key, value } => {
+        let filter = query.filter.expect("Expected filter");
+        match &filter {
+            FilterExpr::Leaf(TagFilter::NotEquals { key, value }) => {
                 assert_eq!(key, "host");
                 assert_eq!(value, "server01");
             }
-            _ => panic!("Expected NotEquals filter"),
+            _ => panic!("Expected Leaf(NotEquals) filter, got {:?}", filter),
         }
     }
 
@@ -1169,9 +1210,29 @@ mod tests {
     }
 
     #[test]
-    fn test_or_rejected() {
-        let result = translate("SELECT * FROM cpu WHERE host = 'a' OR host = 'b'");
-        assert!(result.is_err());
+    fn test_or_supported() {
+        let query = translate("SELECT * FROM cpu WHERE host = 'a' OR host = 'b'").unwrap();
+        let filter = query.filter.expect("Expected filter");
+        match &filter {
+            FilterExpr::Or(children) => {
+                assert_eq!(children.len(), 2);
+                match &children[0] {
+                    FilterExpr::Leaf(TagFilter::Equals { key, value }) => {
+                        assert_eq!(key, "host");
+                        assert_eq!(value, "a");
+                    }
+                    _ => panic!("Expected Leaf(Equals) for first OR child"),
+                }
+                match &children[1] {
+                    FilterExpr::Leaf(TagFilter::Equals { key, value }) => {
+                        assert_eq!(key, "host");
+                        assert_eq!(value, "b");
+                    }
+                    _ => panic!("Expected Leaf(Equals) for second OR child"),
+                }
+            }
+            _ => panic!("Expected Or filter, got {:?}", filter),
+        }
     }
 
     #[test]
@@ -1188,7 +1249,7 @@ mod tests {
         match cmd {
             SqlCommand::Explain(query) => {
                 assert_eq!(query.measurement, "cpu");
-                assert_eq!(query.tag_filters.len(), 1);
+                assert!(query.filter.is_some(), "Expected filter to be set");
             }
             _ => panic!("Expected Explain command"),
         }
@@ -1204,6 +1265,70 @@ mod tests {
                 assert!(matches!(query.field_selection, FieldSelection::Aggregate { .. }));
             }
             _ => panic!("Expected Explain command"),
+        }
+    }
+
+    #[test]
+    fn test_or_with_and() {
+        // (host = 'a' OR host = 'b') AND region = 'us-west'
+        let query = translate(
+            "SELECT * FROM cpu WHERE (host = 'a' OR host = 'b') AND region = 'us-west'",
+        )
+        .unwrap();
+        let filter = query.filter.expect("Expected filter");
+        match &filter {
+            FilterExpr::And(children) => {
+                assert_eq!(children.len(), 2);
+                assert!(matches!(&children[0], FilterExpr::Or(_)));
+                assert!(matches!(&children[1], FilterExpr::Leaf(TagFilter::Equals { .. })));
+            }
+            _ => panic!("Expected And filter, got {:?}", filter),
+        }
+    }
+
+    #[test]
+    fn test_or_with_time_range() {
+        let query = translate(
+            "SELECT * FROM cpu WHERE (host = 'a' OR host = 'b') AND time >= '2024-01-01'",
+        )
+        .unwrap();
+        // Time condition should be extracted, filter should just be the OR
+        let filter = query.filter.expect("Expected filter");
+        match &filter {
+            FilterExpr::Or(children) => assert_eq!(children.len(), 2),
+            _ => panic!("Expected Or filter (time extracted), got {:?}", filter),
+        }
+        assert!(query.time_range.start > 0);
+    }
+
+    #[test]
+    fn test_triple_or() {
+        let query = translate(
+            "SELECT * FROM cpu WHERE host = 'a' OR host = 'b' OR host = 'c'",
+        )
+        .unwrap();
+        let filter = query.filter.expect("Expected filter");
+        match &filter {
+            FilterExpr::Or(children) => assert_eq!(children.len(), 3),
+            _ => panic!("Expected Or filter with 3 children, got {:?}", filter),
+        }
+    }
+
+    #[test]
+    fn test_nested_or_and() {
+        // host = 'a' OR (region = 'us' AND env = 'prod')
+        let query = translate(
+            "SELECT * FROM cpu WHERE host = 'a' OR (region = 'us' AND env = 'prod')",
+        )
+        .unwrap();
+        let filter = query.filter.expect("Expected filter");
+        match &filter {
+            FilterExpr::Or(children) => {
+                assert_eq!(children.len(), 2);
+                assert!(matches!(&children[0], FilterExpr::Leaf(TagFilter::Equals { .. })));
+                assert!(matches!(&children[1], FilterExpr::And(_)));
+            }
+            _ => panic!("Expected Or filter, got {:?}", filter),
         }
     }
 }

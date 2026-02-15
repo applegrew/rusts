@@ -13,7 +13,7 @@ A high-performance time series database written in Rust, designed for monitoring
 - **Flexible Durability**: Configurable WAL modes (sync per write, periodic, or async)
 - **Advanced Compression**: Gorilla XOR for floats, delta-of-delta for timestamps, dictionary encoding for strings
 - **Horizontal Scaling**: Static cluster configuration with sharding and replication
-- **Rich Query API**: Aggregations, time bucketing, tag filtering, and more
+- **Rich Query API**: Aggregations, time bucketing, tag filtering with AND/OR/NOT, and more
 - **Retention Policies**: Automatic data expiration and storage tiering
 
 ## Architecture
@@ -242,15 +242,44 @@ curl -X POST 'http://localhost:8086/query' \
     }
   }'
 
-# Query with tag filter
+# Query with tag filter (simple equality)
 curl -X POST 'http://localhost:8086/query' \
   -H 'Content-Type: application/json' \
   -d '{
     "measurement": "cpu",
     "time_range": {"start": 0, "end": 9223372036854775807},
-    "tag_filters": [
-      {"key": "host", "value": "server01", "op": "Eq"}
-    ]
+    "tags": {"host": "server01"}
+  }'
+
+# Query with OR filter
+curl -X POST 'http://localhost:8086/query' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "measurement": "cpu",
+    "time_range": {"start": 0, "end": 9223372036854775807},
+    "filter": {
+      "or": [
+        {"tag": {"key": "host", "op": "eq", "value": "server01"}},
+        {"tag": {"key": "host", "op": "eq", "value": "server02"}}
+      ]
+    }
+  }'
+
+# Query with nested AND/OR filter
+curl -X POST 'http://localhost:8086/query' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "measurement": "cpu",
+    "time_range": {"start": 0, "end": 9223372036854775807},
+    "filter": {
+      "and": [
+        {"or": [
+          {"tag": {"key": "host", "op": "eq", "value": "server01"}},
+          {"tag": {"key": "host", "op": "eq", "value": "server02"}}
+        ]},
+        {"tag": {"key": "region", "op": "eq", "value": "us-west"}}
+      ]
+    }
   }'
 
 # Query with aggregation
@@ -259,10 +288,9 @@ curl -X POST 'http://localhost:8086/query' \
   -d '{
     "measurement": "cpu",
     "time_range": {"start": 0, "end": 9223372036854775807},
-    "aggregation": {
+    "aggregate": {
       "function": "Mean",
-      "field": "usage",
-      "interval_nanos": 60000000000
+      "field": "usage"
     }
   }'
 ```
@@ -737,6 +765,14 @@ curl -X POST 'http://localhost:8086/sql' \
 curl -X POST 'http://localhost:8086/sql' \
   -d "SELECT AVG(usage), MAX(usage) FROM cpu GROUP BY host"
 
+# OR conditions
+curl -X POST 'http://localhost:8086/sql' \
+  -d "SELECT * FROM cpu WHERE host = 'server01' OR host = 'server02'"
+
+# Nested AND/OR with parentheses
+curl -X POST 'http://localhost:8086/sql' \
+  -d "SELECT * FROM cpu WHERE (host = 'server01' OR host = 'server02') AND region = 'us-west'"
+
 # Time range filtering
 curl -X POST 'http://localhost:8086/sql' \
   -d "SELECT * FROM cpu WHERE time >= '2024-01-01' AND time < '2024-01-02'"
@@ -752,6 +788,8 @@ curl -X POST 'http://localhost:8086/sql' \
 | Tag IN | `WHERE region IN ('us-west', 'us-east')` |
 | Tag NOT EQUALS | `WHERE host != 'server01'` |
 | Tag EXISTS | `WHERE host IS NOT NULL` |
+| OR conditions | `WHERE host = 'a' OR host = 'b'` |
+| Nested AND/OR | `WHERE (host = 'a' OR host = 'b') AND region = 'us'` |
 | Time range | `WHERE time >= '2024-01-01' AND time < '2024-01-02'` |
 | Aggregations | `SELECT AVG(usage), COUNT(*), MAX(temp) FROM cpu` |
 | GROUP BY tags | `GROUP BY host, region` |
@@ -761,7 +799,7 @@ curl -X POST 'http://localhost:8086/sql' \
 
 **Supported aggregate functions:** COUNT, SUM, AVG/MEAN, MIN, MAX, FIRST, LAST, STDDEV, VARIANCE, PERCENTILE_N
 
-**Not supported (v1):** JOINs, subqueries, CTEs, window functions, UNION, OR conditions
+**Not supported (v1):** JOINs, subqueries, CTEs, window functions, UNION
 
 ### SHOW TABLES
 
@@ -789,6 +827,7 @@ curl -X POST 'http://localhost:8086/sql' -d "SHOW TABLES"
   - [x] Time-series functions (now(), time_bucket())
   - [x] /sql API endpoint
   - [x] Documentation and examples
+  - [x] OR-clause support (AND/OR/NOT filter expressions)
   - [ ] DataFusion integration (future)
 - [x] PostgreSQL wire protocol
   - [x] pgwire crate integration

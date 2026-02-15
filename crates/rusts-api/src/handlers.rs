@@ -13,7 +13,7 @@ use opentelemetry::metrics::{Counter, Gauge, Histogram};
 use parking_lot::RwLock;
 use rusts_core::{ParallelConfig, TimeRange};
 use rusts_index::{SeriesIndex, TagIndex};
-use rusts_query::{AggregateFunction, Query, QueryExecutor, QueryPlanner};
+use rusts_query::{AggregateFunction, FilterExpr, Query, QueryExecutor, QueryPlanner, TagFilter};
 use rusts_sql::{SqlCommand, SqlParser, SqlTranslator};
 use rusts_storage::StorageEngine;
 use serde::{Deserialize, Serialize};
@@ -308,13 +308,123 @@ pub async fn write(
 pub struct QueryRequest {
     pub measurement: String,
     pub time_range: Option<TimeRangeRequest>,
+    /// Simple tag equality filters (AND). Kept for backward compatibility.
     pub tags: Option<HashMap<String, String>>,
+    /// Structured filter expression supporting AND, OR, NOT.
+    /// When present, this is ANDed with `tags` (if also present).
+    pub filter: Option<FilterExprRequest>,
     pub fields: Option<Vec<String>>,
     pub aggregate: Option<AggregateRequest>,
     pub group_by: Option<Vec<String>>,
     pub group_by_time: Option<String>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
+}
+
+/// JSON-friendly filter expression for the query API.
+///
+/// Examples:
+/// - `{"tag": {"key": "host", "op": "eq", "value": "server01"}}`
+/// - `{"or": [{"tag": {...}}, {"tag": {...}}]}`
+/// - `{"and": [{"tag": {...}}, {"or": [...]}]}`
+/// - `{"not": {"tag": {...}}}`
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FilterExprRequest {
+    /// A single tag filter condition
+    Tag(TagFilterRequest),
+    /// All sub-expressions must match
+    And(Vec<FilterExprRequest>),
+    /// At least one sub-expression must match
+    Or(Vec<FilterExprRequest>),
+    /// Negate a sub-expression
+    Not(Box<FilterExprRequest>),
+}
+
+/// A single tag filter condition for the JSON API.
+#[derive(Debug, Deserialize)]
+pub struct TagFilterRequest {
+    pub key: String,
+    /// Operator: "eq", "neq", "in", "not_in", "regex", "exists"
+    pub op: String,
+    /// Value for eq/neq/regex operators
+    #[serde(default)]
+    pub value: Option<String>,
+    /// Values for in/not_in operators
+    #[serde(default)]
+    pub values: Option<Vec<String>>,
+}
+
+impl FilterExprRequest {
+    /// Convert to the internal FilterExpr type
+    pub fn to_filter_expr(&self) -> std::result::Result<FilterExpr, String> {
+        match self {
+            FilterExprRequest::Tag(tag) => {
+                let filter = match tag.op.as_str() {
+                    "eq" | "=" | "equals" => {
+                        let value = tag.value.as_ref()
+                            .ok_or("'value' required for eq operator")?;
+                        TagFilter::Equals {
+                            key: tag.key.clone(),
+                            value: value.clone(),
+                        }
+                    }
+                    "neq" | "!=" | "not_equals" => {
+                        let value = tag.value.as_ref()
+                            .ok_or("'value' required for neq operator")?;
+                        TagFilter::NotEquals {
+                            key: tag.key.clone(),
+                            value: value.clone(),
+                        }
+                    }
+                    "in" => {
+                        let values = tag.values.as_ref()
+                            .ok_or("'values' required for in operator")?;
+                        TagFilter::In {
+                            key: tag.key.clone(),
+                            values: values.clone(),
+                        }
+                    }
+                    "not_in" => {
+                        let values = tag.values.as_ref()
+                            .ok_or("'values' required for not_in operator")?;
+                        TagFilter::NotIn {
+                            key: tag.key.clone(),
+                            values: values.clone(),
+                        }
+                    }
+                    "regex" | "=~" => {
+                        let value = tag.value.as_ref()
+                            .ok_or("'value' required for regex operator")?;
+                        TagFilter::Regex {
+                            key: tag.key.clone(),
+                            pattern: value.clone(),
+                        }
+                    }
+                    "exists" => {
+                        TagFilter::Exists {
+                            key: tag.key.clone(),
+                        }
+                    }
+                    other => return Err(format!("Unknown filter operator: '{}'", other)),
+                };
+                Ok(FilterExpr::Leaf(filter))
+            }
+            FilterExprRequest::And(exprs) => {
+                let children: std::result::Result<Vec<_>, _> =
+                    exprs.iter().map(|e| e.to_filter_expr()).collect();
+                Ok(FilterExpr::And(children?))
+            }
+            FilterExprRequest::Or(exprs) => {
+                let children: std::result::Result<Vec<_>, _> =
+                    exprs.iter().map(|e| e.to_filter_expr()).collect();
+                Ok(FilterExpr::Or(children?))
+            }
+            FilterExprRequest::Not(inner) => {
+                Ok(FilterExpr::Not(Box::new(inner.to_filter_expr()?)))
+            }
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -379,10 +489,36 @@ pub async fn query(
         let mut builder = Query::builder(&req.measurement)
             .time_range(time_range.start, time_range.end);
 
-        // Add tag filters
-        if let Some(tags) = &req.tags {
-            for (key, value) in tags {
-                builder = builder.where_tag(key, value);
+        // Build filter expression from tags and/or filter fields
+        {
+            let mut filter_parts: Vec<FilterExpr> = Vec::new();
+
+            // Convert legacy tags to filter expressions
+            if let Some(tags) = &req.tags {
+                for (key, value) in tags {
+                    filter_parts.push(FilterExpr::Leaf(TagFilter::Equals {
+                        key: key.clone(),
+                        value: value.clone(),
+                    }));
+                }
+            }
+
+            // Convert structured filter expression
+            if let Some(filter_req) = &req.filter {
+                let expr = filter_req.to_filter_expr()
+                    .map_err(|e| ApiError::Query(e))?;
+                filter_parts.push(expr);
+            }
+
+            // Combine: if multiple parts, AND them together
+            match filter_parts.len() {
+                0 => {}
+                1 => {
+                    builder = builder.filter(filter_parts.into_iter().next().unwrap());
+                }
+                _ => {
+                    builder = builder.filter(FilterExpr::And(filter_parts));
+                }
             }
         }
 

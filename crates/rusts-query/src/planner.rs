@@ -1,7 +1,7 @@
 //! Query planner with partition pruning and time-series specific optimizations
 
 use crate::error::Result;
-use crate::model::{Query, TagFilter};
+use crate::model::{FilterExpr, Query, TagFilter};
 use rusts_core::{SeriesId, TimeRange};
 use serde::Serialize;
 
@@ -146,7 +146,8 @@ impl QueryPlanner {
         // Use saturating_sub to prevent overflow with extreme time ranges (i64::MIN to i64::MAX)
         let time_range_nanos = query.time_range.end.saturating_sub(query.time_range.start);
         let time_cost = time_range_nanos as f64 / 1_000_000_000.0;
-        let filter_discount = if query.tag_filters.is_empty() { 1.0 } else { 0.5 };
+        let has_filters = query.effective_filter().is_some();
+        let filter_discount = if has_filters { 0.5 } else { 1.0 };
 
         let estimated_cost = (base_cost + time_cost) * filter_discount;
 
@@ -195,17 +196,53 @@ impl QueryPlanner {
         // Simple heuristic: each filter roughly halves the result set
         let mut selectivity = 1.0;
         for filter in filters {
-            match filter {
-                TagFilter::Equals { .. } => selectivity *= 0.1,
-                TagFilter::NotEquals { .. } => selectivity *= 0.9,
-                TagFilter::Regex { .. } => selectivity *= 0.3,
-                TagFilter::In { values, .. } => selectivity *= (values.len() as f64 * 0.1).min(0.5),
-                TagFilter::NotIn { values, .. } => selectivity *= 1.0 - (values.len() as f64 * 0.1).min(0.5),
-                TagFilter::Exists { .. } => selectivity *= 0.7,
-            }
+            selectivity *= Self::estimate_leaf_selectivity(filter);
         }
 
         selectivity.max(0.001)
+    }
+
+    /// Estimate selectivity of a single TagFilter leaf
+    fn estimate_leaf_selectivity(filter: &TagFilter) -> f64 {
+        match filter {
+            TagFilter::Equals { .. } => 0.1,
+            TagFilter::NotEquals { .. } => 0.9,
+            TagFilter::Regex { .. } => 0.3,
+            TagFilter::In { values, .. } => (values.len() as f64 * 0.1).min(0.5),
+            TagFilter::NotIn { values, .. } => 1.0 - (values.len() as f64 * 0.1).min(0.5),
+            TagFilter::Exists { .. } => 0.7,
+        }
+    }
+
+    /// Estimate selectivity of a FilterExpr tree (0.0 - 1.0)
+    pub fn estimate_filter_selectivity(&self, expr: &FilterExpr) -> f64 {
+        match expr {
+            FilterExpr::Leaf(filter) => Self::estimate_leaf_selectivity(filter),
+            FilterExpr::And(exprs) => {
+                if exprs.is_empty() {
+                    return 1.0;
+                }
+                let mut selectivity = 1.0;
+                for e in exprs {
+                    selectivity *= self.estimate_filter_selectivity(e);
+                }
+                selectivity.max(0.001)
+            }
+            FilterExpr::Or(exprs) => {
+                if exprs.is_empty() {
+                    return 0.0;
+                }
+                // Inclusion-exclusion approximation: 1 - product(1 - s_i)
+                let mut complement = 1.0;
+                for e in exprs {
+                    complement *= 1.0 - self.estimate_filter_selectivity(e);
+                }
+                (1.0 - complement).max(0.001)
+            }
+            FilterExpr::Not(inner) => {
+                (1.0 - self.estimate_filter_selectivity(inner)).max(0.001)
+            }
+        }
     }
 }
 
@@ -361,6 +398,7 @@ mod tests {
             measurement: "cpu".to_string(),
             time_range: TimeRange::new(i64::MIN, i64::MAX),
             tag_filters: Vec::new(),
+            filter: None,
             field_selection: crate::model::FieldSelection::All,
             group_by: Vec::new(),
             group_by_time: None,

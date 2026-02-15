@@ -1,6 +1,6 @@
 use rusts_core::{FieldValue, Point};
 use rusts_index::{SeriesIndex, TagIndex};
-use rusts_query::{AggregateFunction, Query, QueryExecutor, TagFilter};
+use rusts_query::{AggregateFunction, FilterExpr, Query, QueryExecutor, TagFilter};
 use rusts_storage::{StorageEngine, StorageEngineConfig, WalDurability};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -338,4 +338,150 @@ fn large_volume_ingestion_and_query_smoke() {
     let result = executor.execute(q).unwrap();
     let v = result.rows[0].fields.values().next().unwrap();
     assert_eq!(v, &FieldValue::Integer(expected as i64));
+}
+
+#[test]
+fn or_filter_returns_union_of_matching_series() {
+    let env = TestEnv::new();
+
+    // 3 series: s1/us, s2/eu, s3/ap
+    let p1 = create_test_point("cpu", &[("host", "s1"), ("region", "us")], 1000, 1.0);
+    let p2 = create_test_point("cpu", &[("host", "s2"), ("region", "eu")], 1000, 2.0);
+    let p3 = create_test_point("cpu", &[("host", "s3"), ("region", "ap")], 1000, 3.0);
+
+    for p in [&p1, &p2, &p3] {
+        env.storage.write(p).unwrap();
+        index_point(p, &env.series_index, &env.tag_index);
+    }
+
+    let executor = QueryExecutor::new(
+        Arc::clone(&env.storage),
+        Arc::clone(&env.series_index),
+        Arc::clone(&env.tag_index),
+    );
+
+    // OR: host = 's1' OR host = 's3' → should return 2 series
+    let query = Query::builder("cpu")
+        .time_range(0, 10_000)
+        .filter(FilterExpr::or(vec![
+            FilterExpr::leaf(TagFilter::Equals {
+                key: "host".to_string(),
+                value: "s1".to_string(),
+            }),
+            FilterExpr::leaf(TagFilter::Equals {
+                key: "host".to_string(),
+                value: "s3".to_string(),
+            }),
+        ]))
+        .build()
+        .unwrap();
+
+    let result = executor.execute(query).unwrap();
+    let hosts: HashSet<String> = result
+        .rows
+        .iter()
+        .flat_map(|r| r.tags.iter().filter(|t| t.key == "host").map(|t| t.value.clone()))
+        .collect();
+    assert_eq!(hosts.len(), 2);
+    assert!(hosts.contains("s1"));
+    assert!(hosts.contains("s3"));
+}
+
+#[test]
+fn nested_and_or_filter_works() {
+    let env = TestEnv::new();
+
+    // 4 series with different host/region combos
+    let points = vec![
+        create_test_point("cpu", &[("host", "s1"), ("region", "us")], 1000, 1.0),
+        create_test_point("cpu", &[("host", "s2"), ("region", "us")], 1000, 2.0),
+        create_test_point("cpu", &[("host", "s3"), ("region", "eu")], 1000, 3.0),
+        create_test_point("cpu", &[("host", "s4"), ("region", "eu")], 1000, 4.0),
+    ];
+
+    for p in &points {
+        env.storage.write(p).unwrap();
+        index_point(p, &env.series_index, &env.tag_index);
+    }
+
+    let executor = QueryExecutor::new(
+        Arc::clone(&env.storage),
+        Arc::clone(&env.series_index),
+        Arc::clone(&env.tag_index),
+    );
+
+    // (host = 's1' OR host = 's3') AND region = 'us'
+    // Only s1 matches (s3 is in eu)
+    let query = Query::builder("cpu")
+        .time_range(0, 10_000)
+        .filter(FilterExpr::and(vec![
+            FilterExpr::or(vec![
+                FilterExpr::leaf(TagFilter::Equals {
+                    key: "host".to_string(),
+                    value: "s1".to_string(),
+                }),
+                FilterExpr::leaf(TagFilter::Equals {
+                    key: "host".to_string(),
+                    value: "s3".to_string(),
+                }),
+            ]),
+            FilterExpr::leaf(TagFilter::Equals {
+                key: "region".to_string(),
+                value: "us".to_string(),
+            }),
+        ]))
+        .build()
+        .unwrap();
+
+    let result = executor.execute(query).unwrap();
+    assert_eq!(result.rows.len(), 1);
+    let host = result.rows[0]
+        .tags
+        .iter()
+        .find(|t| t.key == "host")
+        .unwrap()
+        .value
+        .clone();
+    assert_eq!(host, "s1");
+}
+
+#[test]
+fn not_filter_excludes_matching_series() {
+    let env = TestEnv::new();
+
+    let p1 = create_test_point("cpu", &[("host", "s1")], 1000, 1.0);
+    let p2 = create_test_point("cpu", &[("host", "s2")], 1000, 2.0);
+    let p3 = create_test_point("cpu", &[("host", "s3")], 1000, 3.0);
+
+    for p in [&p1, &p2, &p3] {
+        env.storage.write(p).unwrap();
+        index_point(p, &env.series_index, &env.tag_index);
+    }
+
+    let executor = QueryExecutor::new(
+        Arc::clone(&env.storage),
+        Arc::clone(&env.series_index),
+        Arc::clone(&env.tag_index),
+    );
+
+    // NOT host = 's2' → should return s1 and s3
+    let query = Query::builder("cpu")
+        .time_range(0, 10_000)
+        .filter(FilterExpr::not(FilterExpr::leaf(TagFilter::Equals {
+            key: "host".to_string(),
+            value: "s2".to_string(),
+        })))
+        .build()
+        .unwrap();
+
+    let result = executor.execute(query).unwrap();
+    let hosts: HashSet<String> = result
+        .rows
+        .iter()
+        .flat_map(|r| r.tags.iter().filter(|t| t.key == "host").map(|t| t.value.clone()))
+        .collect();
+    assert_eq!(hosts.len(), 2);
+    assert!(hosts.contains("s1"));
+    assert!(hosts.contains("s3"));
+    assert!(!hosts.contains("s2"));
 }

@@ -53,6 +53,92 @@ impl TagFilter {
     }
 }
 
+/// A filter expression that supports AND, OR, and NOT composition.
+///
+/// This allows complex filter logic like:
+/// `(host = 'server01' OR host = 'server02') AND region = 'us-west'`
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FilterExpr {
+    /// A single tag filter (leaf node)
+    Leaf(TagFilter),
+    /// All sub-expressions must match (AND)
+    And(Vec<FilterExpr>),
+    /// At least one sub-expression must match (OR)
+    Or(Vec<FilterExpr>),
+    /// Negate a sub-expression (NOT)
+    Not(Box<FilterExpr>),
+}
+
+impl FilterExpr {
+    /// Check if a set of tags matches this filter expression
+    pub fn matches(&self, tags: &[Tag]) -> bool {
+        match self {
+            FilterExpr::Leaf(filter) => filter.matches(tags),
+            FilterExpr::And(exprs) => exprs.iter().all(|e| e.matches(tags)),
+            FilterExpr::Or(exprs) => exprs.iter().any(|e| e.matches(tags)),
+            FilterExpr::Not(expr) => !expr.matches(tags),
+        }
+    }
+
+    /// Create a leaf filter expression
+    pub fn leaf(filter: TagFilter) -> Self {
+        FilterExpr::Leaf(filter)
+    }
+
+    /// Create an AND expression
+    pub fn and(exprs: Vec<FilterExpr>) -> Self {
+        FilterExpr::And(exprs)
+    }
+
+    /// Create an OR expression
+    pub fn or(exprs: Vec<FilterExpr>) -> Self {
+        FilterExpr::Or(exprs)
+    }
+
+    /// Create a NOT expression
+    pub fn not(expr: FilterExpr) -> Self {
+        FilterExpr::Not(Box::new(expr))
+    }
+
+    /// Check if this expression is empty (no actual filters)
+    pub fn is_empty(&self) -> bool {
+        match self {
+            FilterExpr::Leaf(_) => false,
+            FilterExpr::And(exprs) | FilterExpr::Or(exprs) => exprs.is_empty(),
+            FilterExpr::Not(_) => false,
+        }
+    }
+
+    /// Collect all leaf TagFilters from this expression tree (flattened)
+    pub fn collect_leaf_filters(&self) -> Vec<&TagFilter> {
+        match self {
+            FilterExpr::Leaf(f) => vec![f],
+            FilterExpr::And(exprs) | FilterExpr::Or(exprs) => {
+                exprs.iter().flat_map(|e| e.collect_leaf_filters()).collect()
+            }
+            FilterExpr::Not(expr) => expr.collect_leaf_filters(),
+        }
+    }
+}
+
+impl From<Vec<TagFilter>> for FilterExpr {
+    /// Convert a flat list of TagFilters into an AND expression.
+    /// This preserves backward compatibility with the old Vec<TagFilter> model.
+    fn from(filters: Vec<TagFilter>) -> Self {
+        if filters.len() == 1 {
+            FilterExpr::Leaf(filters.into_iter().next().unwrap())
+        } else {
+            FilterExpr::And(filters.into_iter().map(FilterExpr::Leaf).collect())
+        }
+    }
+}
+
+impl From<TagFilter> for FilterExpr {
+    fn from(filter: TagFilter) -> Self {
+        FilterExpr::Leaf(filter)
+    }
+}
+
 /// Field selection
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum FieldSelection {
@@ -100,8 +186,12 @@ pub struct Query {
     pub measurement: String,
     /// Time range
     pub time_range: TimeRange,
-    /// Tag filters (AND)
+    /// Tag filters (AND) - kept for backward compatibility
     pub tag_filters: Vec<TagFilter>,
+    /// Filter expression tree (supports AND, OR, NOT)
+    /// When present, this takes precedence over tag_filters
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<FilterExpr>,
     /// Field selection
     pub field_selection: FieldSelection,
     /// Group by tags
@@ -120,6 +210,24 @@ impl Query {
     /// Create a new query builder
     pub fn builder(measurement: impl Into<String>) -> QueryBuilder {
         QueryBuilder::new(measurement)
+    }
+
+    /// Get the effective filter expression for this query.
+    ///
+    /// If `filter` is set, it takes precedence. Otherwise, `tag_filters` is
+    /// converted into a `FilterExpr::And`. Returns `None` if no filters exist.
+    pub fn effective_filter(&self) -> Option<FilterExpr> {
+        if let Some(ref filter) = self.filter {
+            if filter.is_empty() {
+                None
+            } else {
+                Some(filter.clone())
+            }
+        } else if self.tag_filters.is_empty() {
+            None
+        } else {
+            Some(FilterExpr::from(self.tag_filters.clone()))
+        }
     }
 
     /// Validate the query
@@ -144,6 +252,7 @@ pub struct QueryBuilder {
     measurement: String,
     time_range: TimeRange,
     tag_filters: Vec<TagFilter>,
+    filter: Option<FilterExpr>,
     field_selection: FieldSelection,
     group_by: Vec<String>,
     group_by_time: Option<i64>,
@@ -159,6 +268,7 @@ impl QueryBuilder {
             measurement: measurement.into(),
             time_range: TimeRange::default(),
             tag_filters: Vec::new(),
+            filter: None,
             field_selection: FieldSelection::All,
             group_by: Vec::new(),
             group_by_time: None,
@@ -207,6 +317,14 @@ impl QueryBuilder {
             key: key.into(),
             values,
         });
+        self
+    }
+
+    /// Set a filter expression (supports AND, OR, NOT)
+    ///
+    /// When set, this takes precedence over individual where_tag* filters.
+    pub fn filter(mut self, filter: FilterExpr) -> Self {
+        self.filter = Some(filter);
         self
     }
 
@@ -267,6 +385,7 @@ impl QueryBuilder {
             measurement: self.measurement,
             time_range: self.time_range,
             tag_filters: self.tag_filters,
+            filter: self.filter,
             field_selection: self.field_selection,
             group_by: self.group_by,
             group_by_time: self.group_by_time,
@@ -414,6 +533,232 @@ mod tests {
             key: "nonexistent".to_string(),
         };
         assert!(!filter.matches(&tags));
+    }
+
+    #[test]
+    fn test_filter_expr_matches_leaf() {
+        let tags = vec![
+            Tag::new("host", "server01"),
+            Tag::new("region", "us-west"),
+        ];
+
+        let expr = FilterExpr::leaf(TagFilter::Equals {
+            key: "host".to_string(),
+            value: "server01".to_string(),
+        });
+        assert!(expr.matches(&tags));
+
+        let expr = FilterExpr::leaf(TagFilter::Equals {
+            key: "host".to_string(),
+            value: "server02".to_string(),
+        });
+        assert!(!expr.matches(&tags));
+    }
+
+    #[test]
+    fn test_filter_expr_matches_and() {
+        let tags = vec![
+            Tag::new("host", "server01"),
+            Tag::new("region", "us-west"),
+        ];
+
+        // Both match
+        let expr = FilterExpr::and(vec![
+            FilterExpr::leaf(TagFilter::Equals {
+                key: "host".to_string(),
+                value: "server01".to_string(),
+            }),
+            FilterExpr::leaf(TagFilter::Equals {
+                key: "region".to_string(),
+                value: "us-west".to_string(),
+            }),
+        ]);
+        assert!(expr.matches(&tags));
+
+        // One doesn't match
+        let expr = FilterExpr::and(vec![
+            FilterExpr::leaf(TagFilter::Equals {
+                key: "host".to_string(),
+                value: "server01".to_string(),
+            }),
+            FilterExpr::leaf(TagFilter::Equals {
+                key: "region".to_string(),
+                value: "us-east".to_string(),
+            }),
+        ]);
+        assert!(!expr.matches(&tags));
+    }
+
+    #[test]
+    fn test_filter_expr_matches_or() {
+        let tags = vec![
+            Tag::new("host", "server01"),
+            Tag::new("region", "us-west"),
+        ];
+
+        // First matches
+        let expr = FilterExpr::or(vec![
+            FilterExpr::leaf(TagFilter::Equals {
+                key: "host".to_string(),
+                value: "server01".to_string(),
+            }),
+            FilterExpr::leaf(TagFilter::Equals {
+                key: "host".to_string(),
+                value: "server02".to_string(),
+            }),
+        ]);
+        assert!(expr.matches(&tags));
+
+        // Neither matches
+        let expr = FilterExpr::or(vec![
+            FilterExpr::leaf(TagFilter::Equals {
+                key: "host".to_string(),
+                value: "server02".to_string(),
+            }),
+            FilterExpr::leaf(TagFilter::Equals {
+                key: "host".to_string(),
+                value: "server03".to_string(),
+            }),
+        ]);
+        assert!(!expr.matches(&tags));
+    }
+
+    #[test]
+    fn test_filter_expr_matches_not() {
+        let tags = vec![Tag::new("host", "server01")];
+
+        let expr = FilterExpr::not(FilterExpr::leaf(TagFilter::Equals {
+            key: "host".to_string(),
+            value: "server02".to_string(),
+        }));
+        assert!(expr.matches(&tags));
+
+        let expr = FilterExpr::not(FilterExpr::leaf(TagFilter::Equals {
+            key: "host".to_string(),
+            value: "server01".to_string(),
+        }));
+        assert!(!expr.matches(&tags));
+    }
+
+    #[test]
+    fn test_filter_expr_nested_and_or() {
+        // (host = 'server01' OR host = 'server02') AND region = 'us-west'
+        let tags_match = vec![
+            Tag::new("host", "server01"),
+            Tag::new("region", "us-west"),
+        ];
+        let tags_wrong_region = vec![
+            Tag::new("host", "server01"),
+            Tag::new("region", "us-east"),
+        ];
+        let tags_wrong_host = vec![
+            Tag::new("host", "server03"),
+            Tag::new("region", "us-west"),
+        ];
+
+        let expr = FilterExpr::and(vec![
+            FilterExpr::or(vec![
+                FilterExpr::leaf(TagFilter::Equals {
+                    key: "host".to_string(),
+                    value: "server01".to_string(),
+                }),
+                FilterExpr::leaf(TagFilter::Equals {
+                    key: "host".to_string(),
+                    value: "server02".to_string(),
+                }),
+            ]),
+            FilterExpr::leaf(TagFilter::Equals {
+                key: "region".to_string(),
+                value: "us-west".to_string(),
+            }),
+        ]);
+
+        assert!(expr.matches(&tags_match));
+        assert!(!expr.matches(&tags_wrong_region));
+        assert!(!expr.matches(&tags_wrong_host));
+    }
+
+    #[test]
+    fn test_filter_expr_from_vec() {
+        let filters = vec![
+            TagFilter::Equals {
+                key: "host".to_string(),
+                value: "server01".to_string(),
+            },
+            TagFilter::Equals {
+                key: "region".to_string(),
+                value: "us-west".to_string(),
+            },
+        ];
+        let expr = FilterExpr::from(filters);
+        match &expr {
+            FilterExpr::And(children) => assert_eq!(children.len(), 2),
+            _ => panic!("Expected And, got {:?}", expr),
+        }
+
+        // Single filter should become Leaf, not And
+        let filters = vec![TagFilter::Equals {
+            key: "host".to_string(),
+            value: "server01".to_string(),
+        }];
+        let expr = FilterExpr::from(filters);
+        assert!(matches!(expr, FilterExpr::Leaf(_)));
+    }
+
+    #[test]
+    fn test_filter_expr_is_empty() {
+        assert!(!FilterExpr::leaf(TagFilter::Exists { key: "x".to_string() }).is_empty());
+        assert!(FilterExpr::and(vec![]).is_empty());
+        assert!(FilterExpr::or(vec![]).is_empty());
+        assert!(!FilterExpr::not(FilterExpr::leaf(TagFilter::Exists { key: "x".to_string() })).is_empty());
+    }
+
+    #[test]
+    fn test_effective_filter_from_tag_filters() {
+        let query = Query::builder("cpu")
+            .time_range(0, 1000)
+            .where_tag("host", "server01")
+            .build()
+            .unwrap();
+
+        let filter = query.effective_filter().expect("Expected filter");
+        match &filter {
+            FilterExpr::Leaf(TagFilter::Equals { key, value }) => {
+                assert_eq!(key, "host");
+                assert_eq!(value, "server01");
+            }
+            _ => panic!("Expected Leaf(Equals), got {:?}", filter),
+        }
+    }
+
+    #[test]
+    fn test_effective_filter_from_filter_field() {
+        let query = Query::builder("cpu")
+            .time_range(0, 1000)
+            .filter(FilterExpr::or(vec![
+                FilterExpr::leaf(TagFilter::Equals {
+                    key: "host".to_string(),
+                    value: "a".to_string(),
+                }),
+                FilterExpr::leaf(TagFilter::Equals {
+                    key: "host".to_string(),
+                    value: "b".to_string(),
+                }),
+            ]))
+            .build()
+            .unwrap();
+
+        let filter = query.effective_filter().expect("Expected filter");
+        assert!(matches!(filter, FilterExpr::Or(_)));
+    }
+
+    #[test]
+    fn test_effective_filter_none_when_empty() {
+        let query = Query::builder("cpu")
+            .time_range(0, 1000)
+            .build()
+            .unwrap();
+        assert!(query.effective_filter().is_none());
     }
 
     #[test]

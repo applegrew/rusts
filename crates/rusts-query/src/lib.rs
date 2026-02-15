@@ -15,7 +15,7 @@ pub mod planner;
 pub use aggregation::{AggregateFunction, Aggregator};
 pub use error::{QueryError, Result};
 pub use executor::QueryExecutor;
-pub use model::{FieldSelection, Query, QueryBuilder, QueryResult, TagFilter};
+pub use model::{FieldSelection, FilterExpr, Query, QueryBuilder, QueryResult, TagFilter};
 pub use planner::{ExecutionHints, ExplainOutput, QueryPlan, QueryPlanner};
 
 // Re-export from rusts-core
