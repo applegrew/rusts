@@ -703,7 +703,7 @@ impl QueryExecutor {
                 let results: Vec<Result<Vec<ResultRow>>> = series_ids
                     .par_iter()
                     .map(|&series_id| {
-                        let points = self.storage.query(series_id, &query.time_range)?;
+                        let points = self.storage.query_for_measurement(series_id, &query.measurement, &query.time_range)?;
                         let series_meta = self.series_index.get(series_id);
                         let tags = series_meta.map(|m| m.tags).unwrap_or_default();
 
@@ -735,7 +735,7 @@ impl QueryExecutor {
                     let results: Vec<Result<Vec<ResultRow>>> = chunk
                         .par_iter()
                         .map(|&series_id| {
-                            let points = self.storage.query(series_id, &query.time_range)?;
+                            let points = self.storage.query_for_measurement(series_id, &query.measurement, &query.time_range)?;
                             let series_meta = self.series_index.get(series_id);
                             let tags = series_meta.map(|m| m.tags).unwrap_or_default();
 
@@ -772,7 +772,7 @@ impl QueryExecutor {
                     }
                 }
 
-                let points = self.storage.query(series_id, &query.time_range)?;
+                let points = self.storage.query_for_measurement(series_id, &query.measurement, &query.time_range)?;
 
                 let series_meta = self.series_index.get(series_id);
                 let tags = series_meta.map(|m| m.tags).unwrap_or_default();
@@ -870,7 +870,7 @@ impl QueryExecutor {
         if series_ids.len() <= 100 {
             let (series_points, total_seen) = self
                 .storage
-                .query_multi_series_with_limit(series_ids, &query.time_range, k, true)?;
+                .query_multi_series_with_limit_for_measurement(series_ids, &query.measurement, &query.time_range, k, true)?;
 
             let mut collector = TopKCollector::new(k);
             for (series_id, points) in series_points {
@@ -913,7 +913,7 @@ impl QueryExecutor {
 
         let (series_points, total_seen) = self
             .storage
-            .query_multi_series_with_limit(&batch_ids, &query.time_range, k, true)?;
+            .query_multi_series_with_limit_for_measurement(&batch_ids, &query.measurement, &query.time_range, k, true)?;
 
         let mut collector = TopKCollector::new(k);
         for (series_id, points) in series_points {
@@ -953,7 +953,7 @@ impl QueryExecutor {
         if series_ids.len() <= 100 {
             let (series_points, total_seen) = self
                 .storage
-                .query_multi_series_with_limit(series_ids, &query.time_range, k, false)?;
+                .query_multi_series_with_limit_for_measurement(series_ids, &query.measurement, &query.time_range, k, false)?;
 
             let mut collector = TopKCollectorDesc::new(k);
             for (series_id, points) in series_points {
@@ -994,7 +994,7 @@ impl QueryExecutor {
 
         let (series_points, total_seen) = self
             .storage
-            .query_multi_series_with_limit(&batch_ids, &query.time_range, k, false)?;
+            .query_multi_series_with_limit_for_measurement(&batch_ids, &query.measurement, &query.time_range, k, false)?;
 
         let mut collector = TopKCollectorDesc::new(k);
         for (series_id, points) in series_points {
@@ -1037,19 +1037,19 @@ impl QueryExecutor {
         // For COUNT(*), we just need segment metadata (point_count)
         if field == "*" && function == AggregateFunction::Count {
             // Check if memtable has data - if so, we can't use stats alone
-            let (_, has_memtable_data) = self.storage.get_segment_point_count(series_ids, &query.time_range);
+            let (_, has_memtable_data) = self.storage.get_segment_point_count_for_measurement(series_ids, &query.measurement, &query.time_range);
             return !has_memtable_data;
         }
 
         // For field-specific aggregations, verify segment stats are complete
         // Check if memtable has data - if so, we can't use stats alone
-        let (_, has_memtable_data) = self.storage.get_segment_point_count(series_ids, &query.time_range);
+        let (_, has_memtable_data) = self.storage.get_segment_point_count_for_measurement(series_ids, &query.measurement, &query.time_range);
         if has_memtable_data {
             return false;
         }
 
         // Check if all segments have stats for this field
-        self.storage.has_complete_segment_stats(series_ids, &query.time_range, field)
+        self.storage.has_complete_segment_stats_for_measurement(series_ids, &query.measurement, &query.time_range, field)
     }
 
     /// Execute aggregation using segment statistics only (no data decompression).
@@ -1068,11 +1068,11 @@ impl QueryExecutor {
 
         // For COUNT(*), use point count from segment metadata
         if field == "*" && function == AggregateFunction::Count {
-            let (count, _) = self.storage.get_segment_point_count(series_ids, &query.time_range);
+            let (count, _) = self.storage.get_segment_point_count_for_measurement(series_ids, &query.measurement, &query.time_range);
             fields.insert(field_name.to_string(), FieldValue::Integer(count as i64));
         } else {
             // Get aggregated field stats
-            if let Some(stats) = self.storage.get_aggregated_field_stats(series_ids, &query.time_range, field) {
+            if let Some(stats) = self.storage.get_aggregated_field_stats_for_measurement(series_ids, &query.measurement, &query.time_range, field) {
                 let value = match function {
                     AggregateFunction::Count => FieldValue::Integer(stats.count as i64),
                     AggregateFunction::Sum => FieldValue::Float(stats.sum.unwrap_or(0.0)),
@@ -1142,9 +1142,11 @@ impl QueryExecutor {
             && cancel.is_none()
         {
             // Use parallel partition scanning for aggregations with configurable parallelism
-            let all_series_data = self.storage.query_measurement_parallel_with_config(
+            let all_series_data = self.storage.query_measurement_parallel_for_measurement(
                 series_ids,
+                &query.measurement,
                 &query.time_range,
+                None,
                 &self.parallel_config,
             )?;
 
@@ -1216,7 +1218,7 @@ impl QueryExecutor {
                     }
                 }
 
-                let points = self.storage.query(series_id, &query.time_range)?;
+                let points = self.storage.query_for_measurement(series_id, &query.measurement, &query.time_range)?;
 
                 for point in points {
                     if is_count_star {
@@ -1278,7 +1280,7 @@ impl QueryExecutor {
                     }
                 }
 
-                let points = self.storage.query(series_id, &query.time_range)?;
+                let points = self.storage.query_for_measurement(series_id, &query.measurement, &query.time_range)?;
                 let mut time_agg = TimeBucketAggregator::new(
                     function,
                     query.time_range.start,
@@ -1338,7 +1340,7 @@ impl QueryExecutor {
                     }
                 }
 
-                let points = self.storage.query(series_id, &query.time_range)?;
+                let points = self.storage.query_for_measurement(series_id, &query.measurement, &query.time_range)?;
 
                 for point in points {
                     if is_count_star {
@@ -1421,7 +1423,7 @@ impl QueryExecutor {
             let mut aggregator = Aggregator::new(function);
 
             for &series_id in &group_series {
-                let points = self.storage.query(series_id, &query.time_range)?;
+                let points = self.storage.query_for_measurement(series_id, &query.measurement, &query.time_range)?;
 
                 for point in points {
                     if is_count_star {

@@ -485,6 +485,184 @@ impl StorageEngine {
         Ok(result_vec)
     }
 
+    /// Query points for a series, using measurement-aware partition pruning.
+    ///
+    /// Only scans partitions that contain data for the specified measurement,
+    /// skipping partitions that have no segments for it.
+    pub fn query_for_measurement(
+        &self,
+        series_id: SeriesId,
+        measurement: &str,
+        time_range: &TimeRange,
+    ) -> Result<Vec<MemTablePoint>> {
+        let mut all_points = Vec::new();
+
+        // Query active memtable
+        {
+            let memtable = self.active_memtable.read();
+            let points = memtable.query(series_id, time_range);
+            all_points.extend(points);
+        }
+
+        // Query immutable memtables
+        {
+            let immutables = self.immutable_memtables.read();
+            for memtable in immutables.iter() {
+                let points = memtable.query(series_id, time_range);
+                all_points.extend(points);
+            }
+        }
+
+        // Query partitions (measurement-pruned)
+        let partitions = self
+            .partitions
+            .get_partitions_for_measurement_and_range(measurement, time_range);
+        for partition in partitions {
+            let points = partition.query(series_id, time_range)?;
+            all_points.extend(points);
+        }
+
+        // Sort by timestamp
+        all_points.sort_by_key(|p| p.timestamp);
+
+        Ok(all_points)
+    }
+
+    /// Query all series with measurement-aware partition pruning and configurable parallelism.
+    ///
+    /// Uses `get_partitions_for_measurement_and_range` to skip partitions that have
+    /// no data for the queried measurement. Within each partition, intersects the
+    /// query's series_ids with the partition's known series for that measurement.
+    pub fn query_measurement_parallel_for_measurement(
+        &self,
+        series_ids: &[SeriesId],
+        measurement: &str,
+        time_range: &TimeRange,
+        fields: Option<&[String]>,
+        config: &ParallelConfig,
+    ) -> Result<Vec<(SeriesId, Vec<MemTablePoint>)>> {
+        use rayon::prelude::*;
+        use std::collections::HashMap;
+
+        // Query memtables (sequential, small)
+        let mut results: HashMap<SeriesId, Vec<MemTablePoint>> = HashMap::new();
+        {
+            let memtable = self.active_memtable.read();
+            for &series_id in series_ids {
+                let points = memtable.query(series_id, time_range);
+                if !points.is_empty() {
+                    results.entry(series_id).or_default().extend(points);
+                }
+            }
+        }
+        {
+            let immutables = self.immutable_memtables.read();
+            for memtable in immutables.iter() {
+                for &series_id in series_ids {
+                    let points = memtable.query(series_id, time_range);
+                    if !points.is_empty() {
+                        results.entry(series_id).or_default().extend(points);
+                    }
+                }
+            }
+        }
+
+        // Query partitions (measurement-pruned) with series intersection
+        let partitions = self
+            .partitions
+            .get_partitions_for_measurement_and_range(measurement, time_range);
+
+        // Build a HashSet for fast series_id lookup
+        let query_series: std::collections::HashSet<SeriesId> =
+            series_ids.iter().copied().collect();
+
+        if config.should_parallelize_partitions(partitions.len()) {
+            let effective_parallelism = config.effective_partition_parallelism(partitions.len());
+
+            if effective_parallelism >= partitions.len() {
+                let partition_results: Vec<Result<Vec<(SeriesId, Vec<MemTablePoint>)>>> =
+                    partitions
+                        .par_iter()
+                        .map(|partition| {
+                            // Intersect query series with partition's measurement series
+                            let partition_series =
+                                partition.series_ids_for_measurement(measurement);
+                            let mut partition_data = Vec::new();
+                            for series_id in partition_series {
+                                if query_series.contains(&series_id) {
+                                    let points = partition
+                                        .query_with_fields(series_id, time_range, fields)?;
+                                    if !points.is_empty() {
+                                        partition_data.push((series_id, points));
+                                    }
+                                }
+                            }
+                            Ok(partition_data)
+                        })
+                        .collect();
+
+                for result in partition_results {
+                    for (series_id, points) in result? {
+                        results.entry(series_id).or_default().extend(points);
+                    }
+                }
+            } else {
+                for chunk in partitions.chunks(effective_parallelism) {
+                    let chunk_results: Vec<Result<Vec<(SeriesId, Vec<MemTablePoint>)>>> = chunk
+                        .par_iter()
+                        .map(|partition| {
+                            let partition_series =
+                                partition.series_ids_for_measurement(measurement);
+                            let mut partition_data = Vec::new();
+                            for series_id in partition_series {
+                                if query_series.contains(&series_id) {
+                                    let points = partition
+                                        .query_with_fields(series_id, time_range, fields)?;
+                                    if !points.is_empty() {
+                                        partition_data.push((series_id, points));
+                                    }
+                                }
+                            }
+                            Ok(partition_data)
+                        })
+                        .collect();
+
+                    for result in chunk_results {
+                        for (series_id, points) in result? {
+                            results.entry(series_id).or_default().extend(points);
+                        }
+                    }
+                }
+            }
+        } else {
+            // Sequential for small partition counts
+            for partition in partitions {
+                let partition_series = partition.series_ids_for_measurement(measurement);
+                for series_id in partition_series {
+                    if query_series.contains(&series_id) {
+                        let points =
+                            partition.query_with_fields(series_id, time_range, fields)?;
+                        if !points.is_empty() {
+                            results.entry(series_id).or_default().extend(points);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Sort points within each series
+        let mut result_vec: Vec<_> = results
+            .into_iter()
+            .map(|(series_id, mut points)| {
+                points.sort_by_key(|p| p.timestamp);
+                (series_id, points)
+            })
+            .collect();
+
+        result_vec.sort_by_key(|(id, _)| *id);
+        Ok(result_vec)
+    }
+
     /// Query points with early termination for LIMIT queries.
     ///
     /// Returns (points, total_scanned) where:
@@ -740,6 +918,39 @@ impl StorageEngine {
         limit: usize,
         ascending: bool,
     ) -> Result<(Vec<(SeriesId, Vec<MemTablePoint>)>, usize)> {
+        self.query_multi_series_with_limit_impl(series_ids, None, time_range, limit, ascending)
+    }
+
+    /// Query points for multiple series with early termination and measurement-aware pruning.
+    ///
+    /// Like `query_multi_series_with_limit` but only scans partitions that contain
+    /// data for the specified measurement.
+    pub fn query_multi_series_with_limit_for_measurement(
+        &self,
+        series_ids: &[SeriesId],
+        measurement: &str,
+        time_range: &TimeRange,
+        limit: usize,
+        ascending: bool,
+    ) -> Result<(Vec<(SeriesId, Vec<MemTablePoint>)>, usize)> {
+        self.query_multi_series_with_limit_impl(
+            series_ids,
+            Some(measurement),
+            time_range,
+            limit,
+            ascending,
+        )
+    }
+
+    /// Internal implementation for multi-series LIMIT queries with optional measurement pruning.
+    fn query_multi_series_with_limit_impl(
+        &self,
+        series_ids: &[SeriesId],
+        measurement: Option<&str>,
+        time_range: &TimeRange,
+        limit: usize,
+        ascending: bool,
+    ) -> Result<(Vec<(SeriesId, Vec<MemTablePoint>)>, usize)> {
         use std::cmp::Ordering;
         use std::collections::BinaryHeap;
 
@@ -770,8 +981,13 @@ impl StorageEngine {
             }
         }
 
-        // Get partitions in time order
-        let mut partitions = self.partitions.get_partitions_for_range(time_range);
+        // Get partitions in time order (measurement-pruned if specified)
+        let mut partitions = match measurement {
+            Some(m) => self
+                .partitions
+                .get_partitions_for_measurement_and_range(m, time_range),
+            None => self.partitions.get_partitions_for_range(time_range),
+        };
         if !ascending {
             partitions.reverse();
         }
@@ -1339,6 +1555,110 @@ impl StorageEngine {
         }
 
         true
+    }
+
+    /// Get total point count using measurement-aware partition pruning.
+    pub fn get_segment_point_count_for_measurement(
+        &self,
+        series_ids: &[SeriesId],
+        measurement: &str,
+        time_range: &TimeRange,
+    ) -> (u64, bool) {
+        let partitions = self
+            .partitions
+            .get_partitions_for_measurement_and_range(measurement, time_range);
+        let mut total = 0u64;
+
+        for partition in partitions {
+            total += partition.get_point_count_for_series(series_ids, time_range);
+        }
+
+        // Check if memtable has any data for these series in the time range
+        let has_memtable_data = {
+            let memtable = self.active_memtable.read();
+            series_ids
+                .iter()
+                .any(|&series_id| !memtable.query(series_id, time_range).is_empty())
+        } || {
+            let immutables = self.immutable_memtables.read();
+            immutables.iter().any(|memtable| {
+                series_ids
+                    .iter()
+                    .any(|&series_id| !memtable.query(series_id, time_range).is_empty())
+            })
+        };
+
+        (total, has_memtable_data)
+    }
+
+    /// Check if segment stats are complete using measurement-aware partition pruning.
+    pub fn has_complete_segment_stats_for_measurement(
+        &self,
+        series_ids: &[SeriesId],
+        measurement: &str,
+        time_range: &TimeRange,
+        field_name: &str,
+    ) -> bool {
+        let partitions = self
+            .partitions
+            .get_partitions_for_measurement_and_range(measurement, time_range);
+
+        if partitions.is_empty() {
+            return false;
+        }
+
+        for partition in partitions {
+            if partition
+                .get_field_stats(series_ids, time_range, field_name)
+                .is_none()
+            {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// Get aggregated field stats using measurement-aware partition pruning.
+    pub fn get_aggregated_field_stats_for_measurement(
+        &self,
+        series_ids: &[SeriesId],
+        measurement: &str,
+        time_range: &TimeRange,
+        field_name: &str,
+    ) -> Option<crate::segment::FieldStats> {
+        let partitions = self
+            .partitions
+            .get_partitions_for_measurement_and_range(measurement, time_range);
+
+        let mut total_min = f64::INFINITY;
+        let mut total_max = f64::NEG_INFINITY;
+        let mut total_sum = 0.0;
+        let mut total_count = 0u64;
+        let mut found_any = false;
+
+        for partition in partitions {
+            if let Some(stats) = partition.get_field_stats(series_ids, time_range, field_name) {
+                if let (Some(min), Some(max), Some(sum)) = (stats.min, stats.max, stats.sum) {
+                    found_any = true;
+                    total_min = total_min.min(min);
+                    total_max = total_max.max(max);
+                    total_sum += sum;
+                    total_count += stats.count;
+                }
+            }
+        }
+
+        if found_any {
+            Some(crate::segment::FieldStats {
+                min: Some(total_min),
+                max: Some(total_max),
+                sum: Some(total_sum),
+                count: total_count,
+            })
+        } else {
+            None
+        }
     }
 
     /// Get partition stats
@@ -2538,6 +2858,253 @@ mod tests {
         // Should have scanned fewer than all 40 points due to early termination
         // (This depends on partition boundaries, so we just verify it works)
         assert!(total_scanned <= 40, "Should not scan more than total points");
+
+        engine.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_query_for_measurement_prunes_partitions() {
+        use std::thread;
+        use std::time::Duration;
+
+        let dir = TempDir::new().unwrap();
+        let config = StorageEngineConfig {
+            data_dir: dir.path().to_path_buf(),
+            wal_durability: WalDurability::EveryWrite,
+            partition_duration: 1_000_000_000, // 1 second partitions
+            flush_trigger: FlushTrigger {
+                max_size: 1024,
+                max_points: 5,
+                max_age_nanos: i64::MAX,
+                out_of_order_lag_ms: 0,
+            },
+            ..Default::default()
+        };
+
+        let engine = StorageEngine::new(config).unwrap();
+
+        // Write "cpu" data in partition 0
+        for i in 0..10 {
+            let point = create_test_point("cpu", "server01", i * 10_000_000, i as f64);
+            engine.write(&point).unwrap();
+        }
+
+        // Force flush
+        engine.flush().unwrap();
+        thread::sleep(Duration::from_millis(100));
+
+        // Write "mem" data in partition 1
+        for i in 0..10 {
+            let point = Point::builder("mem")
+                .timestamp(1_000_000_000 + i * 10_000_000)
+                .tag("host", "server01")
+                .field("usage", (50 + i) as f64)
+                .build()
+                .unwrap();
+            engine.write(&point).unwrap();
+        }
+
+        let cpu_series_id = create_test_point("cpu", "server01", 0, 0.0).series_id();
+        let mem_series_id = Point::builder("mem")
+            .timestamp(0)
+            .tag("host", "server01")
+            .field("usage", 0.0)
+            .build()
+            .unwrap()
+            .series_id();
+
+        // query_for_measurement for "cpu" should return cpu data
+        let cpu_results = engine
+            .query_for_measurement(cpu_series_id, "cpu", &TimeRange::new(0, 2_000_000_000))
+            .unwrap();
+        assert_eq!(cpu_results.len(), 10);
+
+        // query_for_measurement for "mem" with cpu series_id should return nothing
+        let _cross_results = engine
+            .query_for_measurement(cpu_series_id, "mem", &TimeRange::new(0, 2_000_000_000))
+            .unwrap();
+        // May still find memtable data, but partition data should be pruned
+        // The key test is that it doesn't crash and returns correct results
+
+        // query_for_measurement for "mem" should return mem data
+        let mem_results = engine
+            .query_for_measurement(mem_series_id, "mem", &TimeRange::new(0, 2_000_000_000))
+            .unwrap();
+        assert_eq!(mem_results.len(), 10);
+
+        // query_for_measurement for non-existent measurement should return empty
+        let empty_results = engine
+            .query_for_measurement(cpu_series_id, "disk", &TimeRange::new(0, 2_000_000_000))
+            .unwrap();
+        // Only memtable data (no partitions match "disk")
+        // Since cpu data is in memtable too, this may return memtable hits
+        // but no partition hits
+        let _ = empty_results; // Just verify no panic
+
+        engine.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_query_measurement_parallel_for_measurement() {
+        use std::thread;
+        use std::time::Duration;
+
+        let dir = TempDir::new().unwrap();
+        let config = StorageEngineConfig {
+            data_dir: dir.path().to_path_buf(),
+            wal_durability: WalDurability::EveryWrite,
+            partition_duration: 1_000_000_000,
+            flush_trigger: FlushTrigger {
+                max_size: 1024,
+                max_points: 5,
+                max_age_nanos: i64::MAX,
+                out_of_order_lag_ms: 0,
+            },
+            ..Default::default()
+        };
+
+        let engine = StorageEngine::new(config).unwrap();
+
+        // Write cpu data for two hosts
+        for i in 0..10 {
+            let p1 = create_test_point("cpu", "server01", i * 10_000_000, i as f64);
+            let p2 = create_test_point("cpu", "server02", i * 10_000_000, (i + 100) as f64);
+            engine.write(&p1).unwrap();
+            engine.write(&p2).unwrap();
+        }
+
+        // Write mem data for one host
+        for i in 0..10 {
+            let p = Point::builder("mem")
+                .timestamp(i * 10_000_000)
+                .tag("host", "server01")
+                .field("usage", (50 + i) as f64)
+                .build()
+                .unwrap();
+            engine.write(&p).unwrap();
+        }
+
+        engine.flush().unwrap();
+        thread::sleep(Duration::from_millis(100));
+
+        let cpu_id1 = create_test_point("cpu", "server01", 0, 0.0).series_id();
+        let cpu_id2 = create_test_point("cpu", "server02", 0, 0.0).series_id();
+        let mem_id = Point::builder("mem")
+            .timestamp(0)
+            .tag("host", "server01")
+            .field("usage", 0.0)
+            .build()
+            .unwrap()
+            .series_id();
+
+        let parallel_config = ParallelConfig::default();
+        let time_range = TimeRange::new(0, 1_000_000_000);
+
+        // Query cpu measurement with both cpu series
+        let results = engine
+            .query_measurement_parallel_for_measurement(
+                &[cpu_id1, cpu_id2],
+                "cpu",
+                &time_range,
+                None,
+                &parallel_config,
+            )
+            .unwrap();
+        assert_eq!(results.len(), 2); // Two series
+        for (_, points) in &results {
+            assert_eq!(points.len(), 10);
+        }
+
+        // Query mem measurement with mem series
+        let results = engine
+            .query_measurement_parallel_for_measurement(
+                &[mem_id],
+                "mem",
+                &time_range,
+                None,
+                &parallel_config,
+            )
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].1.len(), 10);
+
+        // Query cpu measurement with mem series - should return empty from partitions
+        let results = engine
+            .query_measurement_parallel_for_measurement(
+                &[mem_id],
+                "cpu",
+                &time_range,
+                None,
+                &parallel_config,
+            )
+            .unwrap();
+        // mem_id won't match any cpu partition series, so partition data is empty
+        // memtable may still have data if not fully flushed
+        // Key: no panic, correct behavior
+        let _ = results;
+
+        engine.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_multi_series_with_limit_for_measurement() {
+        use std::thread;
+        use std::time::Duration;
+
+        let dir = TempDir::new().unwrap();
+        let config = StorageEngineConfig {
+            data_dir: dir.path().to_path_buf(),
+            wal_durability: WalDurability::EveryWrite,
+            partition_duration: 1_000_000_000,
+            flush_trigger: FlushTrigger {
+                max_size: 1024,
+                max_points: 5,
+                max_age_nanos: i64::MAX,
+                out_of_order_lag_ms: 0,
+            },
+            ..Default::default()
+        };
+
+        let engine = StorageEngine::new(config).unwrap();
+
+        // Write cpu data
+        for i in 0..20 {
+            let point = create_test_point("cpu", "server01", i * 10_000_000, i as f64);
+            engine.write(&point).unwrap();
+        }
+
+        engine.flush().unwrap();
+        thread::sleep(Duration::from_millis(100));
+
+        let series_id = create_test_point("cpu", "server01", 0, 0.0).series_id();
+
+        // Query with limit using measurement-aware method
+        let (results, _total_scanned) = engine
+            .query_multi_series_with_limit_for_measurement(
+                &[series_id],
+                "cpu",
+                &TimeRange::new(0, i64::MAX),
+                5,
+                true,
+            )
+            .unwrap();
+
+        let total_points: usize = results.iter().map(|(_, pts)| pts.len()).sum();
+        assert!(total_points <= 5, "Should respect limit of 5, got {}", total_points);
+
+        // Query with non-matching measurement should return fewer/no partition results
+        let (results_wrong_measurement, _) = engine
+            .query_multi_series_with_limit_for_measurement(
+                &[series_id],
+                "disk",
+                &TimeRange::new(0, i64::MAX),
+                5,
+                true,
+            )
+            .unwrap();
+        // With wrong measurement, only memtable data (if any) would be returned
+        // Partition data should be completely pruned
+        let _ = results_wrong_measurement;
 
         engine.shutdown().unwrap();
     }

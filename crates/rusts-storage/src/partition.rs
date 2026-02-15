@@ -9,7 +9,7 @@ use parking_lot::RwLock;
 use rusts_compression::CompressionLevel;
 use rusts_core::{SeriesId, Tag, TimeRange, Timestamp};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -26,6 +26,8 @@ pub struct PartitionMeta {
     pub point_count: usize,
     /// Number of segments
     pub segment_count: usize,
+    /// Measurement names present in this partition
+    pub measurements: Vec<String>,
 }
 
 /// A partition containing segments for a specific time range
@@ -48,6 +50,10 @@ pub struct Partition {
     fsync_on_write: bool,
     /// Whether to use Direct I/O for segment files
     direct_io_segments: bool,
+    /// Set of measurement names present in this partition
+    measurements: RwLock<HashSet<String>>,
+    /// Measurement name -> set of series IDs in this partition
+    measurement_series: RwLock<HashMap<String, HashSet<SeriesId>>>,
 }
 
 impl Partition {
@@ -78,6 +84,8 @@ impl Partition {
             compression,
             fsync_on_write,
             direct_io_segments,
+            measurements: RwLock::new(HashSet::new()),
+            measurement_series: RwLock::new(HashMap::new()),
         })
     }
 
@@ -100,6 +108,8 @@ impl Partition {
             compression: CompressionLevel::Default,
             fsync_on_write: true,
             direct_io_segments: false,
+            measurements: RwLock::new(HashSet::new()),
+            measurement_series: RwLock::new(HashMap::new()),
         };
 
         // Load existing segments
@@ -121,6 +131,14 @@ impl Partition {
                 let meta = segment.meta().clone();
 
                 max_segment_id = max_segment_id.max(meta.id);
+
+                // Update measurement indexes
+                self.measurements.write().insert(meta.measurement.clone());
+                self.measurement_series
+                    .write()
+                    .entry(meta.measurement.clone())
+                    .or_default()
+                    .insert(meta.series_id);
 
                 let mut segments = self.segments.write();
                 segments
@@ -168,6 +186,14 @@ impl Partition {
             .push(segment);
 
         self.segment_metas.write().push(meta.clone());
+
+        // Update measurement indexes
+        self.measurements.write().insert(measurement.to_string());
+        self.measurement_series
+            .write()
+            .entry(measurement.to_string())
+            .or_default()
+            .insert(series_id);
 
         // Update partition metadata
         self.save_meta()?;
@@ -341,6 +367,25 @@ impl Partition {
         self.segments.read().keys().copied().collect()
     }
 
+    /// Check if this partition contains data for the given measurement
+    pub fn has_measurement(&self, measurement: &str) -> bool {
+        self.measurements.read().contains(measurement)
+    }
+
+    /// Get the set of series IDs for a specific measurement in this partition
+    pub fn series_ids_for_measurement(&self, measurement: &str) -> Vec<SeriesId> {
+        self.measurement_series
+            .read()
+            .get(measurement)
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Get all measurement names in this partition
+    pub fn measurements(&self) -> HashSet<String> {
+        self.measurements.read().clone()
+    }
+
     /// Get all segment metadata for index rebuilding
     /// Returns (series_id, measurement, tags) for each unique series
     pub fn get_series_metadata(&self) -> Vec<(SeriesId, String, Vec<Tag>)> {
@@ -447,6 +492,7 @@ impl Partition {
                 .as_nanos() as i64,
             point_count: self.point_count(),
             segment_count: self.segment_count(),
+            measurements: self.measurements.read().iter().cloned().collect(),
         }
     }
 
@@ -661,6 +707,24 @@ impl PartitionManager {
         partitions
             .iter()
             .filter(|p| p.overlaps(time_range))
+            .map(|p| unsafe { &*(p as *const Partition) })
+            .collect()
+    }
+
+    /// Get partitions overlapping with a time range that contain data for a specific measurement.
+    ///
+    /// This is an optimized version of `get_partitions_for_range` that also prunes
+    /// partitions which have no segments for the queried measurement, avoiding
+    /// unnecessary segment lookups during query execution.
+    pub fn get_partitions_for_measurement_and_range(
+        &self,
+        measurement: &str,
+        time_range: &TimeRange,
+    ) -> Vec<&Partition> {
+        let partitions = self.partitions.read();
+        partitions
+            .iter()
+            .filter(|p| p.overlaps(time_range) && p.has_measurement(measurement))
             .map(|p| unsafe { &*(p as *const Partition) })
             .collect()
     }
@@ -921,5 +985,168 @@ mod tests {
 
         let results = p1.query(12345, &TimeRange::new(0, 100000)).unwrap();
         assert_eq!(results.len(), 30);
+    }
+
+    #[test]
+    fn test_partition_has_measurement() {
+        let dir = TempDir::new().unwrap();
+        let time_range = TimeRange::new(0, 86400_000_000_000);
+
+        let partition = Partition::new(0, dir.path(), time_range, CompressionLevel::Fast).unwrap();
+
+        assert!(!partition.has_measurement("cpu"));
+        assert!(!partition.has_measurement("mem"));
+
+        let points = create_test_points(1000, 10);
+        partition.write_segment(1, "cpu", &[], &points).unwrap();
+
+        assert!(partition.has_measurement("cpu"));
+        assert!(!partition.has_measurement("mem"));
+
+        partition.write_segment(2, "mem", &[], &points).unwrap();
+
+        assert!(partition.has_measurement("cpu"));
+        assert!(partition.has_measurement("mem"));
+    }
+
+    #[test]
+    fn test_partition_series_ids_for_measurement() {
+        let dir = TempDir::new().unwrap();
+        let time_range = TimeRange::new(0, 86400_000_000_000);
+
+        let partition = Partition::new(0, dir.path(), time_range, CompressionLevel::Fast).unwrap();
+
+        let points = create_test_points(1000, 10);
+
+        // Write two series for "cpu"
+        partition.write_segment(100, "cpu", &[], &points).unwrap();
+        partition.write_segment(101, "cpu", &[], &points).unwrap();
+        // Write one series for "mem"
+        partition.write_segment(200, "mem", &[], &points).unwrap();
+
+        let mut cpu_series = partition.series_ids_for_measurement("cpu");
+        cpu_series.sort();
+        assert_eq!(cpu_series, vec![100, 101]);
+
+        let mem_series = partition.series_ids_for_measurement("mem");
+        assert_eq!(mem_series, vec![200]);
+
+        let disk_series = partition.series_ids_for_measurement("disk");
+        assert!(disk_series.is_empty());
+    }
+
+    #[test]
+    fn test_partition_measurements_list() {
+        let dir = TempDir::new().unwrap();
+        let time_range = TimeRange::new(0, 86400_000_000_000);
+
+        let partition = Partition::new(0, dir.path(), time_range, CompressionLevel::Fast).unwrap();
+
+        assert!(partition.measurements().is_empty());
+
+        let points = create_test_points(1000, 10);
+        partition.write_segment(1, "cpu", &[], &points).unwrap();
+        partition.write_segment(2, "mem", &[], &points).unwrap();
+        partition.write_segment(3, "cpu", &[], &points).unwrap(); // duplicate measurement
+
+        let measurements = partition.measurements();
+        assert_eq!(measurements.len(), 2);
+        assert!(measurements.contains("cpu"));
+        assert!(measurements.contains("mem"));
+    }
+
+    #[test]
+    fn test_partition_meta_includes_measurements() {
+        let dir = TempDir::new().unwrap();
+        let time_range = TimeRange::new(0, 86400_000_000_000);
+
+        let partition = Partition::new(0, dir.path(), time_range, CompressionLevel::Fast).unwrap();
+
+        let points = create_test_points(1000, 10);
+        partition.write_segment(1, "cpu", &[], &points).unwrap();
+        partition.write_segment(2, "mem", &[], &points).unwrap();
+
+        let meta = partition.meta();
+        let mut measurements = meta.measurements.clone();
+        measurements.sort();
+        assert_eq!(measurements, vec!["cpu".to_string(), "mem".to_string()]);
+    }
+
+    #[test]
+    fn test_partition_measurement_indexes_persist_on_reload() {
+        let dir = TempDir::new().unwrap();
+        let time_range = TimeRange::new(0, 86400_000_000_000);
+
+        // Write data
+        {
+            let partition =
+                Partition::new(0, dir.path(), time_range, CompressionLevel::Fast).unwrap();
+            let points = create_test_points(1000, 10);
+            partition.write_segment(100, "cpu", &[], &points).unwrap();
+            partition.write_segment(200, "mem", &[], &points).unwrap();
+        }
+
+        // Reopen and verify measurement indexes are rebuilt from segment metadata
+        {
+            let partition = Partition::open(dir.path()).unwrap();
+            assert!(partition.has_measurement("cpu"));
+            assert!(partition.has_measurement("mem"));
+            assert!(!partition.has_measurement("disk"));
+
+            let cpu_series = partition.series_ids_for_measurement("cpu");
+            assert_eq!(cpu_series, vec![100]);
+
+            let mem_series = partition.series_ids_for_measurement("mem");
+            assert_eq!(mem_series, vec![200]);
+        }
+    }
+
+    #[test]
+    fn test_partition_manager_measurement_and_range_pruning() {
+        let dir = TempDir::new().unwrap();
+        let duration = 1000_000_000_i64; // 1 second
+
+        let manager =
+            PartitionManager::new(dir.path(), duration, CompressionLevel::Fast).unwrap();
+
+        let points = create_test_points(100, 10);
+
+        // Create 3 partitions: p0=[0,1s), p1=[1s,2s), p2=[2s,3s)
+        let p0 = manager.get_or_create_partition(100).unwrap();
+        p0.write_segment(1, "cpu", &[], &points).unwrap();
+
+        let p1 = manager.get_or_create_partition(duration + 100).unwrap();
+        p1.write_segment(2, "mem", &[], &points).unwrap();
+
+        let p2 = manager.get_or_create_partition(2 * duration + 100).unwrap();
+        p2.write_segment(3, "cpu", &[], &points).unwrap();
+        p2.write_segment(4, "mem", &[], &points).unwrap();
+
+        // Query "cpu" across full range: should get p0 and p2 (not p1)
+        let full_range = TimeRange::new(0, 3 * duration);
+        let cpu_partitions =
+            manager.get_partitions_for_measurement_and_range("cpu", &full_range);
+        assert_eq!(cpu_partitions.len(), 2);
+
+        // Query "mem" across full range: should get p1 and p2 (not p0)
+        let mem_partitions =
+            manager.get_partitions_for_measurement_and_range("mem", &full_range);
+        assert_eq!(mem_partitions.len(), 2);
+
+        // Query "disk" across full range: should get nothing
+        let disk_partitions =
+            manager.get_partitions_for_measurement_and_range("disk", &full_range);
+        assert!(disk_partitions.is_empty());
+
+        // Query "cpu" with narrow range covering only p1: should get nothing
+        let narrow_range = TimeRange::new(duration, 2 * duration);
+        let cpu_narrow =
+            manager.get_partitions_for_measurement_and_range("cpu", &narrow_range);
+        assert!(cpu_narrow.is_empty());
+
+        // Query "mem" with narrow range covering only p1: should get p1
+        let mem_narrow =
+            manager.get_partitions_for_measurement_and_range("mem", &narrow_range);
+        assert_eq!(mem_narrow.len(), 1);
     }
 }
