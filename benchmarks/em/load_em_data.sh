@@ -2,7 +2,9 @@
 #
 # EM Benchmark Data Loader for RusTs
 #
-# Generates EM benchmark data and loads it into a running RusTs server.
+# Generates EM benchmark data and streams it directly into a running
+# RusTs server.  No temporary files are written — the generator pipes
+# into the batch uploader so disk usage is near-zero.
 #
 # Usage:
 #   ./benchmarks/em/load_em_data.sh [OPTIONS]
@@ -24,7 +26,7 @@
 #   --profile large        10000 devices, 24 hours (stress test)
 #   --profile full         50000 devices, 24 hours (production-scale)
 
-set -e
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -105,107 +107,99 @@ else
     exit 1
 fi
 
-# Generate or use pre-generated data
+# Build the data source command — either cat a file or run the generator.
+# In both cases the command writes line-protocol to stdout.
 if [ -n "$DATA_FILE" ] && [ -f "$DATA_FILE" ]; then
     echo -e "Using pre-generated data: ${CYAN}$DATA_FILE${NC}"
-    TEMP_FILE="$DATA_FILE"
-    CLEANUP_TEMP=false
+    DATA_CMD="cat '$DATA_FILE'"
 else
-    TEMP_FILE=$(mktemp /tmp/em_data_XXXXXX.lp)
-    CLEANUP_TEMP=true
-
-    echo -e "${YELLOW}Generating data...${NC}"
-    GEN_START=$(python3 -c 'import time; print(time.time())')
-
-    python3 "$SCRIPT_DIR/generate_em_data.py" \
-        --devices "$DEVICES" \
-        --apps-per-device "$APPS_PER_DEVICE" \
-        --web-apps "$WEB_APPS" \
-        --hours "$HOURS" \
-        --interval "$INTERVAL" \
-        --seed "$SEED" \
-        --output "$TEMP_FILE"
-
-    GEN_END=$(python3 -c 'import time; print(time.time())')
-    GEN_ELAPSED=$(python3 -c "print(f'{$GEN_END - $GEN_START:.1f}')")
-    TOTAL_LINES=$(wc -l < "$TEMP_FILE" | tr -d ' ')
-    FILE_SIZE=$(du -h "$TEMP_FILE" | cut -f1)
-
-    echo -e "Generated ${GREEN}$TOTAL_LINES${NC} lines (${FILE_SIZE}) in ${GEN_ELAPSED}s"
+    echo -e "${YELLOW}Generating + streaming data...${NC}"
+    DATA_CMD="python3 '$SCRIPT_DIR/generate_em_data.py' \
+        --devices $DEVICES \
+        --apps-per-device $APPS_PER_DEVICE \
+        --web-apps $WEB_APPS \
+        --hours $HOURS \
+        --interval $INTERVAL \
+        --seed $SEED \
+        --output -"
 fi
 
-TOTAL_LINES=$(wc -l < "$TEMP_FILE" | tr -d ' ')
-
-# Split data into batch-sized chunk files (single O(n) pass over the file)
 echo ""
 echo -e "${YELLOW}Loading data into RusTs...${NC}"
-CHUNK_DIR=$(mktemp -d /tmp/em_chunks_XXXXXX)
-split -l "$BATCH_SIZE" "$TEMP_FILE" "$CHUNK_DIR/chunk_"
-CHUNK_FILES=("$CHUNK_DIR"/chunk_*)
-TOTAL_CHUNKS=${#CHUNK_FILES[@]}
 
-LOAD_START=$(python3 -c 'import time; print(time.time())')
+# Pipe the data source into a Python streaming uploader.
+# The uploader reads stdin line-by-line, batches BATCH_SIZE lines in
+# memory, and POSTs each batch to /write.  Zero temp files, O(n) time,
+# constant disk usage.
+# Note: we use python3 -c instead of a heredoc so that stdin is free
+# for the pipe from the data source.
+eval "$DATA_CMD" | python3 -u -c '
+import sys, time, urllib.request, urllib.error
 
-BATCH_NUM=0
-LINES_SENT=0
-ERRORS=0
+batch_size = int(sys.argv[1])
+write_url  = f"{sys.argv[2]}/write"
 
-for CHUNK_FILE in "${CHUNK_FILES[@]}"; do
-    BATCH_NUM=$((BATCH_NUM + 1))
-    CHUNK_LINES=$(wc -l < "$CHUNK_FILE" | tr -d ' ')
+batch_num  = 0
+lines_sent = 0
+errors     = 0
+buf        = []
+t_start    = time.monotonic()
 
-    # Send chunk file directly — no shell variable copy, no re-reading
-    HTTP_CODE=$(curl -sf -o /dev/null -w "%{http_code}" \
-        -X POST "$SERVER_URL/write" \
-        -H "Content-Type: text/plain" \
-        --data-binary @"$CHUNK_FILE" 2>/dev/null || echo "000")
+def send(payload_bytes):
+    """POST payload; retry once on failure.  Returns True on success."""
+    req = urllib.request.Request(
+        write_url, data=payload_bytes,
+        headers={"Content-Type": "text/plain"},
+        method="POST",
+    )
+    for attempt in range(2):
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                if resp.status in (200, 204):
+                    return True
+        except urllib.error.HTTPError:
+            pass
+        except Exception:
+            pass
+        if attempt == 0:
+            time.sleep(1)
+    return False
 
-    if [ "$HTTP_CODE" = "204" ] || [ "$HTTP_CODE" = "200" ]; then
-        LINES_SENT=$((LINES_SENT + CHUNK_LINES))
-        PCT=$((LINES_SENT * 100 / TOTAL_LINES))
-        printf "\r  Batch %d/%d: %d/%d lines (%d%%)  " "$BATCH_NUM" "$TOTAL_CHUNKS" "$LINES_SENT" "$TOTAL_LINES" "$PCT"
-    else
-        ERRORS=$((ERRORS + 1))
-        echo -e "\n  ${RED}Batch $BATCH_NUM failed (HTTP $HTTP_CODE)${NC}"
-        # Retry once
-        sleep 1
-        HTTP_CODE=$(curl -sf -o /dev/null -w "%{http_code}" \
-            -X POST "$SERVER_URL/write" \
-            -H "Content-Type: text/plain" \
-            --data-binary @"$CHUNK_FILE" 2>/dev/null || echo "000")
-        if [ "$HTTP_CODE" = "204" ] || [ "$HTTP_CODE" = "200" ]; then
-            LINES_SENT=$((LINES_SENT + CHUNK_LINES))
-            echo -e "  ${GREEN}Retry succeeded${NC}"
-        else
-            echo -e "  ${RED}Retry also failed (HTTP $HTTP_CODE), skipping batch${NC}"
-            LINES_SENT=$((LINES_SENT + CHUNK_LINES))
-        fi
-    fi
-done
+for line in sys.stdin:
+    buf.append(line)
+    if len(buf) >= batch_size:
+        batch_num += 1
+        lines_sent += len(buf)
+        if send("".join(buf).encode()):
+            elapsed = time.monotonic() - t_start
+            rate = int(lines_sent / elapsed) if elapsed > 0 else 0
+            print(f"\r  Batch {batch_num}: {lines_sent:,} lines loaded  ({rate:,} lines/s)  ", end="", flush=True)
+        else:
+            errors += 1
+            print(f"\n  Batch {batch_num} FAILED", flush=True)
+        buf.clear()
 
-# Clean up chunk files
-rm -rf "$CHUNK_DIR"
+if buf:
+    batch_num += 1
+    lines_sent += len(buf)
+    if not send("".join(buf).encode()):
+        errors += 1
 
-echo ""
+elapsed = time.monotonic() - t_start
+rate = int(lines_sent / elapsed) if elapsed > 0 else 0
 
-LOAD_END=$(python3 -c 'import time; print(time.time())')
-LOAD_ELAPSED=$(python3 -c "print(f'{$LOAD_END - $LOAD_START:.1f}')")
-THROUGHPUT=$(python3 -c "elapsed = $LOAD_END - $LOAD_START; print(f'{$TOTAL_LINES / elapsed:.0f}' if elapsed > 0 else 'N/A')")
+print(flush=True)
+print(flush=True)
+print("========================================", flush=True)
+print("Load Complete", flush=True)
+print("========================================", flush=True)
+print(f"Lines loaded:  {lines_sent:,}", flush=True)
+print(f"Batches:       {batch_num:,}", flush=True)
+print(f"Errors:        {errors}", flush=True)
+print(f"Load time:     {elapsed:.1f}s", flush=True)
+print(f"Throughput:    {rate:,} lines/s", flush=True)
+' "$BATCH_SIZE" "$SERVER_URL"
 
-# Cleanup
-if [ "$CLEANUP_TEMP" = true ]; then
-    rm -f "$TEMP_FILE"
-fi
-
-echo ""
-echo "========================================"
-echo -e "${GREEN}Load Complete${NC}"
-echo "========================================"
-echo "Lines loaded:  $TOTAL_LINES"
-echo "Batches:       $BATCH_NUM"
-echo "Errors:        $ERRORS"
-echo "Load time:     ${LOAD_ELAPSED}s"
-echo "Throughput:    ${THROUGHPUT} lines/s"
 echo ""
 echo "You can now run the benchmark:"
 echo "  python3 $SCRIPT_DIR/em_benchmark.py --url $SERVER_URL"

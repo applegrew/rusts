@@ -392,7 +392,7 @@ def generate(args):
     devices = build_fleet(rng, args.devices, args.apps_per_device,
                           args.web_apps)
 
-    out = open(args.output, "w") if args.output else sys.stdout
+    out = sys.stdout if (not args.output or args.output == "-") else open(args.output, "w")
     total_points = 0
     t0 = _time.monotonic()
 
@@ -449,7 +449,7 @@ def generate(args):
               file=sys.stderr)
 
     finally:
-        if args.output:
+        if args.output and args.output != "-":
             out.close()
 
 
