@@ -52,10 +52,10 @@ The generator creates data across 4 measurements matching the RusTs schema:
 
 | Profile | Devices | Hours | Approx Lines | Approx Size |
 |---------|--------:|------:|-------------:|------------:|
-| `small` | 100 | 2 | ~15K | ~5 MB |
-| `medium` | 1,000 | 24 | ~1.5M | ~500 MB |
-| `large` | 10,000 | 24 | ~15M | ~5 GB |
-| `full` | 50,000 | 24 | ~75M | ~25 GB |
+| `small` | 100 | 2 | ~27.5K | ~13 MB |
+| `medium` | 1,000 | 24 | ~3.2M | ~1.5 GB |
+| `large` | 10,000 | 24 | ~31.8M | ~15 GB |
+| `full` | 50,000 | 24 | ~159M | ~75 GB |
 
 ```bash
 # Generate specific profile
