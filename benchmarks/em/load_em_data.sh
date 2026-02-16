@@ -14,7 +14,7 @@
 #   --web-apps N           Web apps per device (default: 2)
 #   --hours H              Hours of data (default: 2)
 #   --interval S           Seconds between points (default: 300)
-#   --batch-size N         Lines per /write batch (default: 500)
+#   --batch-size N         Lines per /write batch (default: 5000)
 #   --seed S               Random seed (default: 42)
 #   --data-file FILE       Pre-generated data file (skip generation)
 #
@@ -35,7 +35,7 @@ APPS_PER_DEVICE=5
 WEB_APPS=2
 HOURS=2
 INTERVAL=300
-BATCH_SIZE=500
+BATCH_SIZE=5000
 SEED=42
 DATA_FILE=""
 
@@ -136,52 +136,55 @@ fi
 
 TOTAL_LINES=$(wc -l < "$TEMP_FILE" | tr -d ' ')
 
-# Load data in batches
+# Split data into batch-sized chunk files (single O(n) pass over the file)
 echo ""
 echo -e "${YELLOW}Loading data into RusTs...${NC}"
+CHUNK_DIR=$(mktemp -d /tmp/em_chunks_XXXXXX)
+split -l "$BATCH_SIZE" "$TEMP_FILE" "$CHUNK_DIR/chunk_"
+CHUNK_FILES=("$CHUNK_DIR"/chunk_*)
+TOTAL_CHUNKS=${#CHUNK_FILES[@]}
+
 LOAD_START=$(python3 -c 'import time; print(time.time())')
 
 BATCH_NUM=0
 LINES_SENT=0
 ERRORS=0
 
-while [ "$LINES_SENT" -lt "$TOTAL_LINES" ]; do
+for CHUNK_FILE in "${CHUNK_FILES[@]}"; do
     BATCH_NUM=$((BATCH_NUM + 1))
-    SKIP=$LINES_SENT
-    REMAINING=$((TOTAL_LINES - LINES_SENT))
-    TAKE=$((REMAINING < BATCH_SIZE ? REMAINING : BATCH_SIZE))
+    CHUNK_LINES=$(wc -l < "$CHUNK_FILE" | tr -d ' ')
 
-    # Extract batch using tail+head (portable)
-    BATCH=$(tail -n +$((SKIP + 1)) "$TEMP_FILE" | head -n "$TAKE")
-
-    # Send batch
-    HTTP_CODE=$(echo "$BATCH" | curl -sf -o /dev/null -w "%{http_code}" \
+    # Send chunk file directly — no shell variable copy, no re-reading
+    HTTP_CODE=$(curl -sf -o /dev/null -w "%{http_code}" \
         -X POST "$SERVER_URL/write" \
         -H "Content-Type: text/plain" \
-        --data-binary @- 2>/dev/null || echo "000")
+        --data-binary @"$CHUNK_FILE" 2>/dev/null || echo "000")
 
     if [ "$HTTP_CODE" = "204" ] || [ "$HTTP_CODE" = "200" ]; then
-        LINES_SENT=$((LINES_SENT + TAKE))
+        LINES_SENT=$((LINES_SENT + CHUNK_LINES))
         PCT=$((LINES_SENT * 100 / TOTAL_LINES))
-        printf "\r  Batch %d: %d/%d lines (%d%%)  " "$BATCH_NUM" "$LINES_SENT" "$TOTAL_LINES" "$PCT"
+        printf "\r  Batch %d/%d: %d/%d lines (%d%%)  " "$BATCH_NUM" "$TOTAL_CHUNKS" "$LINES_SENT" "$TOTAL_LINES" "$PCT"
     else
         ERRORS=$((ERRORS + 1))
         echo -e "\n  ${RED}Batch $BATCH_NUM failed (HTTP $HTTP_CODE)${NC}"
         # Retry once
         sleep 1
-        HTTP_CODE=$(echo "$BATCH" | curl -sf -o /dev/null -w "%{http_code}" \
+        HTTP_CODE=$(curl -sf -o /dev/null -w "%{http_code}" \
             -X POST "$SERVER_URL/write" \
             -H "Content-Type: text/plain" \
-            --data-binary @- 2>/dev/null || echo "000")
+            --data-binary @"$CHUNK_FILE" 2>/dev/null || echo "000")
         if [ "$HTTP_CODE" = "204" ] || [ "$HTTP_CODE" = "200" ]; then
-            LINES_SENT=$((LINES_SENT + TAKE))
+            LINES_SENT=$((LINES_SENT + CHUNK_LINES))
             echo -e "  ${GREEN}Retry succeeded${NC}"
         else
             echo -e "  ${RED}Retry also failed (HTTP $HTTP_CODE), skipping batch${NC}"
-            LINES_SENT=$((LINES_SENT + TAKE))
+            LINES_SENT=$((LINES_SENT + CHUNK_LINES))
         fi
     fi
 done
+
+# Clean up chunk files
+rm -rf "$CHUNK_DIR"
 
 echo ""
 
