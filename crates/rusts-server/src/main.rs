@@ -593,9 +593,11 @@ async fn main() -> anyhow::Result<()> {
     }
     let app_state = Arc::new(app_state_inner);
 
-    // Create router with request timeout
+    // Create router with request timeout and body size limit
     let request_timeout = std::time::Duration::from_secs(config.server.request_timeout_secs);
-    let app = create_router(Arc::clone(&app_state), request_timeout);
+    let max_body_size = config.server.max_body_size;
+    info!("Max request body size: {} bytes ({} MB)", max_body_size, max_body_size / (1024 * 1024));
+    let app = create_router(Arc::clone(&app_state), request_timeout, max_body_size);
 
     // Start HTTP server FIRST - before storage initialization
     let addr: SocketAddr = format!("{}:{}", config.server.host, config.server.port).parse()?;

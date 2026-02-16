@@ -2,6 +2,7 @@
 
 use crate::handlers::{self, AppState};
 use axum::{
+    extract::DefaultBodyLimit,
     routing::{get, post},
     Router,
 };
@@ -13,7 +14,7 @@ use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
 /// Create the API router
-pub fn create_router(state: Arc<AppState>, request_timeout: Duration) -> Router {
+pub fn create_router(state: Arc<AppState>, request_timeout: Duration, max_body_size: usize) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
@@ -31,6 +32,7 @@ pub fn create_router(state: Arc<AppState>, request_timeout: Duration) -> Router 
         // Stats endpoint
         .route("/stats", get(handlers::stats))
         // Add middleware
+        .layer(DefaultBodyLimit::max(max_body_size))
         .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, request_timeout))
         .layer(TraceLayer::new_for_http())
         .layer(cors)
@@ -102,7 +104,7 @@ mod tests {
     #[test]
     fn test_router_creation() {
         let env = TestState::new();
-        let _router = create_router(Arc::clone(&env.state), Duration::from_secs(30));
+        let _router = create_router(Arc::clone(&env.state), Duration::from_secs(30), 10 * 1024 * 1024);
     }
 
     #[tokio::test]
@@ -110,7 +112,7 @@ mod tests {
         let state = create_initializing_state();
         state.startup_state.set_phase(StartupPhase::WalRecovery);
 
-        let app = create_router(state, Duration::from_secs(30));
+        let app = create_router(state, Duration::from_secs(30), 10 * 1024 * 1024);
 
         let response = app
             .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
@@ -129,7 +131,7 @@ mod tests {
     #[tokio::test]
     async fn test_health_endpoint_when_ready() {
         let env = TestState::new();
-        let app = create_router(Arc::clone(&env.state), Duration::from_secs(30));
+        let app = create_router(Arc::clone(&env.state), Duration::from_secs(30), 10 * 1024 * 1024);
 
         let response = app
             .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
@@ -150,7 +152,7 @@ mod tests {
         let state = create_initializing_state();
         state.startup_state.set_phase(StartupPhase::IndexRebuilding);
 
-        let app = create_router(state, Duration::from_secs(30));
+        let app = create_router(state, Duration::from_secs(30), 10 * 1024 * 1024);
 
         let response = app
             .oneshot(Request::builder().uri("/ready").body(Body::empty()).unwrap())
@@ -169,7 +171,7 @@ mod tests {
     #[tokio::test]
     async fn test_ready_endpoint_when_ready() {
         let env = TestState::new();
-        let app = create_router(Arc::clone(&env.state), Duration::from_secs(30));
+        let app = create_router(Arc::clone(&env.state), Duration::from_secs(30), 10 * 1024 * 1024);
 
         let response = app
             .oneshot(Request::builder().uri("/ready").body(Body::empty()).unwrap())
@@ -190,7 +192,7 @@ mod tests {
         let state = create_initializing_state();
         state.startup_state.set_phase(StartupPhase::WalRecovery);
 
-        let app = create_router(state, Duration::from_secs(30));
+        let app = create_router(state, Duration::from_secs(30), 10 * 1024 * 1024);
 
         let response = app
             .oneshot(
@@ -217,7 +219,7 @@ mod tests {
         let state = create_initializing_state();
         state.startup_state.set_phase(StartupPhase::IndexRebuilding);
 
-        let app = create_router(state, Duration::from_secs(30));
+        let app = create_router(state, Duration::from_secs(30), 10 * 1024 * 1024);
 
         let response = app
             .oneshot(
@@ -245,7 +247,7 @@ mod tests {
         let state = create_initializing_state();
         state.startup_state.set_phase(StartupPhase::WalRecovery);
 
-        let app = create_router(state, Duration::from_secs(30));
+        let app = create_router(state, Duration::from_secs(30), 10 * 1024 * 1024);
 
         let response = app
             .oneshot(Request::builder().uri("/stats").body(Body::empty()).unwrap())
@@ -266,7 +268,7 @@ mod tests {
         let state = create_initializing_state();
         state.startup_state.set_phase(StartupPhase::WalRecovery);
 
-        let app = create_router(state, Duration::from_secs(30));
+        let app = create_router(state, Duration::from_secs(30), 10 * 1024 * 1024);
 
         let response = app
             .oneshot(
@@ -292,7 +294,7 @@ mod tests {
     #[tokio::test]
     async fn test_write_endpoint_when_ready() {
         let env = TestState::new();
-        let app = create_router(Arc::clone(&env.state), Duration::from_secs(30));
+        let app = create_router(Arc::clone(&env.state), Duration::from_secs(30), 10 * 1024 * 1024);
 
         let response = app
             .oneshot(
@@ -328,7 +330,7 @@ mod tests {
 
         for phase in phases {
             state.startup_state.set_phase(phase.clone());
-            let app = create_router(Arc::clone(&state), Duration::from_secs(30));
+            let app = create_router(Arc::clone(&state), Duration::from_secs(30), 10 * 1024 * 1024);
 
             let response = app
                 .oneshot(Request::builder().uri("/ready").body(Body::empty()).unwrap())
