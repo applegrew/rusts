@@ -22,6 +22,7 @@
 //!         query_timeout,
 //!         "0.0.0.0",
 //!         5432,
+//!         100,       // max_connections (0 = unlimited)
 //!         shutdown,
 //!     ).await
 //! });
@@ -40,8 +41,9 @@ use rusts_api::handlers::AppState;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// Run the PostgreSQL wire protocol server
 ///
@@ -55,6 +57,7 @@ use tracing::{error, info};
 /// * `query_timeout` - Maximum duration for query execution
 /// * `host` - Host address to bind to (e.g., "0.0.0.0" for all interfaces)
 /// * `port` - Port to listen on (default PostgreSQL port is 5432)
+/// * `max_connections` - Maximum number of concurrent connections (0 = unlimited)
 /// * `shutdown` - Cancellation token to signal graceful shutdown
 ///
 /// # Returns
@@ -66,6 +69,7 @@ pub async fn run_postgres_server(
     query_timeout: Duration,
     host: &str,
     port: u16,
+    max_connections: usize,
     shutdown: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr = format!("{}:{}", host, port);
@@ -73,8 +77,20 @@ pub async fn run_postgres_server(
 
     info!("PostgreSQL wire protocol server listening on {}", addr);
     info!("Connect with: psql -h {} -p {}", host, port);
+    if max_connections > 0 {
+        info!("Max PostgreSQL connections: {}", max_connections);
+    } else {
+        info!("Max PostgreSQL connections: unlimited");
+    }
 
     let factory = Arc::new(PgWireHandlerFactory::new(app_state, query_timeout));
+
+    // Use a semaphore to enforce the connection limit (0 = unlimited)
+    let conn_semaphore = if max_connections > 0 {
+        Some(Arc::new(Semaphore::new(max_connections)))
+    } else {
+        None
+    };
 
     loop {
         tokio::select! {
@@ -82,6 +98,20 @@ pub async fn run_postgres_server(
             result = listener.accept() => {
                 match result {
                     Ok((socket, peer_addr)) => {
+                        // Acquire a permit if connection limiting is enabled
+                        let permit = if let Some(ref sem) = conn_semaphore {
+                            match sem.clone().try_acquire_owned() {
+                                Ok(permit) => Some(permit),
+                                Err(_) => {
+                                    warn!("Rejecting PostgreSQL connection from {} — max_connections ({}) reached", peer_addr, max_connections);
+                                    drop(socket);
+                                    continue;
+                                }
+                            }
+                        } else {
+                            None
+                        };
+
                         info!("New PostgreSQL connection from {}", peer_addr);
 
                         let factory_ref = factory.clone();
@@ -95,6 +125,8 @@ pub async fn run_postgres_server(
                                     error!("Error processing PostgreSQL connection from {}: {}", peer_addr, e);
                                 }
                             }
+                            // Permit is dropped here, releasing the semaphore slot
+                            drop(permit);
                         });
                     }
                     Err(e) => {

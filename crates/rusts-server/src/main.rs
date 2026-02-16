@@ -11,7 +11,7 @@
 
 mod telemetry;
 
-use rusts_api::auth::AuthConfig;
+use rusts_api::auth::{AuthConfig, AuthState};
 use rusts_api::{create_router, handlers::AppState, StartupPhase, StartupState};
 use rusts_core::ParallelConfig;
 use rusts_storage::memtable::FlushTrigger;
@@ -43,9 +43,6 @@ pub struct ServerConfig {
     pub postgres: PostgresSettings,
     /// Telemetry / OpenTelemetry configuration
     pub telemetry: TelemetrySettings,
-    /// Retention policies
-    #[serde(default)]
-    pub retention_policies: Vec<RetentionPolicyConfig>,
 }
 
 /// Server network settings
@@ -107,6 +104,9 @@ pub struct StorageSettings {
     pub direct_io_wal: bool,
     /// Use Direct I/O (bypass OS page cache) for segment files (default: false).
     pub direct_io_segments: bool,
+    /// Retention policies for automatic data expiration
+    #[serde(default)]
+    pub retention_policies: Vec<RetentionPolicyConfig>,
 }
 
 impl Default for StorageSettings {
@@ -123,6 +123,7 @@ impl Default for StorageSettings {
             fsync_on_write: true,
             direct_io_wal: false,
             direct_io_segments: false,
+            retention_policies: Vec::new(),
         }
     }
 }
@@ -210,11 +211,67 @@ pub struct RetentionPolicyConfig {
     pub name: String,
     /// Measurement pattern (supports wildcards)
     pub pattern: String,
-    /// Retention duration (e.g., "30d", "1w", "6h")
+    /// Retention duration (e.g., "30d", "1w", "6h", "90d")
     pub duration: String,
     /// Is this the default policy
     #[serde(default)]
     pub is_default: bool,
+}
+
+impl RetentionPolicyConfig {
+    /// Parse the duration string into seconds.
+    /// Supported suffixes: s (seconds), m (minutes), h (hours), d (days), w (weeks).
+    pub fn duration_secs(&self) -> Option<u64> {
+        let s = self.duration.trim();
+        if s.is_empty() {
+            return None;
+        }
+        let (num_str, multiplier) = match s.as_bytes().last()? {
+            b's' => (&s[..s.len() - 1], 1u64),
+            b'm' => (&s[..s.len() - 1], 60),
+            b'h' => (&s[..s.len() - 1], 3600),
+            b'd' => (&s[..s.len() - 1], 86400),
+            b'w' => (&s[..s.len() - 1], 604800),
+            _ => return None,
+        };
+        num_str.parse::<u64>().ok().map(|n| n * multiplier)
+    }
+
+    /// Check if a measurement name matches this policy's pattern.
+    /// Supports `*` as a glob wildcard.
+    pub fn matches(&self, measurement: &str) -> bool {
+        glob_match(&self.pattern, measurement)
+    }
+}
+
+/// Simple glob matching supporting `*` (matches any sequence of characters).
+fn glob_match(pattern: &str, text: &str) -> bool {
+    // Use a simple two-pointer backtracking approach
+    let pb = pattern.as_bytes();
+    let tb = text.as_bytes();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star_pi, mut star_ti) = (usize::MAX, 0usize);
+
+    while ti < tb.len() {
+        if pi < pb.len() && (pb[pi] == b'?' || pb[pi] == tb[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < pb.len() && pb[pi] == b'*' {
+            star_pi = pi;
+            star_ti = ti;
+            pi += 1;
+        } else if star_pi != usize::MAX {
+            pi = star_pi + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+    while pi < pb.len() && pb[pi] == b'*' {
+        pi += 1;
+    }
+    pi == pb.len()
 }
 
 /// Parallel query execution settings
@@ -243,7 +300,7 @@ pub struct PostgresSettings {
     pub host: String,
     /// Port for PostgreSQL connections (default: 5432)
     pub port: u16,
-    /// Maximum concurrent connections (not currently enforced)
+    /// Maximum concurrent connections (0 = unlimited)
     pub max_connections: usize,
 }
 
@@ -280,7 +337,6 @@ impl Default for ServerConfig {
             parallel: ParallelSettings::default(),
             postgres: PostgresSettings::default(),
             telemetry: TelemetrySettings::default(),
-            retention_policies: Vec::new(),
         }
     }
 }
@@ -593,11 +649,20 @@ async fn main() -> anyhow::Result<()> {
     }
     let app_state = Arc::new(app_state_inner);
 
-    // Create router with request timeout and body size limit
+    // Create auth state from config
+    let auth_config = config.to_auth_config();
+    if auth_config.enabled {
+        info!("Authentication enabled (JWT)");
+    } else {
+        info!("Authentication disabled");
+    }
+    let auth_state = Arc::new(AuthState::new(auth_config));
+
+    // Create router with request timeout, body size limit, and auth
     let request_timeout = std::time::Duration::from_secs(config.server.request_timeout_secs);
     let max_body_size = config.server.max_body_size;
     info!("Max request body size: {} bytes ({} MB)", max_body_size, max_body_size / (1024 * 1024));
-    let app = create_router(Arc::clone(&app_state), request_timeout, max_body_size);
+    let app = create_router(Arc::clone(&app_state), request_timeout, max_body_size, auth_state);
 
     // Start HTTP server FIRST - before storage initialization
     let addr: SocketAddr = format!("{}:{}", config.server.host, config.server.port).parse()?;
@@ -674,6 +739,7 @@ async fn main() -> anyhow::Result<()> {
         let pg_shutdown = shutdown_token.clone();
         let pg_host = config.postgres.host.clone();
         let pg_port = config.postgres.port;
+        let pg_max_connections = config.postgres.max_connections;
 
         info!("Starting PostgreSQL wire protocol server on {}:{}", pg_host, pg_port);
 
@@ -683,11 +749,91 @@ async fn main() -> anyhow::Result<()> {
                 query_timeout,
                 &pg_host,
                 pg_port,
+                pg_max_connections,
                 pg_shutdown,
             ).await {
                 tracing::error!("PostgreSQL server error: {}", e);
             }
         });
+    }
+
+    // Start retention policy enforcement background task
+    if !config.storage.retention_policies.is_empty() {
+        let policies = config.storage.retention_policies.clone();
+        let retention_state = Arc::clone(&app_state);
+        let retention_shutdown = shutdown_token.clone();
+
+        // Validate and log policies
+        let mut valid_policies = Vec::new();
+        for policy in &policies {
+            match policy.duration_secs() {
+                Some(secs) => {
+                    info!(
+                        "Retention policy '{}': pattern='{}', duration={}s ({}d)",
+                        policy.name, policy.pattern, secs, secs / 86400
+                    );
+                    valid_policies.push(policy.clone());
+                }
+                None => {
+                    tracing::warn!(
+                        "Retention policy '{}': invalid duration '{}', skipping",
+                        policy.name, policy.duration
+                    );
+                }
+            }
+        }
+
+        if !valid_policies.is_empty() {
+            info!("Starting retention enforcement task ({} policies)", valid_policies.len());
+            tokio::spawn(async move {
+                // Check every 60 seconds
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            // Wait until storage is ready
+                            let storage = match retention_state.get_storage() {
+                                Some(s) => s,
+                                None => continue,
+                            };
+
+                            let now_nanos = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_nanos() as i64;
+
+                            for policy in &valid_policies {
+                                let retention_secs = match policy.duration_secs() {
+                                    Some(s) => s,
+                                    None => continue,
+                                };
+                                let cutoff_nanos = now_nanos - (retention_secs as i64 * 1_000_000_000);
+
+                                match storage.delete_partitions_before(cutoff_nanos) {
+                                    Ok(0) => {} // nothing to delete
+                                    Ok(n) => {
+                                        info!(
+                                            "Retention policy '{}': deleted {} partition(s) older than {}",
+                                            policy.name, n, policy.duration
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "Retention policy '{}': error deleting partitions: {}",
+                                            policy.name, e
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        _ = retention_shutdown.cancelled() => {
+                            info!("Retention enforcement task shutting down");
+                            break;
+                        }
+                    }
+                }
+            });
+        }
     }
 
     // Handle shutdown gracefully (SIGINT and SIGTERM)

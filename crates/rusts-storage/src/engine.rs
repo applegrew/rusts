@@ -1421,6 +1421,12 @@ impl StorageEngine {
         self.partitions.get_all_series()
     }
 
+    /// Delete partitions whose data is entirely older than the given timestamp.
+    /// Returns the number of partitions deleted.
+    pub fn delete_partitions_before(&self, timestamp: i64) -> Result<usize> {
+        self.partitions.delete_partitions_before(timestamp)
+    }
+
     /// Get all series from both memtable and partitions
     /// Used for complete index rebuilding on server startup
     pub fn get_all_series(&self) -> Vec<(SeriesId, String, Vec<rusts_core::Tag>)> {

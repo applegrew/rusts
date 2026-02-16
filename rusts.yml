@@ -29,10 +29,26 @@ storage:
   direct_io_wal: false
   # Use Direct I/O (bypass OS page cache) for segment files (default: false).
   direct_io_segments: false
+  # Retention policies — a background task checks every 60s and deletes
+  # partitions whose data is entirely older than the configured duration.
+  # Duration suffixes: s (seconds), m (minutes), h (hours), d (days), w (weeks).
+  # Pattern supports * glob wildcard.
+  # Example:
+  #   retention_policies:
+  #     - name: default
+  #       pattern: "*"
+  #       duration: "90d"
+  #       is_default: true
+  #     - name: short_lived_metrics
+  #       pattern: "tmp_*"
+  #       duration: "7d"
+  retention_policies: []
+# Authentication — when enabled, /write, /query, /sql, /stats require a valid
+# JWT Bearer token. /health and /ready remain public.
 auth:
   enabled: false
-  jwt_secret: change-me-in-production
-  token_expiration_secs: 3600
+  jwt_secret: change-me-in-production   # MUST change for production
+  token_expiration_secs: 3600            # Token lifetime in seconds
 logging:
   level: info
   show_target: true
@@ -42,7 +58,7 @@ postgres:
   enabled: true
   host: 0.0.0.0
   port: 5432
-  max_connections: 100
+  max_connections: 100  # Max concurrent pgwire connections (0 = unlimited)
 telemetry:
   # Enable OpenTelemetry metrics and trace export (default: false).
   # When disabled, zero overhead — no providers are installed.
@@ -55,4 +71,3 @@ telemetry:
   export_interval_secs: 10
   # Service name reported to the collector.
   service_name: rusts
-retention_policies: []
