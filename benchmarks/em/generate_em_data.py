@@ -8,11 +8,11 @@ piped straight into the RusTs /write endpoint.
 
 Measurements generated
 ──────────────────────
-  mb_em_device_metrics            – 38+ device-level fields
-  mb_em_installed_app_metrics     – per-app metrics (CPU, mem, IO, crashes …)
-  mb_em_web_app_metrics           – web-app experience metrics
-  mb_em_network_monitoring_metrics – packet loss, latency, jitter
-  mb_em_device_metrics_battery    – battery-specific metrics
+  em_device_metrics            – 38+ device-level fields
+  em_installed_app_metrics     – per-app metrics (CPU, mem, IO, crashes …)
+  em_web_app_metrics           – web-app experience metrics
+  em_network_monitoring_metrics – packet loss, latency, jitter
+  em_device_metrics_battery    – battery-specific metrics
 
 Usage
 ─────
@@ -96,7 +96,7 @@ def _clamp(v: float, lo: float = 0.0, hi: float = 100.0) -> float:
 
 def gen_device_metrics(rng: random.Random, ts_ns: int, device_id: str,
                        type_k: str, base_cpu: float, base_mem: float) -> str:
-    """mb_em_device_metrics — 38 fields."""
+    """em_device_metrics — 38 fields."""
     d = _diurnal(ts_ns)
     noise = lambda scale=5.0: rng.uniform(-scale, scale)
 
@@ -185,13 +185,13 @@ def gen_device_metrics(rng: random.Random, ts_ns: int, device_id: str,
         f"em_device_crashes={crashes}i"
     )
 
-    return f"mb_em_device_metrics,{tag_set} {fields} {ts_ns}"
+    return f"em_device_metrics,{tag_set} {fields} {ts_ns}"
 
 
 def gen_installed_app_metrics(rng: random.Random, ts_ns: int, device_id: str,
                               app_id: str, app_name: str, app_version: str,
                               type_k: str) -> str:
-    """mb_em_installed_app_metrics — 10 fields."""
+    """em_installed_app_metrics — 10 fields."""
     d = _diurnal(ts_ns)
     cpu = _clamp(rng.uniform(1, 30) * d + rng.uniform(-2, 2))
     mem = _clamp(rng.uniform(5, 40) * d + rng.uniform(-3, 3))
@@ -225,12 +225,12 @@ def gen_installed_app_metrics(rng: random.Random, ts_ns: int, device_id: str,
         f"em_installed_app_last_access_time={last_access}i"
     )
 
-    return f"mb_em_installed_app_metrics,{tag_set} {fields} {ts_ns}"
+    return f"em_installed_app_metrics,{tag_set} {fields} {ts_ns}"
 
 
 def gen_web_app_metrics(rng: random.Random, ts_ns: int, device_id: str,
                         app_id: str, type_k: str) -> str:
-    """mb_em_web_app_metrics — 12 fields."""
+    """em_web_app_metrics — 12 fields."""
     availability = _clamp(rng.uniform(90, 100) + rng.uniform(-2, 2))
     resp_time = max(0, rng.uniform(50, 2000) + rng.uniform(-100, 100))
     pageload = max(0, rng.uniform(100, 5000) + rng.uniform(-200, 200))
@@ -263,12 +263,12 @@ def gen_web_app_metrics(rng: random.Random, ts_ns: int, device_id: str,
         f"em_web_app_last_access_time={last_access}i"
     )
 
-    return f"mb_em_web_app_metrics,{tag_set} {fields} {ts_ns}"
+    return f"em_web_app_metrics,{tag_set} {fields} {ts_ns}"
 
 
 def gen_network_metrics(rng: random.Random, ts_ns: int, device_id: str,
                         app_id: str, type_k: str) -> str:
-    """mb_em_network_monitoring_metrics — 3 fields."""
+    """em_network_monitoring_metrics — 3 fields."""
     pkt_loss = _clamp(rng.uniform(0, 5) + rng.uniform(-0.5, 0.5), 0, 100)
     latency = max(0, rng.uniform(10, 200) + rng.uniform(-10, 10))
     jitter = max(0, rng.uniform(1, 30) + rng.uniform(-2, 2))
@@ -285,12 +285,12 @@ def gen_network_metrics(rng: random.Random, ts_ns: int, device_id: str,
         f"em_jitter={jitter:.4f}"
     )
 
-    return f"mb_em_network_monitoring_metrics,{tag_set} {fields} {ts_ns}"
+    return f"em_network_monitoring_metrics,{tag_set} {fields} {ts_ns}"
 
 
 def gen_battery_metrics(rng: random.Random, ts_ns: int, device_id: str,
                         battery_id: str, type_k: str) -> str:
-    """mb_em_device_metrics_battery — battery fields."""
+    """em_device_metrics_battery — battery fields."""
     charge = _clamp(rng.uniform(10, 100) + rng.uniform(-5, 5))
     health = _clamp(rng.uniform(70, 100) + rng.uniform(-2, 2))
     cycle = rng.randint(50, 1000)
@@ -313,7 +313,7 @@ def gen_battery_metrics(rng: random.Random, ts_ns: int, device_id: str,
         f"em_battery_status={status}i"
     )
 
-    return f"mb_em_device_metrics_battery,{tag_set} {fields} {ts_ns}"
+    return f"em_device_metrics_battery,{tag_set} {fields} {ts_ns}"
 
 
 # ── Fleet generation ───────────────────────────────────────────────────────

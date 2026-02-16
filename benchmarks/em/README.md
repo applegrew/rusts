@@ -42,11 +42,11 @@ The generator creates data across 4 measurements matching the RusTs schema:
 
 | Measurement | Tags | Fields | Description |
 |-------------|------|--------|-------------|
-| `mb_em_device_metrics` | devicesysid_k, type_k, os_k, city_t, ... | 38 device metrics (CPU, memory, disk, energy, WiFi, ...) | Device health |
-| `mb_em_installed_app_metrics` | devicesysid_k, appsysid_k, type_k, appname_t, appversion_t | 11 app metrics (CPU, memory, I/O, crashes, ...) | Installed app performance |
-| `mb_em_web_app_metrics` | devicesysid_k, appsysid_k, type_k | 12 web app metrics (availability, response time, ...) | Web app performance |
-| `mb_em_network_monitoring_metrics` | devicesysid_k, appsysid_k, type_k | 3 network metrics (packet loss, latency, jitter) | Network monitoring |
-| `mb_em_device_metrics_battery` | devicesysid_k, batteryid_k, type_k | 1 battery metric | Battery health |
+| `em_device_metrics` | devicesysid_k, type_k, os_k, city_t, ... | 38 device metrics (CPU, memory, disk, energy, WiFi, ...) | Device health |
+| `em_installed_app_metrics` | devicesysid_k, appsysid_k, type_k, appname_t, appversion_t | 11 app metrics (CPU, memory, I/O, crashes, ...) | Installed app performance |
+| `em_web_app_metrics` | devicesysid_k, appsysid_k, type_k | 12 web app metrics (availability, response time, ...) | Web app performance |
+| `em_network_monitoring_metrics` | devicesysid_k, appsysid_k, type_k | 3 network metrics (packet loss, latency, jitter) | Network monitoring |
+| `em_device_metrics_battery` | devicesysid_k, batteryid_k, type_k | 1 battery metric | Battery health |
 
 ### Data Profiles
 
@@ -139,5 +139,5 @@ Format: `-- ID | Name | Category | DB R_ms | DB C_ms`
 
 1. **ROLLUP queries excluded**: RusTs does not support `CREATE TEMPORARY TABLE`, `DATE_BIN`, or multi-statement transactions. The 2 ROLLUP queries from Part A are omitted.
 2. **Parameterized queries**: Queries with `?` placeholders have been substituted with concrete values from the known device/app IDs used in the benchmark data.
-3. **DB C single-metric mapping**: DB C stores each metric as a separate measurement. In RusTs, these are fields within `mb_em_device_metrics`. The Part B queries are translated to use the RusTs schema.
+3. **DB C single-metric mapping**: DB C stores each metric as a separate measurement. In RusTs, these are fields within `em_device_metrics`. The Part B queries are translated to use the RusTs schema.
 4. **COUNT DISTINCT**: Some dashboard queries use `COUNT(DISTINCT tag)` which may have different performance characteristics across systems.
