@@ -5,9 +5,9 @@
 -- Each query is annotated with its source, category, and baseline timings.
 --
 -- Categories:
---   A = Part A (perf37, 50k load, DB R timings)
---   B = Part B (perf36, DB C single-metric timings)
---   C = Part C (perf36, DB C multi-metric timings)
+--   A = Part A (50k load, DB R timings)
+--   B = Part B (DB C single-metric timings)
+--   C = Part C (DB C multi-metric timings)
 --
 -- Annotation format:
 --   -- ID | Name | Category | DB R_ms | DB C_ms
@@ -20,7 +20,7 @@
 -- ============================================================================
 
 -- ============================================================================
--- CATEGORY A: Part A — perf37 single-metric (DB R slow queries @ 50k)
+-- CATEGORY A: Part A — single-metric (DB R slow queries @ 50k)
 -- ============================================================================
 
 -- QA01 | DeviceMet - Page file usage | A | 8776 | 0
@@ -66,7 +66,7 @@ SELECT appsysid_k, appversion_t, SUM(em_installed_app_usage) FROM em_installed_a
 SELECT appsysid_k, appversion_t, MAX(em_installed_app_last_access_time) FROM em_installed_app_metrics WHERE appsysid_k IN ('0185948833fab2108124c6273e5c7ba5', '9985d48833fab2108124c6273e5c7bb9', '9585d48833fab2108124c6273e5c7b42', '9185d48833fab2108124c6273e5c7b9f', '8d85948833fab2108124c6273e5c7beb', 'f48518cc33f6b2108124c6273e5c7be2', '1985d48833fab2108124c6273e5c7b6a', '8985d48833fab2108124c6273e5c7b08', '0985d48833fab2108124c6273e5c7b25', '1d85d48833fab2108124c6273e5c7b84') AND devicesysid_k = '0cddbe08f4f53a1047c02d117116e609' AND em_installed_app_last_access_time > 0 AND time >= '2025-12-24 06:13:48' AND time <= '2025-12-24 08:13:48' GROUP BY appsysid_k, appversion_t
 
 -- ============================================================================
--- CATEGORY B: Part B — perf36 single-metric (DB C timings)
+-- CATEGORY B: Part B — single-metric (DB C timings)
 -- DB C uses per-metric measurements; RusTs stores these as fields within
 -- em_device_metrics. Queries are translated accordingly.
 -- ============================================================================
@@ -192,7 +192,7 @@ SELECT time, em_device_memory_usage FROM em_device_metrics WHERE time >= '2025-1
 SELECT time, em_energy_consumption_mbb FROM em_device_metrics WHERE time >= '2025-12-24 06:13:48' AND time <= '2025-12-24 08:13:48' AND devicesysid_k = '0cddbe08f4f53a1047c02d117116e609' AND em_energy_consumption_mbb >= 0 AND type_k = 'device' ORDER BY time DESC
 
 -- ============================================================================
--- CATEGORY C: Part C — perf36 multi-metric (DB C timings)
+-- CATEGORY C: Part C — multi-metric (DB C timings)
 -- Multi-field SELECTs across raw / hourly / daily / all_agents tables.
 -- In RusTs these map to em_device_metrics, em_installed_app_metrics,
 -- em_web_app_metrics, and em_network_monitoring_metrics.

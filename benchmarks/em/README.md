@@ -7,9 +7,9 @@ Benchmarks RusTs query performance against the EM (Endpoint Management) workload
 The EM workload models endpoint monitoring for enterprise devices — CPU, memory, disk, energy, WiFi, installed apps, web apps, and network monitoring metrics. Queries range from simple single-metric time-range scans to multi-field aggregations with GROUP BY.
 
 **Query sources:**
-- **Part A** (14 queries): DB R slow queries at 50k device load (perf37)
-- **Part B** (40 queries): DB C single-metric queries (perf36)
-- **Part C** (16 queries): DB C multi-metric queries (perf36)
+- **Part A** (14 queries): DB R slow queries at 50k device load
+- **Part B** (40 queries): DB C single-metric queries
+- **Part C** (16 queries): DB C multi-metric queries
 
 **Total: 70 queries** covering raw scans, filtered lookups, TOP-N aggregations, COUNT DISTINCT, multi-field SELECTs, and time-windowed aggregations.
 
@@ -132,8 +132,8 @@ Each query in `em_queries.sql` is annotated with:
 Format: `-- ID | Name | Category | DB R_ms | DB C_ms`
 
 - `0` means no baseline available for that system
-- DB R baselines are from perf37 (50k device load)
-- DB C baselines are from perf36
+- DB R baselines are from 50k device load tests
+- DB C baselines are from single/multi-metric tests
 
 ## Known Limitations
 
