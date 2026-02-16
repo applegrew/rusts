@@ -11,6 +11,7 @@ pub mod auth;
 pub mod error;
 pub mod handlers;
 pub mod line_protocol;
+pub mod memory;
 pub mod router;
 
 pub use error::{ApiError, Result};

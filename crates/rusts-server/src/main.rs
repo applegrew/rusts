@@ -12,6 +12,7 @@
 mod telemetry;
 
 use rusts_api::auth::{AuthConfig, AuthState};
+use rusts_api::memory::MemoryGuard;
 use rusts_api::{create_router, handlers::AppState, StartupPhase, StartupState};
 use rusts_core::ParallelConfig;
 use rusts_storage::memtable::FlushTrigger;
@@ -61,6 +62,10 @@ pub struct ServerSettings {
     pub query_timeout_secs: u64,
     /// Maximum number of concurrent queries
     pub max_concurrent_queries: usize,
+    /// Maximum process memory (RSS) in MB.  When the limit is approached
+    /// the server flushes memtables proactively; when exceeded it rejects
+    /// writes with HTTP 503 until memory drops.  0 = unlimited (default).
+    pub max_memory_mb: u64,
 }
 
 impl Default for ServerSettings {
@@ -72,6 +77,7 @@ impl Default for ServerSettings {
             request_timeout_secs: 30,
             query_timeout_secs: 30,
             max_concurrent_queries: 100,
+            max_memory_mb: 0, // unlimited
         }
     }
 }
@@ -523,6 +529,7 @@ EXAMPLE CONFIG (rusts.yml):
     server:
       host: "0.0.0.0"
       port: 8086
+      max_memory_mb: 4096  # 4 GB limit (0 = unlimited)
 
     storage:
       data_dir: "./data"
@@ -636,6 +643,19 @@ async fn main() -> anyhow::Result<()> {
         if parallel_config.thread_pool_size == 0 { "auto".to_string() } else { parallel_config.thread_pool_size.to_string() },
     );
 
+    // Create memory guard
+    let memory_guard = Arc::new(MemoryGuard::new(config.server.max_memory_mb));
+    if memory_guard.is_enabled() {
+        info!(
+            "Memory limit: {} MB (soft: {} MB, hard: {} MB)",
+            config.server.max_memory_mb,
+            config.server.max_memory_mb * 9 / 10,
+            config.server.max_memory_mb
+        );
+    } else {
+        info!("Memory limit: unlimited (set server.max_memory_mb to enable)");
+    }
+
     // Create application state in initializing mode (no storage yet)
     // This allows health/ready endpoints to respond immediately
     let mut app_state_inner = AppState::new_initializing(
@@ -647,6 +667,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(metrics) = server_metrics {
         app_state_inner.set_metrics(metrics);
     }
+    app_state_inner.set_memory_guard(Arc::clone(&memory_guard));
     let app_state = Arc::new(app_state_inner);
 
     // Create auth state from config
@@ -753,6 +774,23 @@ async fn main() -> anyhow::Result<()> {
                 pg_shutdown,
             ).await {
                 tracing::error!("PostgreSQL server error: {}", e);
+            }
+        });
+    }
+
+    // Start background RSS refresh task (updates cached RSS every second)
+    if memory_guard.is_enabled() {
+        let mg = Arc::clone(&memory_guard);
+        let mg_shutdown = shutdown_token.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        mg.refresh();
+                    }
+                    _ = mg_shutdown.cancelled() => break,
+                }
             }
         });
     }

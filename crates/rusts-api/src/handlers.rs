@@ -2,6 +2,7 @@
 
 use crate::error::ApiError;
 use crate::line_protocol::LineProtocolParser;
+use crate::memory::{MemoryGuard, MemoryPressure};
 use axum::{
     body::Bytes,
     extract::State,
@@ -116,6 +117,8 @@ pub struct AppState {
     pub parallel_config: ParallelConfig,
     /// Optional telemetry metrics (None when telemetry is disabled).
     pub metrics: Option<ServerMetrics>,
+    /// Memory guard for enforcing process memory limits.
+    pub memory_guard: Arc<MemoryGuard>,
 }
 
 impl AppState {
@@ -148,6 +151,7 @@ impl AppState {
             startup_state,
             parallel_config,
             metrics: None,
+            memory_guard: Arc::new(MemoryGuard::new(0)),
         }
     }
 
@@ -168,12 +172,18 @@ impl AppState {
             startup_state,
             parallel_config,
             metrics: None,
+            memory_guard: Arc::new(MemoryGuard::new(0)),
         }
     }
 
     /// Set telemetry metrics handles.
     pub fn set_metrics(&mut self, metrics: ServerMetrics) {
         self.metrics = Some(metrics);
+    }
+
+    /// Set the memory guard (call before Arc-wrapping).
+    pub fn set_memory_guard(&mut self, guard: Arc<MemoryGuard>) {
+        self.memory_guard = guard;
     }
 
     /// Set the storage engine once it's initialized
@@ -266,6 +276,36 @@ pub async fn write(
         let phase = state.startup_state.phase();
         ApiError::ServiceUnavailable(format!("Server is starting up ({})", phase))
     })?;
+
+    // Check memory pressure before accepting the write.
+    // The background RSS refresh task updates the cached value every second;
+    // we only call refresh() inline when the guard is disabled (no-op path).
+    match state.memory_guard.check() {
+        MemoryPressure::Critical => {
+            let rss_mb = state.memory_guard.current_rss_bytes() / (1024 * 1024);
+            let max_mb = state.memory_guard.max_bytes() / (1024 * 1024);
+            tracing::warn!(
+                "Write rejected: memory limit exceeded (RSS {}MB / {}MB limit)",
+                rss_mb, max_mb
+            );
+            // Force a memtable flush to try to free memory
+            if let Err(e) = storage.force_flush() {
+                tracing::error!("Emergency flush failed: {}", e);
+            }
+            return Err(ApiError::ServiceUnavailable(format!(
+                "Memory limit exceeded ({}MB / {}MB). Write rejected — try again shortly.",
+                rss_mb, max_mb
+            )));
+        }
+        MemoryPressure::High => {
+            // Proactively flush memtable to reduce memory pressure
+            tracing::debug!("Memory pressure high, triggering proactive flush");
+            if let Err(e) = storage.force_flush() {
+                tracing::warn!("Proactive flush failed: {}", e);
+            }
+        }
+        MemoryPressure::Normal => {}
+    }
 
     let (points, parse_errors) = LineProtocolParser::parse_lines_ok(&body);
 

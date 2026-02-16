@@ -1427,6 +1427,20 @@ impl StorageEngine {
         self.partitions.delete_partitions_before(timestamp)
     }
 
+    /// Force-flush the active memtable to disk, even if flush thresholds
+    /// have not been reached.  Used by the memory guard to free memory
+    /// under pressure.  No-op if the active memtable is empty.
+    pub fn force_flush(&self) -> Result<()> {
+        let has_data = {
+            let memtable = self.active_memtable.read();
+            memtable.point_count() > 0
+        };
+        if has_data {
+            self.rotate_memtable()?;
+        }
+        Ok(())
+    }
+
     /// Get all series from both memtable and partitions
     /// Used for complete index rebuilding on server startup
     pub fn get_all_series(&self) -> Vec<(SeriesId, String, Vec<rusts_core::Tag>)> {

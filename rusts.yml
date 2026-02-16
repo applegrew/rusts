@@ -5,6 +5,10 @@ server:
   request_timeout_secs: 120
   query_timeout_secs: 120
   max_concurrent_queries: 100
+  # Maximum process memory (RSS) in MB. At 90% the server flushes memtables
+  # proactively; at 100% it rejects writes with HTTP 503 until memory drops.
+  # 0 = unlimited (default). Set this to prevent the OS OOM killer.
+  max_memory_mb: 0
 storage:
   data_dir: ./data
   wal_dir: null

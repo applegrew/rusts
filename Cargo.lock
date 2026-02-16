@@ -2967,6 +2967,7 @@ dependencies = [
  "dashmap",
  "hyper",
  "jsonwebtoken",
+ "libc",
  "opentelemetry",
  "parking_lot",
  "rand 0.8.5",
