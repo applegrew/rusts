@@ -6,7 +6,7 @@
 //! - Background flushing and compaction
 
 use crate::error::Result;
-use crate::memtable::{FlushTrigger, MemTable, MemTablePoint};
+use crate::memtable::{FlushReason, FlushTrigger, MemTable, MemTablePoint};
 use crate::partition::PartitionManager;
 use crate::wal::{WalDurability, WalReader, WalWriter};
 use parking_lot::RwLock;
@@ -81,8 +81,47 @@ enum FlushCommand {
     Flush {
         memtable: Arc<MemTable>,
         wal_sequence: u64,
+        reason: FlushReason,
     },
     Shutdown,
+}
+
+/// Per-reason flush counters for telemetry.
+#[derive(Debug, Default)]
+pub struct FlushCounters {
+    pub size_threshold: AtomicU64,
+    pub point_count_threshold: AtomicU64,
+    pub age_threshold: AtomicU64,
+    pub memory_pressure: AtomicU64,
+    pub shutdown: AtomicU64,
+}
+
+impl FlushCounters {
+    fn increment(&self, reason: FlushReason) {
+        match reason {
+            FlushReason::SizeThreshold => self.size_threshold.fetch_add(1, Ordering::Relaxed),
+            FlushReason::PointCountThreshold => self.point_count_threshold.fetch_add(1, Ordering::Relaxed),
+            FlushReason::AgeThreshold => self.age_threshold.fetch_add(1, Ordering::Relaxed),
+            FlushReason::MemoryPressure => self.memory_pressure.fetch_add(1, Ordering::Relaxed),
+            FlushReason::Shutdown => self.shutdown.fetch_add(1, Ordering::Relaxed),
+        };
+    }
+
+    /// Returns `(reason_name, count)` pairs for all reasons that have been triggered.
+    pub fn snapshot(&self) -> Vec<(&'static str, u64)> {
+        vec![
+            ("size_threshold", self.size_threshold.load(Ordering::Relaxed)),
+            ("point_count_threshold", self.point_count_threshold.load(Ordering::Relaxed)),
+            ("age_threshold", self.age_threshold.load(Ordering::Relaxed)),
+            ("memory_pressure", self.memory_pressure.load(Ordering::Relaxed)),
+            ("shutdown", self.shutdown.load(Ordering::Relaxed)),
+        ]
+    }
+
+    /// Total flushes across all reasons.
+    pub fn total(&self) -> u64 {
+        self.snapshot().iter().map(|(_, c)| c).sum()
+    }
 }
 
 /// Storage engine
@@ -105,6 +144,8 @@ pub struct StorageEngine {
     running: RwLock<bool>,
     /// Last WAL sequence number that has been flushed to segments
     last_flushed_sequence: AtomicU64,
+    /// Per-reason flush counters for telemetry
+    flush_counters: FlushCounters,
 }
 
 impl StorageEngine {
@@ -152,6 +193,7 @@ impl StorageEngine {
             flush_tx,
             running: RwLock::new(true),
             last_flushed_sequence: AtomicU64::new(checkpoint_sequence.unwrap_or(0)),
+            flush_counters: FlushCounters::default(),
         };
 
         // Start background flusher
@@ -190,15 +232,15 @@ impl StorageEngine {
         self.wal.write(points)?;
 
         // Write to active memtable and check if flush is needed
-        let should_flush = {
+        let flush_reason = {
             let memtable = self.active_memtable.read();
             memtable.insert_batch(points)?;
             memtable.should_flush()
         };
 
         // Check if flush is needed
-        if should_flush {
-            self.rotate_memtable()?;
+        if let Some(reason) = flush_reason {
+            self.rotate_memtable(reason)?;
         }
 
         Ok(())
@@ -1205,7 +1247,7 @@ impl StorageEngine {
 
     /// Force flush active memtable
     pub fn flush(&self) -> Result<()> {
-        self.rotate_memtable()
+        self.rotate_memtable(FlushReason::Shutdown)
     }
 
     /// Shutdown the storage engine
@@ -1427,16 +1469,26 @@ impl StorageEngine {
         self.partitions.delete_partitions_before(timestamp)
     }
 
+    /// Get the per-reason flush counters for telemetry.
+    pub fn flush_counters(&self) -> &FlushCounters {
+        &self.flush_counters
+    }
+
     /// Force-flush the active memtable to disk, even if flush thresholds
     /// have not been reached.  Used by the memory guard to free memory
     /// under pressure.  No-op if the active memtable is empty.
     pub fn force_flush(&self) -> Result<()> {
+        self.force_flush_with_reason(FlushReason::MemoryPressure)
+    }
+
+    /// Force-flush with a specific reason.  No-op if the active memtable is empty.
+    pub fn force_flush_with_reason(&self, reason: FlushReason) -> Result<()> {
         let has_data = {
             let memtable = self.active_memtable.read();
             memtable.point_count() > 0
         };
         if has_data {
-            self.rotate_memtable()?;
+            self.rotate_memtable(reason)?;
         }
         Ok(())
     }
@@ -1804,8 +1856,9 @@ impl StorageEngine {
     }
 
     /// Rotate the active memtable (make it immutable and create new active)
-    fn rotate_memtable(&self) -> Result<()> {
-        let _span = tracing::info_span!("storage.rotate_memtable").entered();
+    fn rotate_memtable(&self, reason: FlushReason) -> Result<()> {
+        self.flush_counters.increment(reason);
+        let _span = tracing::info_span!("storage.rotate_memtable", %reason).entered();
         // Get the current WAL sequence before rotation
         // All data in this memtable was written at or before this sequence
         let wal_sequence = self.wal.sequence();
@@ -1824,13 +1877,14 @@ impl StorageEngine {
         // Add to immutable list
         self.immutable_memtables.write().push(old_memtable.clone());
 
-        // Trigger background flush with the WAL sequence
+        // Trigger background flush with the WAL sequence and reason
         let _ = self.flush_tx.send(FlushCommand::Flush {
             memtable: old_memtable,
             wal_sequence,
+            reason,
         });
 
-        debug!("Rotated memtable (WAL sequence: {})", wal_sequence);
+        debug!("Rotated memtable (WAL sequence: {}, reason: {})", wal_sequence, reason);
         Ok(())
     }
 
@@ -1863,12 +1917,12 @@ impl StorageEngine {
 
                 while let Some(cmd) = rx.recv().await {
                     match cmd {
-                        FlushCommand::Flush { memtable, wal_sequence } => {
+                        FlushCommand::Flush { memtable, wal_sequence, reason } => {
                             if let Err(e) = flush_memtable_to_partitions(&memtable, &partitions) {
                                 error!("Failed to flush memtable: {}", e);
                             } else {
-                                debug!("Flushed memtable with {} points (WAL sequence: {})",
-                                       memtable.point_count(), wal_sequence);
+                                info!("Flushed memtable: {} points, WAL seq {}, reason={}",
+                                       memtable.point_count(), wal_sequence, reason);
 
                                 // Save checkpoint after successful flush
                                 if let Err(e) = Self::save_checkpoint(&data_dir, wal_sequence) {

@@ -795,6 +795,35 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Start background flush-counter telemetry emitter (emits per-reason
+    // flush counts as OTel gauge values every 5 seconds).
+    if config.telemetry.enabled {
+        if let Some(ref m) = app_state.metrics {
+            let flush_metrics = m.clone();
+            let flush_state = Arc::clone(&app_state);
+            let flush_shutdown = shutdown_token.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            if let Some(storage) = flush_state.get_storage() {
+                                let fc = storage.flush_counters();
+                                for (reason, count) in fc.snapshot() {
+                                    flush_metrics.memtable_flushes_total.record(
+                                        count as i64,
+                                        &[opentelemetry::KeyValue::new("reason", reason)],
+                                    );
+                                }
+                            }
+                        }
+                        _ = flush_shutdown.cancelled() => break,
+                    }
+                }
+            });
+        }
+    }
+
     // Start retention policy enforcement background task
     if !config.storage.retention_policies.is_empty() {
         let policies = config.storage.retention_policies.clone();

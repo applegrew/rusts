@@ -90,9 +90,9 @@ fn build_metrics(meter: &opentelemetry::metrics::Meter) -> ServerMetrics {
             .i64_gauge("rusts.active_queries")
             .with_description("Currently executing queries")
             .build(),
-        memtable_flushes: meter
-            .u64_counter("rusts.memtable_flushes")
-            .with_description("Total memtable flush operations")
+        memtable_flushes_total: meter
+            .i64_gauge("rusts.memtable_flushes_total")
+            .with_description("Cumulative memtable flush count (use 'reason' attribute to filter)")
             .build(),
         wal_syncs: meter
             .u64_counter("rusts.wal_syncs")

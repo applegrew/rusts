@@ -14,9 +14,9 @@ pub mod partition;
 pub mod segment;
 pub mod wal;
 
-pub use engine::{StorageEngine, StorageEngineConfig};
+pub use engine::{FlushCounters, StorageEngine, StorageEngineConfig};
 pub use error::{Result, StorageError};
-pub use memtable::{MemTable, MemTablePoint};
+pub use memtable::{FlushReason, MemTable, MemTablePoint};
 pub use partition::{Partition, PartitionManager};
 pub use segment::{FieldStats, Segment, SegmentMeta, SegmentReader, SegmentWriter};
 pub use wal::{WalDurability, WalReader, WalWriter};

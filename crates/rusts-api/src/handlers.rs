@@ -98,7 +98,7 @@ pub struct ServerMetrics {
     pub queries_executed: Counter<u64>,
     pub query_latency_ms: Histogram<f64>,
     pub active_queries: Gauge<i64>,
-    pub memtable_flushes: Counter<u64>,
+    pub memtable_flushes_total: Gauge<i64>,
     pub wal_syncs: Counter<u64>,
     pub wal_bytes_written: Counter<u64>,
     pub process_cpu_usage: Gauge<f64>,
@@ -728,6 +728,17 @@ pub struct StatsResponse {
     pub measurement_count: usize,
     pub memtable: MemTableStatsResponse,
     pub partitions: PartitionStatsResponse,
+    pub flush_counts: FlushCountsResponse,
+}
+
+#[derive(Serialize)]
+pub struct FlushCountsResponse {
+    pub total: u64,
+    pub size_threshold: u64,
+    pub point_count_threshold: u64,
+    pub age_threshold: u64,
+    pub memory_pressure: u64,
+    pub shutdown: u64,
 }
 
 #[derive(Serialize)]
@@ -756,6 +767,9 @@ pub async fn stats(State(state): State<Arc<AppState>>) -> std::result::Result<Js
     let memtable = storage.memtable_stats();
     let partitions = storage.partition_stats();
 
+    let fc = storage.flush_counters();
+    let fc_snap = fc.snapshot();
+
     Ok(Json(StatsResponse {
         series_count: state.series_index.len(),
         measurement_count: state.series_index.measurements().len(),
@@ -769,6 +783,14 @@ pub async fn stats(State(state): State<Arc<AppState>>) -> std::result::Result<Js
             partition_count: partitions.partition_count,
             total_segments: partitions.total_segments,
             total_points: partitions.total_points,
+        },
+        flush_counts: FlushCountsResponse {
+            total: fc.total(),
+            size_threshold: fc_snap.iter().find(|(k, _)| *k == "size_threshold").map(|(_, v)| *v).unwrap_or(0),
+            point_count_threshold: fc_snap.iter().find(|(k, _)| *k == "point_count_threshold").map(|(_, v)| *v).unwrap_or(0),
+            age_threshold: fc_snap.iter().find(|(k, _)| *k == "age_threshold").map(|(_, v)| *v).unwrap_or(0),
+            memory_pressure: fc_snap.iter().find(|(k, _)| *k == "memory_pressure").map(|(_, v)| *v).unwrap_or(0),
+            shutdown: fc_snap.iter().find(|(k, _)| *k == "shutdown").map(|(_, v)| *v).unwrap_or(0),
         },
     }))
 }

@@ -40,6 +40,33 @@ struct SeriesData {
     points: RwLock<Vec<MemTablePoint>>,
 }
 
+/// Reason why a memtable flush was triggered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlushReason {
+    /// Memtable size exceeded `max_size`.
+    SizeThreshold,
+    /// Point count exceeded `max_points`.
+    PointCountThreshold,
+    /// Oldest point age exceeded `max_age_nanos`.
+    AgeThreshold,
+    /// Server process memory pressure (from MemoryGuard).
+    MemoryPressure,
+    /// Graceful server shutdown.
+    Shutdown,
+}
+
+impl std::fmt::Display for FlushReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FlushReason::SizeThreshold => write!(f, "size_threshold"),
+            FlushReason::PointCountThreshold => write!(f, "point_count_threshold"),
+            FlushReason::AgeThreshold => write!(f, "age_threshold"),
+            FlushReason::MemoryPressure => write!(f, "memory_pressure"),
+            FlushReason::Shutdown => write!(f, "shutdown"),
+        }
+    }
+}
+
 /// Flush trigger configuration
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FlushTrigger {
@@ -464,18 +491,19 @@ impl MemTable {
             .collect()
     }
 
-    /// Check if flush should be triggered
+    /// Check if flush should be triggered.
     ///
-    /// Flush is triggered when any threshold is exceeded (size, points, or age)
-    /// AND the out-of-order lag period has passed since the last write.
-    /// This gives late-arriving data time to be sorted correctly within segments.
-    pub fn should_flush(&self) -> bool {
+    /// Returns `Some(reason)` when a threshold is exceeded **and** the
+    /// out-of-order lag period has elapsed since the last write.
+    /// Returns `None` when no flush is needed.
+    pub fn should_flush(&self) -> Option<FlushReason> {
         // First check if any threshold is exceeded
-        let threshold_exceeded = self.is_threshold_exceeded();
+        let reason = self.flush_reason();
 
-        if !threshold_exceeded {
-            return false;
-        }
+        let reason = match reason {
+            Some(r) => r,
+            None => return None,
+        };
 
         // Check if enough time has passed since the last write (O3 lag)
         // This ensures we wait for late-arriving data before committing
@@ -485,7 +513,7 @@ impl MemTable {
 
         // If no writes yet, don't flush
         if last_write == 0 {
-            return false;
+            return None;
         }
 
         let now_ms = std::time::SystemTime::now()
@@ -496,17 +524,22 @@ impl MemTable {
         let elapsed_since_write = now_ms.saturating_sub(last_write);
 
         // Only flush if O3 lag period has passed since last write
-        elapsed_since_write >= self.flush_trigger.out_of_order_lag_ms
+        if elapsed_since_write >= self.flush_trigger.out_of_order_lag_ms {
+            Some(reason)
+        } else {
+            None
+        }
     }
 
-    /// Check if any flush threshold is exceeded (without considering O3 lag)
-    pub fn is_threshold_exceeded(&self) -> bool {
+    /// Determine which flush threshold is exceeded (without considering O3 lag).
+    /// Returns the first matching reason, or `None`.
+    pub fn flush_reason(&self) -> Option<FlushReason> {
         if self.size.load(Ordering::Relaxed) >= self.flush_trigger.max_size {
-            return true;
+            return Some(FlushReason::SizeThreshold);
         }
 
         if self.point_count.load(Ordering::Relaxed) >= self.flush_trigger.max_points {
-            return true;
+            return Some(FlushReason::PointCountThreshold);
         }
 
         if let Some(oldest) = *self.oldest_timestamp.read() {
@@ -515,11 +548,16 @@ impl MemTable {
                 .unwrap()
                 .as_nanos() as i64;
             if now - oldest >= self.flush_trigger.max_age_nanos {
-                return true;
+                return Some(FlushReason::AgeThreshold);
             }
         }
 
-        false
+        None
+    }
+
+    /// Check if any flush threshold is exceeded (without considering O3 lag)
+    pub fn is_threshold_exceeded(&self) -> bool {
+        self.flush_reason().is_some()
     }
 
     /// Get the out-of-order lag configuration in milliseconds
@@ -690,7 +728,7 @@ mod tests {
             memtable.insert(&p).unwrap();
         }
 
-        assert!(memtable.should_flush());
+        assert!(memtable.should_flush().is_some());
     }
 
     #[test]
@@ -708,7 +746,7 @@ mod tests {
             memtable.insert(&p).unwrap();
         }
 
-        assert!(memtable.should_flush());
+        assert!(memtable.should_flush().is_some());
     }
 
     #[test]
@@ -728,14 +766,14 @@ mod tests {
 
         // Threshold is exceeded but O3 lag hasn't passed yet
         assert!(memtable.is_threshold_exceeded());
-        // should_flush should return false because we're within the lag window
-        assert!(!memtable.should_flush());
+        // should_flush should return None because we're within the lag window
+        assert!(memtable.should_flush().is_none());
 
         // Wait for O3 lag to pass
         std::thread::sleep(std::time::Duration::from_millis(150));
 
-        // Now should_flush should return true
-        assert!(memtable.should_flush());
+        // Now should_flush should return Some(reason)
+        assert!(memtable.should_flush().is_some());
     }
 
     #[test]
@@ -752,8 +790,54 @@ mod tests {
         let p = create_test_point("cpu", "server01", 1000, 64.5);
         memtable.insert(&p).unwrap();
 
-        // With O3 lag of 0, should_flush should return true immediately
-        assert!(memtable.should_flush());
+        // With O3 lag of 0, should_flush should return Some immediately
+        assert!(memtable.should_flush().is_some());
+    }
+
+    #[test]
+    fn test_flush_reason_size_threshold() {
+        let trigger = FlushTrigger {
+            max_size: 100,
+            max_points: usize::MAX,
+            max_age_nanos: i64::MAX,
+            out_of_order_lag_ms: 0,
+        };
+        let memtable = MemTable::with_flush_trigger(trigger);
+        for i in 0..100 {
+            let p = create_test_point("cpu", "server01", i * 1000, i as f64);
+            memtable.insert(&p).unwrap();
+        }
+        assert_eq!(memtable.flush_reason(), Some(FlushReason::SizeThreshold));
+    }
+
+    #[test]
+    fn test_flush_reason_point_count_threshold() {
+        let trigger = FlushTrigger {
+            max_size: usize::MAX,
+            max_points: 5,
+            max_age_nanos: i64::MAX,
+            out_of_order_lag_ms: 0,
+        };
+        let memtable = MemTable::with_flush_trigger(trigger);
+        for i in 0..5 {
+            let p = create_test_point("cpu", "server01", i * 1000, i as f64);
+            memtable.insert(&p).unwrap();
+        }
+        assert_eq!(memtable.flush_reason(), Some(FlushReason::PointCountThreshold));
+    }
+
+    #[test]
+    fn test_flush_reason_none_when_below_thresholds() {
+        let trigger = FlushTrigger {
+            max_size: usize::MAX,
+            max_points: usize::MAX,
+            max_age_nanos: i64::MAX,
+            out_of_order_lag_ms: 0,
+        };
+        let memtable = MemTable::with_flush_trigger(trigger);
+        let p = create_test_point("cpu", "server01", 1000, 64.5);
+        memtable.insert(&p).unwrap();
+        assert_eq!(memtable.flush_reason(), None);
     }
 
     #[test]
