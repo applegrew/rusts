@@ -1,4 +1,6 @@
-![Logo](logo.png)
+<p align="center">
+  <img src="logo.png" alt="RusTS Logo" width="360" height="360">
+</p>
 
 # RusTs
 
